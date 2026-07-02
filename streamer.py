@@ -84,6 +84,36 @@ class ByteStreamer:
             print(f"[streamer] metrics error: {e}")
         await asyncio.sleep(wait_s)
 
+    async def _get_fresh_msg(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
+        """Get or fetch a fresh message for the specific client."""
+        now = time.time()
+        key = (chat_id, message_id, client_idx if client_idx is not None else client)
+        if not hasattr(self, "_msg_cache"):
+            self._msg_cache = {}
+        cached_msg, fetched_at = self._msg_cache.get(key, (None, 0.0))
+        if cached_msg is None or (now - fetched_at) > 3000:
+            try:
+                msg = await client.get_messages(chat_id, message_id)
+            except Exception:
+                # Fallback to env variable CHANNEL_USERNAME if direct lookup fails
+                import os
+                channel = os.getenv("CHANNEL_USERNAME", "").strip()
+                if channel.startswith("-") and channel[1:].isdigit():
+                    channel = int(channel)
+                elif channel.isdigit():
+                    channel = int(channel)
+                if not channel:
+                    raise
+                msg = await client.get_messages(channel, message_id)
+            self._msg_cache[key] = (msg, now)
+            return msg
+        return cached_msg
+
+    def _invalidate_msg_cache(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
+        key = (chat_id, message_id, client_idx if client_idx is not None else client)
+        if hasattr(self, "_msg_cache") and key in self._msg_cache:
+            del self._msg_cache[key]
+
     async def yield_file(
         self,
         msg,
@@ -96,7 +126,6 @@ class ByteStreamer:
         c: Client = None,
         c_idx: int = None,
     ) -> AsyncGenerator[bytes, None]:
-        fid     = _extract_fid(msg)
         # Pick client at entry if not provided — but do NOT reuse it across
         # the entire multi-chunk loop below. Instead, re-pick per chunk to
         # ensure round-robin distribution even within a single stream request.
@@ -108,6 +137,15 @@ class ByteStreamer:
                 initial_c_idx, initial_c = await self.client.pick()
             else:
                 initial_c_idx, initial_c = None, self.client
+
+        # Ensure msg is bound to the chosen client's session
+        if hasattr(msg, "_client") and msg._client != initial_c:
+            try:
+                msg = await self._get_fresh_msg(msg.chat.id, msg.id, initial_c, initial_c_idx)
+            except Exception:
+                pass
+
+        fid     = _extract_fid(msg)
         session = await self._session(initial_c, fid)
         loc     = _location(fid)
         part    = 1
@@ -148,11 +186,21 @@ class ByteStreamer:
         except FileReferenceExpired:
             if not _retry:
                 raise
-            # Refresh message to get new file reference using the current client
-            refresh_client = initial_c if initial_c is not None else (await self.client.pick())[1]
-            msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+            # Invalidate cache
+            self._invalidate_msg_cache(msg.chat.id, msg.id, initial_c, initial_c_idx)
+            # Refresh message to get new file reference using a valid client
+            refresh_client = initial_c
+            refresh_c_idx = initial_c_idx
+            if refresh_client is None:
+                refresh_c_idx, refresh_client = await self.client.pick()
+            try:
+                msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
+            except Exception:
+                # If refresh fails, try picking another client
+                refresh_c_idx, refresh_client = await self.client.pick()
+                msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
             # Restart from beginning with fresh client selection
-            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, None, None):
+            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, refresh_client, refresh_c_idx):
                 yield b
             return
 
@@ -184,13 +232,20 @@ class ByteStreamer:
             if hasattr(self.client, "pick"):
                 current_c_idx, current_c = await self.client.pick()
             
+            # Ensure msg is bound to the chosen client's session
+            if hasattr(msg, "_client") and msg._client != current_c:
+                try:
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, current_c, current_c_idx)
+                except Exception:
+                    pass
+
+            fid = _extract_fid(msg)
+            loc = _location(fid)
+
             await self._throttle(current_c_idx)  # Throttle between chunks
             try:
-                # Create new session for the newly picked client if it changed
-                if current_c != initial_c:
-                    current_session = await self._session(current_c, fid)
-                else:
-                    current_session = session
+                # Create new session for the newly picked client
+                current_session = await self._session(current_c, fid)
                 async with self._concurrent_semaphore:
                     r = await current_session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
@@ -213,11 +268,21 @@ class ByteStreamer:
             except FileReferenceExpired:
                 if not _retry:
                     raise
-                # Refresh message to get new file reference using the current client
-                refresh_client = current_c if current_c is not None else (await self.client.pick())[1]
-                msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+                # Invalidate cache
+                self._invalidate_msg_cache(msg.chat.id, msg.id, current_c, current_c_idx)
+                # Refresh message to get new file reference using a valid client
+                refresh_client = current_c
+                refresh_c_idx = current_c_idx
+                if refresh_client is None:
+                    refresh_c_idx, refresh_client = await self.client.pick()
+                try:
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
+                except Exception:
+                    # If refresh fails, try picking another client
+                    refresh_c_idx, refresh_client = await self.client.pick()
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
                 # Continue from current offset with fresh client selection
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, None, None):
+                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, refresh_client, refresh_c_idx):
                     yield b
                 return
 
