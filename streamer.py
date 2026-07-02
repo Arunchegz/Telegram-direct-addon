@@ -151,6 +151,7 @@ class ByteStreamer:
             # Refresh message to get new file reference using the current client
             refresh_client = initial_c if initial_c is not None else (await self.client.pick())[1]
             msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+            # Restart from beginning with fresh client selection
             async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, None, None):
                 yield b
             return
@@ -215,6 +216,7 @@ class ByteStreamer:
                 # Refresh message to get new file reference using the current client
                 refresh_client = current_c if current_c is not None else (await self.client.pick())[1]
                 msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+                # Continue from current offset with fresh client selection
                 async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, None, None):
                     yield b
                 return
