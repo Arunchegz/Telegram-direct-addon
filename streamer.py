@@ -148,8 +148,10 @@ class ByteStreamer:
         except FileReferenceExpired:
             if not _retry:
                 raise
-            msg = await initial_c.get_messages(msg.chat.id, msg.id)
-            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, initial_c_idx, initial_c):
+            # Refresh message to get new file reference using the current client
+            refresh_client = initial_c if initial_c is not None else (await self.client.pick())[1]
+            msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, None, None):
                 yield b
             return
 
@@ -210,8 +212,10 @@ class ByteStreamer:
             except FileReferenceExpired:
                 if not _retry:
                     raise
-                msg = await current_c.get_messages(msg.chat.id, msg.id)
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, current_c_idx, current_c):
+                # Refresh message to get new file reference using the current client
+                refresh_client = current_c if current_c is not None else (await self.client.pick())[1]
+                msg = await refresh_client.get_messages(msg.chat.id, msg.id)
+                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, None, None):
                     yield b
                 return
 
