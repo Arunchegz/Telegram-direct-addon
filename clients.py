@@ -56,6 +56,7 @@ class ClientPool:
             c = Client(
                 f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                 session_string=sess, no_updates=True, workers=16,
+                sleep_threshold=0,
             )
             await c.start()
             if channel_username:
