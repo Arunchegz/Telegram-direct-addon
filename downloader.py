@@ -395,6 +395,14 @@ class DownloadTask:
 
                 current_offset = chunk_end + 1
 
+                # If we reached EOF but the file is not fully cached, wrap around to download gaps
+                if current_offset >= self.file_size:
+                    if not self.dl_map.has_range(0, self.file_size - 1):
+                        next_gap = self._find_next_gap(0)
+                        if next_gap < self.file_size:
+                            current_offset = next_gap
+                            print(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
+
             # EOF
             self._done = True
             await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
