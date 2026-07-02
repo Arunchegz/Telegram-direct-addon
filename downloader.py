@@ -331,6 +331,8 @@ class DownloadTask:
                 # other chunks and any concurrent downloads/live streams.
                 if hasattr(self.streamer.client, "pick"):
                     c_idx, c = await self.streamer.client.pick()
+                else:
+                    c_idx, c = None, self.streamer.client
 
                 try:
                     msg  = await self._fresh_msg(c)
@@ -343,6 +345,11 @@ class DownloadTask:
                         current_pos = current_offset
                         while bytes_remaining > 0:
                             request_chunk = min(TG_MAX_LIMIT, bytes_remaining)
+                            # Re-pick client for each sub-chunk within the prefetch batch
+                            # to ensure even distribution across sessions when downloading
+                            # large files that require multiple GetFile calls per chunk.
+                            if hasattr(self.streamer.client, "pick") and current_pos > current_offset:
+                                c_idx, c = await self.streamer.client.pick()
                             async for piece in self.streamer.yield_file(
                                 msg,
                                 offset=current_pos,
