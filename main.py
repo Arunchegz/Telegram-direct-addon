@@ -455,7 +455,9 @@ async def stream(type: str, id: str):
                 info = st.parse_series(fn)
                 if info and (info["season"]!=season or info["episode"]!=episode): continue
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
-            streams.append({"name":"TGStream","title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{mid}"})
+            cached = await _is_cached(mid)
+            label = "TGStream ⚡" if cached else "TGStream"
+            streams.append({"name":label,"title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{mid}"})
         return JSONResponse({"streams": streams})
 
     clean = id[len(prefix):] if id.startswith(prefix) else id
@@ -486,8 +488,10 @@ async def stream(type: str, id: str):
                 q   = m.get("quality","Unknown")
                 sz  = m.get("file_size_text","Unknown")
                 src = m.get("source","")
+                cached = await _is_cached(mid)
+                label = "TGStream ⚡" if cached else "TGStream"
                 streams.append({
-                    "name": "TGStream",
+                    "name": label,
                     "title": f"{fn}\n{q}{' | '+src if src else ''} | {sz}",
                     "url": f"{BASE_URL}/proxy/{mid}"
                 })
@@ -509,7 +513,9 @@ async def stream(type: str, id: str):
     q   = movie.get("quality","Unknown")
     sz  = movie.get("file_size_text","Unknown")
     src = movie.get("source","")
-    return JSONResponse({"streams": [{"name":"TGStream",
+    cached = await _is_cached(clean)
+    label = "TGStream ⚡" if cached else "TGStream"
+    return JSONResponse({"streams": [{"name":label,
         "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}"}]})
 
 
@@ -519,6 +525,14 @@ async def _ensure_download(movie_id: str, file_size: int, message_id: int):
         redis=redis_client, byte_streamer=byte_streamer, fetch_msg_fn=_fetch_msg,
     )
     await download_manager.evict_lru_if_needed(redis_client)
+
+
+async def _is_cached(movie_id: str) -> bool:
+    done = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+    if done != b"1":
+        return False
+    sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+    return sparse_path.exists()
 
 
 async def _yield_local_file(dl_file, start: int, length: int, request: Request):
