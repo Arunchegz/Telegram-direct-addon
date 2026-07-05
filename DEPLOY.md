@@ -10,7 +10,7 @@ railway up           # first deploy (will fail — no vars yet)
 
 ## 2 — Add Redis addon
 
-Railway dashboard → your project → **+ New** → **Database** → **Redis**  
+Railway dashboard → your project → **+ New** → **Database** → **Redis***  
 Railway auto-injects `REDIS_URL` into your service. Nothing else needed.
 
 ## 3 — Set env vars
