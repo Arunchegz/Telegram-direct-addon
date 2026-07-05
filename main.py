@@ -125,6 +125,20 @@ async def lifespan(app: FastAPI):
     _schedule(_sync_loop())
     _schedule(_prefetch_worker())
     _schedule(_bot_channel_listener())
+
+    # Resume incomplete downloads at startup
+    async def _resume_downloads():
+        try:
+            await asyncio.sleep(5)
+            movies = await st.load_movies(redis_client)
+            for mid, m in movies.items():
+                done_val = await redis_client.get(f"tgstream:dl:done:{mid}")
+                if done_val != b"1":
+                    print(f"[prefetch] resuming incomplete movie at startup: {mid} ({m.get('file_name', mid)})")
+                    await prefetch_queue.put(mid)
+        except Exception as ree:
+            print(f"[prefetch] failed to resume incomplete movies: {ree}")
+    _schedule(_resume_downloads())
     yield
     await download_manager.shutdown()
     await client_pool.stop()
@@ -164,7 +178,29 @@ DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower(
 
 
 async def _notify_send(text: str) -> int | None:
-    if not (BOT_TOKEN and NOTIFY_CHAT_ID):
+    if not NOTIFY_CHAT_ID:
+        return None
+
+    # Resolve NOTIFY_CHAT_ID
+    chat_id = NOTIFY_CHAT_ID
+    try:
+        if chat_id.startswith("-") and chat_id[1:].isdigit():
+            chat_id = int(chat_id)
+        elif chat_id.isdigit():
+            chat_id = int(chat_id)
+    except ValueError:
+        pass
+
+    # Try Pyrogram first (MTProto bypasses api.telegram.org blocks)
+    if tg and tg.is_connected:
+        try:
+            msg = await tg.send_message(chat_id, text)
+            return msg.id
+        except Exception as pe:
+            print(f"[notify] Pyrogram send failed, falling back to HTTP: {pe}")
+
+    # Fallback to standard HTTP Bot API
+    if not BOT_TOKEN:
         return None
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -172,13 +208,40 @@ async def _notify_send(text: str) -> int | None:
                               json={"chat_id": NOTIFY_CHAT_ID, "text": text})
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"[notify] send failed: {e}")
+        print(f"[notify] HTTP send failed: {e}")
         return None
 
 
 async def _notify_edit(msg_id: int, text: str) -> float:
     """Returns 0 on success/harmless-no-op, or seconds to wait if rate-limited."""
-    if not (BOT_TOKEN and NOTIFY_CHAT_ID) or not msg_id:
+    if not NOTIFY_CHAT_ID or not msg_id:
+        return 0
+
+    chat_id = NOTIFY_CHAT_ID
+    try:
+        if chat_id.startswith("-") and chat_id[1:].isdigit():
+            chat_id = int(chat_id)
+        elif chat_id.isdigit():
+            chat_id = int(chat_id)
+    except ValueError:
+        pass
+
+    # Try Pyrogram first (MTProto)
+    if tg and tg.is_connected:
+        try:
+            await tg.edit_message_text(chat_id, msg_id, text)
+            return 0
+        except FloodWait as fw:
+            print(f"[notify] Pyrogram edit rate-limited, backing off {fw.value}s")
+            return float(fw.value)
+        except Exception as pe:
+            desc = str(pe)
+            if "MESSAGE_NOT_MODIFIED" in desc or "not modified" in desc.lower():
+                return 0
+            print(f"[notify] Pyrogram edit failed, falling back to HTTP: {pe}")
+
+    # Fallback to standard HTTP Bot API
+    if not BOT_TOKEN:
         return 0
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -189,13 +252,13 @@ async def _notify_edit(msg_id: int, text: str) -> float:
                 desc = data.get("description", "")
                 if data.get("error_code") == 429:
                     wait = data.get("parameters", {}).get("retry_after", 3)
-                    print(f"[notify] rate-limited, backing off {wait}s")
+                    print(f"[notify] HTTP rate-limited, backing off {wait}s")
                     return float(wait)
                 if "not modified" not in desc:
-                    print(f"[notify] edit rejected: {desc}")
+                    print(f"[notify] HTTP edit rejected: {desc}")
             return 0
     except Exception as e:
-        print(f"[notify] edit failed: {e}")
+        print(f"[notify] HTTP edit failed: {e}")
         return 0
 
 
@@ -352,7 +415,8 @@ async def _sync_channel(force: bool = False) -> int:
             last = await redis_client.get(st.R_SYNC_TS)
             if last:
                 try:
-                    if (time.time() - float(last)) < SYNC_INTERVAL:
+                    interval = SYNC_POLL_S if DISABLE_BOT_LISTENER else SYNC_INTERVAL
+                    if (time.time() - float(last)) < interval:
                         # Return the current movies count
                         return await redis_client.hlen(st.R_MOVIES)
                 except ValueError:
