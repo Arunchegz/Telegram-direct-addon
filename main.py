@@ -124,7 +124,24 @@ async def lifespan(app: FastAPI):
     async def _instant_sync_handler(client, message):
         print(f"[listener] Pyrogram new post detected ({message.id}) — instant sync")
         try:
-            await _sync_channel(force=True)
+            media = message.video or message.document
+            if media:
+                fn = getattr(media, "file_name", None)
+                if fn:
+                    mid = st.movie_id(fn)
+                    existing_movies = await st.load_movies(redis_client)
+                    if mid not in existing_movies:
+                        print(f"[listener] instantly adding new movie: {mid}")
+                        await st.save_movie(redis_client, mid, {
+                            "message_id": message.id, "file_name": fn,
+                            "file_size": media.file_size,
+                            "file_size_text": st.fmt_size(media.file_size),
+                            "quality": st.quality(fn), "source": st.source(fn),
+                            "synced_at": int(time.time()),
+                        })
+                        await prefetch_queue.put(mid)
+            # Sync in background to reconcile index and clean up deletions
+            _schedule(_sync_channel(force=True))
         except Exception as se:
             print(f"[listener] Pyrogram instant sync failed: {se}")
 
@@ -371,8 +388,7 @@ async def _prefetch_worker():
             fn = m.get("file_name", movie_id)
             print(f"[prefetch] starting {movie_id} ({fn})")
 
-            msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
-
+            # Start download task first so it starts instantly
             task = await download_manager.get_or_create(
                 movie_id=movie_id,
                 file_size=m["file_size"],
@@ -382,7 +398,11 @@ async def _prefetch_worker():
                 fetch_msg_fn=_fetch_msg,
                 priority=False,
             )
+
+            # Send notification afterwards (if task successfully started)
+            msg_id = None
             if task and task._task:
+                msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
                 reporter = asyncio.create_task(
                     _progress_reporter(movie_id, fn, m["file_size"], msg_id)
                 )
@@ -399,7 +419,7 @@ async def _prefetch_worker():
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
-                    await _notify_edit(msg_id, f"✅ Already cached: {fn}")
+                    await _notify_send(f"✅ Already cached: {fn}")
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
