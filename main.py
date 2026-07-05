@@ -1068,13 +1068,13 @@ async def proxy(movie_id: str, request: Request):
                 first_cut = rest_start - aligned
                 last_cut  = (end % TG_CHUNK) + 1
                 parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
-                byte_streamer.mark_live_start()
+                byte_streamer.mark_live_start(movie_id)
                 try:
                     async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
                         if await request.is_disconnected(): break
                         yield chunk
                 finally:
-                    byte_streamer.mark_live_end()
+                    byte_streamer.mark_live_end(movie_id)
 
         return StreamingResponse(_mixed(), status_code=206,
                                  headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
@@ -1102,13 +1102,13 @@ async def proxy(movie_id: str, request: Request):
     async def _live():
         # No semaphore here — live proxy requests must never queue behind each other.
         # Pyrogram handles MTProto-level concurrency internally.
-        byte_streamer.mark_live_start()
+        byte_streamer.mark_live_start(movie_id)
         try:
             async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
                 if await request.is_disconnected(): break
                 yield chunk
         finally:
-            byte_streamer.mark_live_end()
+            byte_streamer.mark_live_end(movie_id)
 
     return StreamingResponse(_live(), status_code=206,
                              headers={**headers, "X-Source": "telegram-live"}, media_type=ctype_val)

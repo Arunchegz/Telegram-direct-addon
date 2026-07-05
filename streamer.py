@@ -44,15 +44,19 @@ class ByteStreamer:
 
         # Live-playback priority: counts requests currently pulling bytes
         # for active/foreground streaming (Path C tail + Path D). Background
-        # downloader checks this and pauses while it's > 0, so both sessions
-        # stay free for whoever is actually watching right now.
+        # downloader checks this and pauses while a different movie is streaming.
         self.live_streams = 0
+        self.live_movie_ids = set()
 
-    def mark_live_start(self) -> None:
+    def mark_live_start(self, movie_id: str = None) -> None:
         self.live_streams += 1
+        if movie_id:
+            self.live_movie_ids.add(movie_id)
 
-    def mark_live_end(self) -> None:
+    def mark_live_end(self, movie_id: str = None) -> None:
         self.live_streams = max(0, self.live_streams - 1)
+        if movie_id and movie_id in self.live_movie_ids:
+            self.live_movie_ids.remove(movie_id)
 
     async def _throttle(self, c_idx=None) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.

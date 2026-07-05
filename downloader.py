@@ -317,13 +317,15 @@ class DownloadTask:
                 chunk_len = chunk_end - current_offset + 1
 
                 # Give priority to live playback: pause background fetch
-                # entirely while any foreground stream is actively pulling
-                # bytes, so both sessions stay free for whoever is watching
-                # right now instead of splitting throughput with prefetch.
-                while getattr(self.streamer, "live_streams", 0) > 0:
+                # ONLY if a DIFFERENT movie is actively streaming.
+                # If the user is streaming THIS movie, we want to download it
+                # as fast as possible to catch up and cache ahead of the play-head!
+                live_movies = getattr(self.streamer, "live_movie_ids", set())
+                while any(mid != self.movie_id for mid in live_movies):
                     await asyncio.sleep(0.5)
                     if self._seek_event.is_set():
                         break  # re-check seek/offset before resuming below
+                    live_movies = getattr(self.streamer, "live_movie_ids", set())
 
                 # Alternate clients per chunk — each chunk independently
                 # picks whichever session is least recently used pool-wide,
