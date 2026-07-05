@@ -123,6 +123,8 @@ async def lifespan(app: FastAPI):
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
     _schedule(_sync_loop())
+    _schedule(_prefetch_worker())
+    _schedule(_bot_channel_listener())
     yield
     await download_manager.shutdown()
     await client_pool.stop()
@@ -141,10 +143,181 @@ async def _fetch_msg(msg_id: int, client: Client = None):
     return await c.get_messages(CHANNEL_USERNAME, msg_id)
 
 
+SYNC_POLL_S = int(os.getenv("SYNC_POLL_S", "120"))  # auto-detect new/removed movies
+
 async def _sync_loop():
-    # Sync only on catalog requests (no background periodic sync)
     while True:
-        await asyncio.sleep(3600)  # Sleep indefinitely, only sync when /catalog is called
+        try:
+            await _sync_channel(force=False)
+        except Exception as e:
+            print(f"[sync_loop] {e}")
+        await asyncio.sleep(SYNC_POLL_S)
+
+
+import httpx
+
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
+NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bot must be admin
+_TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+async def _notify_send(text: str) -> int | None:
+    if not (BOT_TOKEN and NOTIFY_CHAT_ID):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{_TG_API}/sendMessage",
+                              json={"chat_id": NOTIFY_CHAT_ID, "text": text})
+            return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        print(f"[notify] send failed: {e}")
+        return None
+
+
+async def _notify_edit(msg_id: int, text: str) -> float:
+    """Returns 0 on success/harmless-no-op, or seconds to wait if rate-limited."""
+    if not (BOT_TOKEN and NOTIFY_CHAT_ID) or not msg_id:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{_TG_API}/editMessageText",
+                             json={"chat_id": NOTIFY_CHAT_ID, "message_id": msg_id, "text": text})
+            data = r.json()
+            if not data.get("ok"):
+                desc = data.get("description", "")
+                if data.get("error_code") == 429:
+                    wait = data.get("parameters", {}).get("retry_after", 3)
+                    print(f"[notify] rate-limited, backing off {wait}s")
+                    return float(wait)
+                if "not modified" not in desc:
+                    print(f"[notify] edit rejected: {desc}")
+            return 0
+    except Exception as e:
+        print(f"[notify] edit failed: {e}")
+        return 0
+
+
+async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_id: int | None):
+    """Edit the notify message every second with % and live speed (MB/s)."""
+    if not msg_id:
+        return
+    last_bytes = 0
+    last_ts = time.time()
+    cooldown = 0.0
+    while True:
+        task = download_manager.get(movie_id)
+        if not task or not task._task or task._task.done():
+            break
+        dl_map = download_manager.get_map(movie_id)
+        done_bytes = dl_map.total_bytes() if dl_map else 0
+        pct = min(100, int(done_bytes / file_size * 100)) if file_size else 0
+
+        now = time.time()
+        elapsed = now - last_ts
+        speed_mbps = ((done_bytes - last_bytes) / 1024 / 1024) / elapsed if elapsed > 0 else 0.0
+        last_bytes, last_ts = done_bytes, now
+
+        if cooldown <= 0:
+            size_mb = file_size / 1024 / 1024
+            done_mb = done_bytes / 1024 / 1024
+            text = (f"⬇️ Prefetching: {file_name}\n"
+                    f"{pct}/100 ({done_mb:.0f}MB / {size_mb:.0f}MB)\n"
+                    f"Speed: {speed_mbps:.2f} MB/s")
+            cooldown = await _notify_edit(msg_id, text)
+        else:
+            cooldown -= 1
+
+        await asyncio.sleep(1)
+
+
+prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue()
+
+
+async def _bot_channel_listener():
+    """Long-poll the bot's own getUpdates for channel_post events.
+    Fires an instant force-sync the moment a new post lands in the
+    channel — no waiting for SYNC_POLL_S. Falls back to normal poll
+    loop if BOT_TOKEN not set."""
+    if not BOT_TOKEN:
+        print("[listener] BOT_TOKEN not set, skipping instant-post listener")
+        return
+    offset = 0
+    async with httpx.AsyncClient(timeout=40) as c:
+        while True:
+            try:
+                r = await c.get(f"{_TG_API}/getUpdates", params={
+                    "offset": offset, "timeout": 30,
+                    "allowed_updates": '["channel_post"]',
+                })
+                data = r.json()
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    post = upd.get("channel_post")
+                    if post and (post.get("video") or post.get("document")):
+                        print("[listener] new channel post detected — instant sync")
+                        try:
+                            await _sync_channel(force=True)
+                        except Exception as e:
+                            print(f"[listener] sync failed: {e}")
+            except Exception as e:
+                print(f"[listener] poll error: {e}")
+                await asyncio.sleep(5)
+
+
+async def _prefetch_worker():
+    """Pulls one movie_id at a time, downloads it fully in background.
+    Skipped/paused automatically whenever a real Stremio stream is live
+    (see live_streams check in downloader.py) -> streaming always wins."""
+    while True:
+        movie_id = await prefetch_queue.get()
+        try:
+            movies = await st.load_movies(redis_client)
+            m = movies.get(movie_id)
+            if not m:
+                continue
+            fn = m.get("file_name", movie_id)
+            print(f"[prefetch] starting {movie_id} ({fn})")
+
+            msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
+
+            task = await download_manager.get_or_create(
+                movie_id=movie_id,
+                file_size=m["file_size"],
+                message_id=m["message_id"],
+                redis=redis_client,
+                byte_streamer=byte_streamer,
+                fetch_msg_fn=_fetch_msg,
+                priority=False,
+            )
+            if task and task._task:
+                reporter = asyncio.create_task(
+                    _progress_reporter(movie_id, fn, m["file_size"], msg_id)
+                )
+                await task._task  # wait till done/cancelled/evicted before next queued item
+                reporter.cancel()
+                # Cancelled mid-way by a priority (play) request? -> not really
+                # done, put back at the end of the queue to finish later.
+                done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+                if done_val == b"1":
+                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100")
+                else:
+                    print(f"[prefetch] {movie_id} preempted, requeueing")
+                    await prefetch_queue.put(movie_id)
+            else:
+                done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+                if done_val == b"1":
+                    await _notify_edit(msg_id, f"✅ Already cached: {fn}")
+                else:
+                    # another download (priority or another prefetch) is
+                    # active right now — wait a bit, then retry
+                    print(f"[prefetch] {movie_id} deferred, another download active")
+                    await asyncio.sleep(15)
+                    await prefetch_queue.put(movie_id)
+            print(f"[prefetch] finished {movie_id}")
+        except Exception as e:
+            print(f"[prefetch] {movie_id} failed: {e}")
+        finally:
+            prefetch_queue.task_done()
 
 
 async def _sync_channel(force: bool = False) -> int:
@@ -163,6 +336,8 @@ async def _sync_channel(force: bool = False) -> int:
         if not acquired:
             return 0
         try:
+            existing_ids = set((await st.load_movies(redis_client)).keys())
+
             count = 0
             found_ids = set()
             async for msg in tg.get_chat_history(CHANNEL_USERNAME):
@@ -182,14 +357,17 @@ async def _sync_channel(force: bool = False) -> int:
                     found_ids.add(mid)
                     count += 1
                 except: continue
-            
+
+            # New movies -> queue for one-at-a-time auto-prefetch
+            for mid in found_ids - existing_ids:
+                print(f"Sync: new movie detected, queued for prefetch: {mid}")
+                await prefetch_queue.put(mid)
+
             # Clean up deleted movies
-            current_movies = await st.load_movies(redis_client)
-            for mid in list(current_movies.keys()):
-                if mid not in found_ids:
-                    print(f"Sync: removing deleted movie {mid} from index")
-                    await st.del_movie(redis_client, mid)
-                    await download_manager.evict(mid, redis_client)
+            for mid in existing_ids - found_ids:
+                print(f"Sync: removing deleted movie {mid} from index")
+                await st.del_movie(redis_client, mid)
+                await download_manager.evict(mid, redis_client)
 
             await redis_client.set(st.R_SYNC_TS, str(time.time()))
             print(f"Sync: {count} movies")
@@ -523,6 +701,7 @@ async def _ensure_download(movie_id: str, file_size: int, message_id: int):
     await download_manager.get_or_create(
         movie_id=movie_id, file_size=file_size, message_id=message_id,
         redis=redis_client, byte_streamer=byte_streamer, fetch_msg_fn=_fetch_msg,
+        priority=True,
     )
     await download_manager.evict_lru_if_needed(redis_client)
 
