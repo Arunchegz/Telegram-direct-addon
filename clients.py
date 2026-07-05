@@ -19,6 +19,7 @@ import time
 from typing import Dict, List, Tuple
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 
 class ClientPool:
@@ -61,34 +62,62 @@ class ClientPool:
         for i, sess in enumerate(sessions):
             self._broken[i] = False
             no_updates = False if i == 0 else True
-            if ":" in sess:
+            try:
+                if ":" in sess:
+                    c = Client(
+                        f"streamer_{i}", api_id=api_id, api_hash=api_hash,
+                        bot_token=sess, no_updates=no_updates, workers=16,
+                        sleep_threshold=0, in_memory=True,
+                    )
+                else:
+                    c = Client(
+                        f"streamer_{i}", api_id=api_id, api_hash=api_hash,
+                        session_string=sess, no_updates=no_updates, workers=16,
+                        sleep_threshold=0, in_memory=True,
+                    )
+                await c.start()
+                if channel_username:
+                    try:
+                        await c.get_chat(channel_username)
+                        print(f"[clients] client {i} successfully resolved channel {channel_username}")
+                    except Exception as e:
+                        print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
+                else:
+                    try:
+                        async for _ in c.get_dialogs(limit=100):
+                            pass
+                    except Exception as e:
+                        print(f"[clients] peer-cache warmup failed for client {i}: {e}")
+                self.clients.append(c)
+                print(f"[clients] client {i} started")
+            except FloodWait as fw:
+                print(f"[clients] client {i} failed to start due to FloodWait (cooldown {fw.value}s)")
+                # Instantiate a dummy client object to maintain index symmetry in the pool
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
-                    bot_token=sess, no_updates=no_updates, workers=16,
-                    sleep_threshold=0, in_memory=True,
+                    bot_token=sess if ":" in sess else None,
+                    session_string=None if ":" in sess else sess,
+                    no_updates=no_updates, workers=1, in_memory=True
                 )
-            else:
+                self.clients.append(c)
+                self.mark_broken(i)
+                self.mark_cooldown(i, fw.value)
+            except Exception as e:
+                print(f"[clients] client {i} failed to start due to error: {e}")
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
-                    session_string=sess, no_updates=no_updates, workers=16,
-                    sleep_threshold=0, in_memory=True,
+                    bot_token=sess if ":" in sess else None,
+                    session_string=None if ":" in sess else sess,
+                    no_updates=no_updates, workers=1, in_memory=True
                 )
-            await c.start()
-            if channel_username:
-                try:
-                    await c.get_chat(channel_username)
-                    print(f"[clients] client {i} successfully resolved channel {channel_username}")
-                except Exception as e:
-                    print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
-            else:
-                try:
-                    async for _ in c.get_dialogs(limit=100):
-                        pass
-                except Exception as e:
-                    print(f"[clients] peer-cache warmup failed for client {i}: {e}")
-            self.clients.append(c)
-            print(f"[clients] client {i} started")
-        print(f"[clients] pool ready with {len(self.clients)} client(s)")
+                self.clients.append(c)
+                self.mark_broken(i)
+        
+        # Check if we have at least one healthy client
+        healthy_count = sum(1 for idx in range(len(self.clients)) if not self._broken.get(idx, False))
+        if healthy_count == 0:
+            raise RuntimeError("All clients in the pool failed to start. Cannot proceed.")
+        print(f"[clients] pool ready with {healthy_count} healthy client(s)")
 
     async def stop(self):
         for c in self.clients:
