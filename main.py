@@ -158,7 +158,9 @@ import httpx
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bot must be admin
-_TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_API_BASE    = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
+_TG_API        = f"{TG_API_BASE}/bot{BOT_TOKEN}"
+DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower() == "true"
 
 
 async def _notify_send(text: str) -> int | None:
@@ -238,6 +240,9 @@ async def _bot_channel_listener():
     Fires an instant force-sync the moment a new post lands in the
     channel — no waiting for SYNC_POLL_S. Falls back to normal poll
     loop if BOT_TOKEN not set."""
+    if DISABLE_BOT_LISTENER:
+        print("[listener] DISABLE_BOT_LISTENER is true, skipping instant-post listener")
+        return
     if not BOT_TOKEN:
         print("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
