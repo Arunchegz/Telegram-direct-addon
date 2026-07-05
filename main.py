@@ -401,6 +401,8 @@ async def _bot_channel_listener():
                 await asyncio.sleep(10)
 
 
+deferred_notifications = {}
+
 async def _prefetch_worker():
     """Pulls one movie_id at a time, downloads it fully in background.
     Skipped/paused automatically whenever a real Stremio stream is live
@@ -427,9 +429,13 @@ async def _prefetch_worker():
             )
 
             # Send notification afterwards (if task successfully started)
-            msg_id = None
+            msg_id = deferred_notifications.pop(movie_id, None)
             if task and task._task:
-                msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
+                if msg_id:
+                    await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
+                else:
+                    msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
+                
                 reporter = asyncio.create_task(
                     _progress_reporter(movie_id, fn, m["file_size"], msg_id)
                 )
@@ -446,11 +452,20 @@ async def _prefetch_worker():
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
-                    await _notify_send(f"✅ Already cached: {fn}")
+                    if msg_id:
+                        await _notify_edit(msg_id, f"✅ Already cached: {fn}")
+                    else:
+                        await _notify_send(f"✅ Already cached: {fn}")
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
                     print(f"[prefetch] {movie_id} deferred, another download active")
+                    if msg_id:
+                        await _notify_edit(msg_id, f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
+                    else:
+                        msg_id = await _notify_send(f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
+                    if msg_id:
+                        deferred_notifications[movie_id] = msg_id
                     await asyncio.sleep(15)
                     await prefetch_queue.put(movie_id)
             print(f"[prefetch] finished {movie_id}")
