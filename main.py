@@ -126,19 +126,7 @@ async def lifespan(app: FastAPI):
     _schedule(_prefetch_worker())
     _schedule(_bot_channel_listener())
 
-    # Resume incomplete downloads at startup
-    async def _resume_downloads():
-        try:
-            await asyncio.sleep(5)
-            movies = await st.load_movies(redis_client)
-            for mid, m in movies.items():
-                done_val = await redis_client.get(f"tgstream:dl:done:{mid}")
-                if done_val != b"1":
-                    print(f"[prefetch] resuming incomplete movie at startup: {mid} ({m.get('file_name', mid)})")
-                    await prefetch_queue.put(mid)
-        except Exception as ree:
-            print(f"[prefetch] failed to resume incomplete movies: {ree}")
-    _schedule(_resume_downloads())
+
     yield
     await download_manager.shutdown()
     await client_pool.stop()
