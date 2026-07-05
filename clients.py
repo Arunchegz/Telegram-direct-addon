@@ -53,16 +53,17 @@ class ClientPool:
                 "SESSION_STRING_2, ...) or fall back to SESSION_STRING."
             )
         for i, sess in enumerate(sessions):
+            no_updates = False if i == 0 else True
             if ":" in sess:
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
-                    bot_token=sess, no_updates=True, workers=16,
+                    bot_token=sess, no_updates=no_updates, workers=16,
                     sleep_threshold=0, in_memory=True,
                 )
             else:
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
-                    session_string=sess, no_updates=True, workers=16,
+                    session_string=sess, no_updates=no_updates, workers=16,
                     sleep_threshold=0, in_memory=True,
                 )
             await c.start()

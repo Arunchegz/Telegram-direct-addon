@@ -29,8 +29,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
+from pyrogram.handlers import MessageHandler
 from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
@@ -118,6 +119,21 @@ async def lifespan(app: FastAPI):
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
     tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
+
+    # Register real-time Pyrogram update listener for instant prefetching on new channel posts
+    async def _instant_sync_handler(client, message):
+        print(f"[listener] Pyrogram new post detected ({message.id}) — instant sync")
+        try:
+            await _sync_channel(force=True)
+        except Exception as se:
+            print(f"[listener] Pyrogram instant sync failed: {se}")
+
+    if CHANNEL_USERNAME:
+        chat_filter = filters.chat(CHANNEL_USERNAME)
+        media_filter = filters.video | filters.document
+        tg.add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))
+        print(f"[listener] Registered Pyrogram instant post handler for {CHANNEL_USERNAME}")
+
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
