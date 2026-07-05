@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, AuthKeyDuplicated
 from pyrogram.handlers import MessageHandler
 from starlette.status import HTTP_401_UNAUTHORIZED
 
@@ -81,6 +81,10 @@ DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* en
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
 tg: Client = None
+
+def get_tg() -> Client:
+    global tg
+    return client_pool.primary() or tg
 redis_client: aioredis.Redis = None
 byte_streamer: ByteStreamer = None
 stream_sem: asyncio.Semaphore = None
@@ -174,8 +178,16 @@ app.mount("/dashboard", StaticFiles(directory="static", html=True), name="dashbo
 
 
 async def _fetch_msg(msg_id: int, client: Client = None):
-    c = client or tg
-    return await c.get_messages(CHANNEL_USERNAME, msg_id)
+    c = client or get_tg()
+    try:
+        return await c.get_messages(CHANNEL_USERNAME, msg_id)
+    except AuthKeyDuplicated as ae:
+        print(f"[_fetch_msg] AuthKeyDuplicated on client. Marking client broken: {ae}")
+        client_pool.mark_broken_by_client(c)
+        alt_c = get_tg()
+        if alt_c != c:
+            return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
+        raise ae
 
 
 SYNC_POLL_S = int(os.getenv("SYNC_POLL_S", "120"))  # auto-detect new/removed movies
@@ -184,6 +196,12 @@ async def _sync_loop():
     while True:
         try:
             await _sync_channel(force=False)
+        except AuthKeyDuplicated:
+            print("[sync_loop] AuthKeyDuplicated, retrying instantly with healthy client")
+            try:
+                await _sync_channel(force=False)
+            except Exception as e:
+                print(f"[sync_loop] retry failed: {e}")
         except Exception as e:
             print(f"[sync_loop] {e}")
         await asyncio.sleep(SYNC_POLL_S)
@@ -213,10 +231,14 @@ async def _notify_send(text: str) -> int | None:
         pass
 
     # Try Pyrogram first (MTProto bypasses api.telegram.org blocks)
-    if tg and tg.is_connected:
+    active_tg = get_tg()
+    if active_tg and active_tg.is_connected:
         try:
-            msg = await tg.send_message(chat_id, text)
+            msg = await active_tg.send_message(chat_id, text)
             return msg.id
+        except AuthKeyDuplicated as ae:
+            print(f"[notify] AuthKeyDuplicated on client. Marking client broken: {ae}")
+            client_pool.mark_broken_by_client(active_tg)
         except Exception as pe:
             print(f"[notify] Pyrogram send failed, falling back to HTTP: {pe}")
 
@@ -248,9 +270,14 @@ async def _notify_edit(msg_id: int, text: str) -> float:
         pass
 
     # Try Pyrogram first (MTProto)
-    if tg and tg.is_connected:
+    active_tg = get_tg()
+    if active_tg and active_tg.is_connected:
         try:
-            await tg.edit_message_text(chat_id, msg_id, text)
+            await active_tg.edit_message_text(chat_id, msg_id, text)
+            return 0
+        except AuthKeyDuplicated as ae:
+            print(f"[notify] AuthKeyDuplicated on client. Marking client broken: {ae}")
+            client_pool.mark_broken_by_client(active_tg)
             return 0
         except FloodWait as fw:
             print(f"[notify] Pyrogram edit rate-limited, backing off {fw.value}s")
@@ -454,23 +481,29 @@ async def _sync_channel(force: bool = False) -> int:
 
             count = 0
             found_ids = set()
-            async for msg in tg.get_chat_history(CHANNEL_USERNAME):
-                try:
-                    media = msg.video or msg.document
-                    if not media: continue
-                    fn = getattr(media, "file_name", None)
-                    if not fn: continue
-                    mid = st.movie_id(fn)
-                    await st.save_movie(redis_client, mid, {
-                        "message_id": msg.id, "file_name": fn,
-                        "file_size": media.file_size,
-                        "file_size_text": st.fmt_size(media.file_size),
-                        "quality": st.quality(fn), "source": st.source(fn),
-                        "synced_at": int(time.time()),
-                    })
-                    found_ids.add(mid)
-                    count += 1
-                except: continue
+            active_tg = get_tg()
+            try:
+                async for msg in active_tg.get_chat_history(CHANNEL_USERNAME):
+                    try:
+                        media = msg.video or msg.document
+                        if not media: continue
+                        fn = getattr(media, "file_name", None)
+                        if not fn: continue
+                        mid = st.movie_id(fn)
+                        await st.save_movie(redis_client, mid, {
+                            "message_id": msg.id, "file_name": fn,
+                            "file_size": media.file_size,
+                            "file_size_text": st.fmt_size(media.file_size),
+                            "quality": st.quality(fn), "source": st.source(fn),
+                            "synced_at": int(time.time()),
+                        })
+                        found_ids.add(mid)
+                        count += 1
+                    except: continue
+            except AuthKeyDuplicated as ae:
+                print(f"[sync] AuthKeyDuplicated on client. Marking client broken: {ae}")
+                client_pool.mark_broken_by_client(active_tg)
+                raise ae
 
             # New movies -> queue for one-at-a-time auto-prefetch
             for mid in found_ids - existing_ids:
@@ -518,7 +551,12 @@ async def manifest(): return JSONResponse(MANIFEST)
 
 
 @app.get("/sync")
-async def manual_sync(): return {"synced": await _sync_channel(force=True)}
+async def manual_sync():
+    try:
+        return {"synced": await _sync_channel(force=True)}
+    except AuthKeyDuplicated:
+        print("[sync] Retrying manual sync after marking previous client broken")
+        return {"synced": await _sync_channel(force=True)}
 
 
 async def _debug_auth(request: Request):
@@ -1123,8 +1161,13 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
     
     # 2. Optionally delete from Telegram
     if delete_tg:
+        active_tg = get_tg()
         try:
-            await tg.delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
+            await active_tg.delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
+        except AuthKeyDuplicated as ae:
+            print(f"[delete_media] AuthKeyDuplicated on client. Marking client broken: {ae}")
+            client_pool.mark_broken_by_client(active_tg)
+            await get_tg().delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
         except Exception as e:
             print(f"[delete_media] failed to delete from Telegram: {e}")
             raise HTTPException(status_code=502, detail=f"Failed to delete from Telegram: {e}")

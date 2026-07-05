@@ -27,21 +27,27 @@ class ClientPool:
         self._rr_counter = 0
         self._cooldown_until: Dict[int, float] = {}
         self._download_load: Dict[int, int] = {}   # idx -> # active DownloadTasks pinned to it
+        self._broken: Dict[int, bool] = {}         # idx -> True if client connection is broken
         self._lock = asyncio.Lock()
 
     @staticmethod
     def _load_sessions() -> List[str]:
         sessions = []
+        seen = set()
         i = 1
         while True:
             s = os.getenv(f"SESSION_STRING_{i}", "").strip()
             if not s:
                 break
-            sessions.append(s)
+            if s not in seen:
+                sessions.append(s)
+                seen.add(s)
+            else:
+                print(f"[clients] WARNING: SESSION_STRING_{i} is a duplicate of a previously loaded session. Skipping to avoid AuthKeyDuplicated.")
             i += 1
         if not sessions:
             s = os.getenv("SESSION_STRING", "").strip()
-            if s:
+            if s and s not in seen:
                 sessions.append(s)
         return sessions
 
@@ -53,6 +59,7 @@ class ClientPool:
                 "SESSION_STRING_2, ...) or fall back to SESSION_STRING."
             )
         for i, sess in enumerate(sessions):
+            self._broken[i] = False
             no_updates = False if i == 0 else True
             if ":" in sess:
                 c = Client(
@@ -103,7 +110,8 @@ class ClientPool:
 
     def _available(self) -> List[int]:
         now = time.time()
-        return [i for i in range(len(self.clients)) if self._cooldown_until.get(i, 0) <= now]
+        return [i for i in range(len(self.clients)) 
+                if self._cooldown_until.get(i, 0) <= now and not self._broken.get(i, False)]
 
     async def pick(self) -> Tuple[int, Client]:
         """Round-robin among clients not currently in cooldown.
@@ -129,7 +137,20 @@ class ClientPool:
     def primary(self) -> Client:
         """Client used for cheap metadata calls (get_messages etc) that
         rarely trip FloodWait — no need to rotate these."""
-        return self.clients[0]
+        for i in range(len(self.clients)):
+            if not self._broken.get(i, False):
+                return self.clients[i]
+        return self.clients[0] if self.clients else None
+
+    def mark_broken(self, idx: int):
+        self._broken[idx] = True
+        print(f"[clients] client {idx} marked as broken (auth key duplicated / invalidated)")
+
+    def mark_broken_by_client(self, client: Client):
+        for i, c in enumerate(self.clients):
+            if c == client:
+                self.mark_broken(i)
+                break
 
     async def acquire_download_slot(self) -> Tuple[int, Client]:
         """Pick the client with the fewest active background DownloadTasks
