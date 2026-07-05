@@ -473,6 +473,7 @@ class DownloadManager:
         # client concurrently instead of serialising everything through 1.
         self._dl_semaphore = asyncio.Semaphore(1)  # placeholder, resized in init_pool_size()
         self._active_movie_ids: set[str] = set()   # movies with a live DownloadTask
+        self._active_task_mid: Optional[str] = None  # the ONE movie allowed to actively download
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -489,6 +490,7 @@ class DownloadManager:
         redis: aioredis.Redis,
         byte_streamer,
         fetch_msg_fn,
+        priority: bool = False,
     ) -> Optional[DownloadTask]:
         async with self._lock:
             task = self._tasks.get(movie_id)
@@ -517,10 +519,21 @@ class DownloadManager:
                     return None
             # ─────────────────────────────────────────────────────────────────
 
-            # No hard "only one movie at a time" cap anymore. Multiple
-            # DownloadTasks can run concurrently — actual concurrent
-            # Telegram chunk fetches are still bounded by self._dl_semaphore
-            # (sized to client pool count) inside DownloadTask._run.
+            # Only ONE movie may actively download at a time. Priority
+            # requests (user pressed play) preempt a lower-priority
+            # (prefetch) download in progress — the preempted task's
+            # partial progress is already persisted to Redis, so it
+            # simply resumes later. Two priority requests never fight
+            # over this since actual playback also has the live-MTProto
+            # proxy fallback path and doesn't strictly need the bg task.
+            if self._active_task_mid and self._active_task_mid != movie_id:
+                other = self._tasks.get(self._active_task_mid)
+                if other and other._task and not other._task.done():
+                    if priority:
+                        print(f"[dm] preempting {self._active_task_mid} for priority download {movie_id}")
+                        other.cancel()
+                    else:
+                        return None  # low-priority (prefetch) — wait your turn
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
@@ -551,7 +564,13 @@ class DownloadManager:
             dt.start()
             self._tasks[movie_id] = dt
             self._active_movie_ids.add(movie_id)
-            dt._task.add_done_callback(lambda _t, mid=movie_id: self._active_movie_ids.discard(mid))
+            self._active_task_mid = movie_id
+
+            def _on_done(_t, mid=movie_id):
+                self._active_movie_ids.discard(mid)
+                if self._active_task_mid == mid:
+                    self._active_task_mid = None
+            dt._task.add_done_callback(_on_done)
 
             # Update access timestamp for LRU eviction
             await redis.set(R_DL_TS.format(movie_id), str(time.time()), ex=86400)
