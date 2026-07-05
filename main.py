@@ -242,14 +242,32 @@ async def _bot_channel_listener():
         print("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
     offset = 0
-    async with httpx.AsyncClient(timeout=40) as c:
+    async with httpx.AsyncClient(timeout=45) as c:
         while True:
             try:
                 r = await c.get(f"{_TG_API}/getUpdates", params={
                     "offset": offset, "timeout": 30,
                     "allowed_updates": '["channel_post"]',
                 })
-                data = r.json()
+                if r.status_code != 200:
+                    print(f"[listener] HTTP error {r.status_code}: {r.text[:200]}")
+                    await asyncio.sleep(15)
+                    continue
+
+                try:
+                    data = r.json()
+                except Exception as je:
+                    print(f"[listener] JSON decode failed: {je}. Response: {r.text[:200]}")
+                    await asyncio.sleep(15)
+                    continue
+
+                if not data.get("ok"):
+                    desc = data.get("description", "Unknown error")
+                    err_code = data.get("error_code")
+                    print(f"[listener] Telegram error {err_code}: {desc}")
+                    await asyncio.sleep(15)
+                    continue
+
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
                     post = upd.get("channel_post")
@@ -260,8 +278,11 @@ async def _bot_channel_listener():
                         except Exception as e:
                             print(f"[listener] sync failed: {e}")
             except Exception as e:
-                print(f"[listener] poll error: {e}")
-                await asyncio.sleep(5)
+                import traceback
+                print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
+                if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
+                    traceback.print_exc()
+                await asyncio.sleep(10)
 
 
 async def _prefetch_worker():
