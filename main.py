@@ -1065,12 +1065,15 @@ async def stream(type: str, id: str):
         for mid, m in movies.items():
             fn = m.get("file_name","")
             if not st.flex_match(title, fn): continue
-            if year:
+            if year and type == "movie":
                 try:
                     my = int(year)
                     if not any(str(my+d) in fn for d in (-1,0,1)): continue
-                except: 
-                    if year not in fn: continue
+                except:
+                    m4 = re.match(r"(\d{4})", year)
+                    if m4:
+                        if m4.group(1) not in fn: continue
+                    elif year not in fn: continue
             if season and episode:
                 info = st.parse_series(fn)
                 if info and (info["season"]!=season or info["episode"]!=episode): continue
