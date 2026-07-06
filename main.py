@@ -489,6 +489,9 @@ async def _handle_admin_command(chat_id, text: str):
 
     # unknown commands are ignored silently — DMs to the bot aren't
     # necessarily commands and shouldn't get a noisy reply
+
+
+async def _bot_channel_listener():
     """Long-poll the bot's own getUpdates for channel_post events.
     Fires an instant force-sync the moment a new post lands in the
     channel — no waiting for SYNC_POLL_S. Falls back to normal poll
