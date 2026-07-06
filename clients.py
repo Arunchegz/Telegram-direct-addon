@@ -30,6 +30,23 @@ class ClientPool:
         self._download_load: Dict[int, int] = {}   # idx -> # active DownloadTasks pinned to it
         self._broken: Dict[int, bool] = {}         # idx -> True if client connection is broken
         self._lock = asyncio.Lock()
+        self.on_health_event = None   # optional async fn(text), set by main.py for alerts
+        self._last_alert_ts: Dict[str, float] = {}
+        self._alert_min_interval_s = 300  # don't re-alert same condition more than once per 5min
+
+    def _fire_alert(self, key: str, text: str):
+        """Fire-and-forget, rate-limited per `key` so a flapping client
+        doesn't spam the notify channel."""
+        if not self.on_health_event:
+            return
+        now = time.time()
+        if now - self._last_alert_ts.get(key, 0) < self._alert_min_interval_s:
+            return
+        self._last_alert_ts[key] = now
+        try:
+            asyncio.get_running_loop().create_task(self.on_health_event(text))
+        except RuntimeError:
+            pass  # no running loop (e.g. during early startup) — skip
 
     @staticmethod
     def _load_sessions() -> List[str]:
@@ -154,6 +171,8 @@ class ClientPool:
                 soonest = min(self._cooldown_until.values())
                 wait = max(0.0, soonest - time.time())
                 print(f"[clients] all {len(self.clients)} client(s) cooling down, waiting {wait:.1f}s")
+                if wait > 30:
+                    self._fire_alert("all_cooldown", f"🟡 All {len(self.clients)} Telegram client(s) cooling down, waiting {wait:.0f}s")
                 await asyncio.sleep(wait)
                 avail = self._available() or list(range(len(self.clients)))
             # Rotate over the full client count, not len(avail) — avail shrinks
@@ -174,6 +193,7 @@ class ClientPool:
     def mark_broken(self, idx: int):
         self._broken[idx] = True
         print(f"[clients] client {idx} marked as broken (auth key duplicated / invalidated)")
+        self._fire_alert(f"broken:{idx}", f"🔴 Telegram client {idx} marked broken (auth key duplicated/invalidated)")
 
     def mark_broken_by_client(self, client: Client):
         for i, c in enumerate(self.clients):
@@ -204,6 +224,9 @@ class ClientPool:
 
     def __len__(self):
         return len(self.clients)
+
+    def healthy_count(self) -> int:
+        return sum(1 for i in range(len(self.clients)) if not self._broken.get(i, False))
 
 
 pool = ClientPool()

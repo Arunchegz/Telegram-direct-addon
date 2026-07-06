@@ -37,7 +37,7 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 import pyrogram.utils
 import state as st
 from clients import pool as client_pool
-from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES
+from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
 
@@ -158,10 +158,13 @@ async def lifespan(app: FastAPI):
 
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
+    download_manager.on_alert = _notify_send
+    client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
     _schedule(_sync_loop())
-    _schedule(_prefetch_worker())
+    for i in range(download_manager._max_concurrent_downloads):
+        _schedule(_prefetch_worker(worker_id=i))
     _schedule(_bot_channel_listener())
     _schedule(_sweep_loop())
 
@@ -234,6 +237,8 @@ NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bo
 TG_API_BASE    = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
 _TG_API        = f"{TG_API_BASE}/bot{BOT_TOKEN}"
 DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower() == "true"
+ADMIN_USER_ID  = os.getenv("ADMIN_USER_ID", "").strip()  # Telegram user id allowed to issue /commands via DM
+_START_TIME    = time.time()
 
 
 async def _notify_send(text: str) -> int | None:
@@ -330,13 +335,39 @@ async def _notify_edit(msg_id: int, text: str) -> float:
         return 0
 
 
+def _progress_bar(pct: int, width: int = 12) -> str:
+    filled = round(width * pct / 100)
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _fmt_eta(remaining_mb: float, speed_mbps: float) -> str:
+    if speed_mbps <= 0.05:
+        return "…"
+    secs = remaining_mb / speed_mbps
+    if secs < 60:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{secs/60:.0f}m"
+    return f"{secs/3600:.1f}h"
+
+
+PROGRESS_EDIT_MIN_PCT = int(os.getenv("PROGRESS_EDIT_MIN_PCT", "5"))   # only edit on >=this % change
+PROGRESS_EDIT_MAX_S   = int(os.getenv("PROGRESS_EDIT_MAX_S", "10"))    # ...or after this many seconds, whichever first
+
+
 async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_id: int | None):
-    """Edit the notify message every second with % and live speed (MB/s)."""
+    """Edit the notify message with a progress bar, %, speed, and ETA.
+    Throttled to only actually call the Telegram edit API on a meaningful
+    percent change or after PROGRESS_EDIT_MAX_S, whichever comes first —
+    a 1s fixed interval burns edit-API calls (and risks FloodWait) for
+    large files that take many minutes."""
     if not msg_id:
         return
     last_bytes = 0
     last_ts = time.time()
-    cooldown = 0.0
+    last_sent_pct = -100
+    last_sent_ts = 0.0
+    rate_limit_cooldown = 0.0
     while True:
         task = download_manager.get(movie_id)
         if not task or not task._task or task._task.done():
@@ -350,15 +381,22 @@ async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_
         speed_mbps = ((done_bytes - last_bytes) / 1024 / 1024) / elapsed if elapsed > 0 else 0.0
         last_bytes, last_ts = done_bytes, now
 
-        if cooldown <= 0:
+        should_send = (
+            rate_limit_cooldown <= 0
+            and (abs(pct - last_sent_pct) >= PROGRESS_EDIT_MIN_PCT or (now - last_sent_ts) >= PROGRESS_EDIT_MAX_S)
+        )
+        if should_send:
             size_mb = file_size / 1024 / 1024
             done_mb = done_bytes / 1024 / 1024
+            eta = _fmt_eta(size_mb - done_mb, speed_mbps)
             text = (f"⬇️ Prefetching: {file_name}\n"
-                    f"{pct}/100 ({done_mb:.0f}MB / {size_mb:.0f}MB)\n"
-                    f"Speed: {speed_mbps:.2f} MB/s")
-            cooldown = await _notify_edit(msg_id, text)
+                    f"{_progress_bar(pct)} {pct}%\n"
+                    f"{done_mb:.0f}MB / {size_mb:.0f}MB · {speed_mbps:.2f} MB/s · ETA {eta}")
+            rate_limit_cooldown = await _notify_edit(msg_id, text)
+            last_sent_pct = pct
+            last_sent_ts = now
         else:
-            cooldown -= 1
+            rate_limit_cooldown = max(0.0, rate_limit_cooldown - 1)
 
         await asyncio.sleep(1)
 
@@ -366,7 +404,91 @@ async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_
 prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue()
 
 
-async def _bot_channel_listener():
+async def _bot_reply(chat_id, text: str):
+    """Plain HTTP Bot API sendMessage — used for admin command replies,
+    which go to whatever DM chat the command came from (not necessarily
+    NOTIFY_CHAT_ID)."""
+    if not BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{_TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+    except Exception as e:
+        print(f"[bot] reply failed: {e}")
+
+
+async def _handle_admin_command(chat_id, text: str):
+    """Minimal remote control over DM. Only responds to ADMIN_USER_ID."""
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("/status", "/status@" ):
+        uptime_s = time.time() - _START_TIME
+        uptime = f"{uptime_s/3600:.1f}h" if uptime_s > 3600 else f"{uptime_s/60:.0f}m"
+        healthy = client_pool.healthy_count()
+        stats = download_manager.stats()
+        active = sum(1 for s in stats.values() if s["task_running"])
+        total_local = sum(s["size_on_disk_mb"] for s in stats.values())
+        movies = await st.load_movies(redis_client)
+        await _bot_reply(chat_id,
+            f"📊 Status\n"
+            f"Uptime: {uptime}\n"
+            f"Clients: {healthy}/{len(client_pool)} healthy\n"
+            f"Catalog: {len(movies)} movies\n"
+            f"Downloads: {active} active, {len(stats)} tracked\n"
+            f"Local cache: {total_local/1024:.1f}GB / {MAX_LOCAL_GB:.0f}GB\n"
+            f"Prefetch queue: {prefetch_queue.qsize()}\n"
+            f"Prefetch paused: {download_manager.paused}")
+
+    elif cmd == "/pause":
+        download_manager.paused = True
+        await _bot_reply(chat_id, "⏸ Prefetching paused. Active playback downloads unaffected.")
+
+    elif cmd == "/resume":
+        download_manager.paused = False
+        await _bot_reply(chat_id, "▶️ Prefetching resumed.")
+
+    elif cmd == "/evict":
+        if not arg:
+            await _bot_reply(chat_id, "Usage: /evict <movie_id>")
+            return
+        movies = await st.load_movies(redis_client)
+        if arg not in movies:
+            await _bot_reply(chat_id, f"Not found: {arg}")
+            return
+        await download_manager.evict(arg, redis_client)
+        await _bot_reply(chat_id, f"🗑 Evicted: {arg}")
+
+    elif cmd == "/find":
+        if not arg:
+            await _bot_reply(chat_id, "Usage: /find <name>")
+            return
+        movies = await st.load_movies(redis_client)
+        matches = [
+            (mid, m) for mid, m in movies.items()
+            if st.flex_match(arg, m.get("file_name", ""))
+        ][:5]
+        if not matches:
+            await _bot_reply(chat_id, f"No matches for: {arg}")
+            return
+        lines = []
+        for mid, m in matches:
+            cached = await redis_client.get(f"tgstream:dl:done:{mid}")
+            state_tag = "✅ cached" if cached == b"1" else "—"
+            lines.append(f"{m.get('file_name', mid)} ({state_tag})\nid: {mid}")
+        await _bot_reply(chat_id, "🔎 Matches:\n\n" + "\n\n".join(lines))
+
+    elif cmd in ("/help", "/start"):
+        await _bot_reply(chat_id,
+            "Commands:\n"
+            "/status — pool/cache/queue snapshot\n"
+            "/pause /resume — toggle background prefetching\n"
+            "/evict <id> — drop a cached movie\n"
+            "/find <name> — search catalog + cache state")
+
+    # unknown commands are ignored silently — DMs to the bot aren't
+    # necessarily commands and shouldn't get a noisy reply
     """Long-poll the bot's own getUpdates for channel_post events.
     Fires an instant force-sync the moment a new post lands in the
     channel — no waiting for SYNC_POLL_S. Falls back to normal poll
@@ -377,13 +499,17 @@ async def _bot_channel_listener():
     if not BOT_TOKEN:
         print("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
+    if ADMIN_USER_ID:
+        print(f"[listener] admin commands enabled for user {ADMIN_USER_ID}")
+    else:
+        print("[listener] ADMIN_USER_ID not set — /status /pause /resume /evict /find disabled")
     offset = 0
     async with httpx.AsyncClient(timeout=45) as c:
         while True:
             try:
                 r = await c.get(f"{_TG_API}/getUpdates", params={
                     "offset": offset, "timeout": 30,
-                    "allowed_updates": '["channel_post"]',
+                    "allowed_updates": '["channel_post","message"]',
                 })
                 if r.status_code != 200:
                     print(f"[listener] HTTP error {r.status_code}: {r.text[:200]}")
@@ -413,6 +539,17 @@ async def _bot_channel_listener():
                             await _sync_channel(force=True)
                         except Exception as e:
                             print(f"[listener] sync failed: {e}")
+                        continue
+
+                    dm = upd.get("message")
+                    if dm and ADMIN_USER_ID:
+                        sender_id = str(dm.get("from", {}).get("id", ""))
+                        text = dm.get("text", "")
+                        if sender_id == ADMIN_USER_ID and text.startswith("/"):
+                            try:
+                                await _handle_admin_command(dm["chat"]["id"], text)
+                            except Exception as e:
+                                print(f"[listener] admin command failed: {e}")
             except Exception as e:
                 import traceback
                 print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
@@ -423,19 +560,29 @@ async def _bot_channel_listener():
 
 deferred_notifications = {}
 
-async def _prefetch_worker():
+async def _prefetch_worker(worker_id: int = 0):
     """Pulls one movie_id at a time, downloads it fully in background.
     Skipped/paused automatically whenever a real Stremio stream is live
-    (see live_streams check in downloader.py) -> streaming always wins."""
+    (see live_streams check in downloader.py) -> streaming always wins.
+
+    Multiple instances of this coroutine run concurrently (sized to
+    download_manager._max_concurrent_downloads) so prefetching actually
+    uses all the concurrent download slots instead of draining the queue
+    one movie at a time regardless of pool size."""
     while True:
         movie_id = await prefetch_queue.get()
         try:
+            if download_manager.paused:
+                print(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
+                await asyncio.sleep(15)
+                await prefetch_queue.put(movie_id)
+                continue
             movies = await st.load_movies(redis_client)
             m = movies.get(movie_id)
             if not m:
                 continue
             fn = m.get("file_name", movie_id)
-            print(f"[prefetch] starting {movie_id} ({fn})")
+            print(f"[prefetch:{worker_id}] starting {movie_id} ({fn})")
 
             # Start download task first so it starts instantly
             task = await download_manager.get_or_create(
@@ -465,21 +612,22 @@ async def _prefetch_worker():
                 # done, put back at the end of the queue to finish later.
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
-                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100")
+                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
                 else:
-                    print(f"[prefetch] {movie_id} preempted, requeueing")
+                    print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
                     await prefetch_queue.put(movie_id)
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
+                    ready_text = f"✅ Already cached: {fn}\n{BASE_URL}/proxy/{movie_id}"
                     if msg_id:
-                        await _notify_edit(msg_id, f"✅ Already cached: {fn}")
+                        await _notify_edit(msg_id, ready_text)
                     else:
-                        await _notify_send(f"✅ Already cached: {fn}")
+                        await _notify_send(ready_text)
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
-                    print(f"[prefetch] {movie_id} deferred, another download active")
+                    print(f"[prefetch:{worker_id}] {movie_id} deferred, another download active")
                     if msg_id:
                         await _notify_edit(msg_id, f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
                     else:
@@ -488,9 +636,9 @@ async def _prefetch_worker():
                         deferred_notifications[movie_id] = msg_id
                     await asyncio.sleep(15)
                     await prefetch_queue.put(movie_id)
-            print(f"[prefetch] finished {movie_id}")
+            print(f"[prefetch:{worker_id}] finished {movie_id}")
         except Exception as e:
-            print(f"[prefetch] {movie_id} failed: {e}")
+            print(f"[prefetch:{worker_id}] {movie_id} failed: {e}")
         finally:
             prefetch_queue.task_done()
 
@@ -563,19 +711,25 @@ async def _sync_channel(force: bool = False) -> int:
                 raise ae
 
             # New movies -> queue for one-at-a-time auto-prefetch
-            for mid in found_ids - existing_ids:
+            new_ids = found_ids - existing_ids
+            for mid in new_ids:
                 print(f"Sync: new movie detected, queued for prefetch: {mid}")
                 await prefetch_queue.put(mid)
 
             # Clean up deleted movies — only meaningful on a full walk;
             # an incremental (min_id) pass never sees old messages so it
             # must never be treated as evidence they were deleted.
+            removed_ids = set()
             if do_full:
-                for mid in existing_ids - found_ids:
+                removed_ids = existing_ids - found_ids
+                for mid in removed_ids:
                     print(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(redis_client, mid)
                     await download_manager.evict(mid, redis_client)
                 await redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
+
+            if new_ids or removed_ids:
+                await _notify_send(f"🔄 Synced: {len(new_ids)} new, {len(removed_ids)} removed")
 
             if max_id_seen > min_id:
                 await redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))

@@ -209,6 +209,7 @@ class DownloadTask:
         fetch_msg_fn,           # async fn(msg_id) -> msg
         message_id: int,
         dl_semaphore: asyncio.Semaphore,
+        alert_fn=None,   # optional async fn(text) — fired after repeated consecutive failures
     ):
         self.movie_id    = movie_id
         self.file_size   = file_size
@@ -219,6 +220,7 @@ class DownloadTask:
         self.fetch_msg   = fetch_msg_fn
         self.message_id  = message_id
         self._semaphore  = dl_semaphore
+        self._alert_fn   = alert_fn
 
         self._task: Optional[asyncio.Task] = None
         self._hint: int = 0              # play-head hint from proxy
@@ -227,6 +229,8 @@ class DownloadTask:
         self._msg = None                 # cached fresh message
         self._msg_fetched_at = 0.0
         self._error_backoff = 1.0        # Exponential backoff multiplier
+        self._consecutive_errors = 0     # for stuck-download alerting
+        self._alerted_stuck = False      # avoid repeat alerts for the same stuck streak
         self._seek_event = asyncio.Event()       # fires on large seek, aborts current batch
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
@@ -381,6 +385,8 @@ class DownloadTask:
                     self._progress_event.set()
                     self._progress_event = asyncio.Event()
                     self._error_backoff = 1.0
+                    self._consecutive_errors = 0
+                    self._alerted_stuck = False
 
                     try:
                         from metrics import metrics
@@ -396,7 +402,15 @@ class DownloadTask:
                 except Exception as e:
                     backoff_s = DL_MIN_BACKOFF * self._error_backoff
                     self._error_backoff = min(self._error_backoff * 2, 8)
+                    self._consecutive_errors += 1
                     print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
+                    if self._consecutive_errors >= 5 and not self._alerted_stuck and self._alert_fn:
+                        self._alerted_stuck = True
+                        await self._alert_fn(
+                            f"⚠️ Download stuck: {self.movie_id}\n"
+                            f"{self._consecutive_errors} consecutive failures at "
+                            f"{current_offset/1024/1024:.1f}MB — last error: {e}"
+                        )
                     await asyncio.sleep(backoff_s)
                     self._msg = None
                     continue
@@ -483,6 +497,8 @@ class DownloadManager:
         self._active_task_mids: set[str] = set()    # movies currently allowed to actively download
         self._priority_mids: set[str] = set()        # of the above, which were started as priority
         self._max_concurrent_downloads = 1           # placeholder, resized in init_pool_size()
+        self.paused = False    # set via /pause admin command — blocks new prefetch starts
+        self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -493,6 +509,13 @@ class DownloadManager:
         self._max_concurrent_downloads = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", str(default_concurrent)))
         print(f"[dm] download semaphore sized to {n} (matches client pool), "
               f"max concurrent background downloads = {self._max_concurrent_downloads}")
+
+    async def _fire_alert(self, text: str):
+        if self.on_alert:
+            try:
+                await self.on_alert(text)
+            except Exception as e:
+                print(f"[dm] alert hook failed: {e}")
 
     async def get_or_create(
         self,
@@ -581,6 +604,7 @@ class DownloadManager:
                 fetch_msg_fn=fetch_msg_fn,
                 message_id=message_id,
                 dl_semaphore=self._dl_semaphore,
+                alert_fn=self._fire_alert,
             )
             dt.start()
             self._tasks[movie_id] = dt
@@ -637,6 +661,10 @@ class DownloadManager:
         limit = MAX_LOCAL_GB * 1024 ** 3
         if total <= limit:
             return
+
+        await self._fire_alert(
+            f"🗄 Disk pressure: {total/1024**3:.1f}GB used (limit {MAX_LOCAL_GB:.0f}GB) — evicting LRU entries"
+        )
 
         # Build LRU order from Redis timestamps
         order = []
