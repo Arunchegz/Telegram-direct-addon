@@ -72,6 +72,7 @@ if CHANNEL_USERNAME:
 
 REDIS_URL          = os.getenv("REDIS_URL", "")
 SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
+FULL_RECONCILE_S   = int(os.getenv("FULL_RECONCILE_S", "3600"))  # full history rescan cadence (deletions)
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 2MB initial fetch
@@ -162,12 +163,14 @@ async def lifespan(app: FastAPI):
     _schedule(_sync_loop())
     _schedule(_prefetch_worker())
     _schedule(_bot_channel_listener())
+    _schedule(_sweep_loop())
 
 
     yield
     await download_manager.shutdown()
     await client_pool.stop()
     await redis_client.aclose()
+    await st.close_http_client()
 
 
 app = FastAPI(title="TGStream", version="2.0.0", lifespan=lifespan, docs_url="/api/docs")
@@ -188,6 +191,23 @@ async def _fetch_msg(msg_id: int, client: Client = None):
         if alt_c != c:
             return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
         raise ae
+
+
+SWEEP_INTERVAL_S = int(os.getenv("SWEEP_INTERVAL_S", "1800"))  # prune stale caches every 30min
+
+async def _sweep_loop():
+    """Bounds two otherwise-unbounded in-memory structures on a long-lived
+    process: ByteStreamer._msg_cache and DownloadManager._tasks/_maps/_files
+    for finished, long-idle movies."""
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_S)
+        try:
+            n1 = byte_streamer.prune_msg_cache()
+            n2 = await download_manager.prune_finished_tasks()
+            if n1 or n2:
+                print(f"[sweep] pruned {n1} msg-cache entries, {n2} finished task entries")
+        except Exception as e:
+            print(f"[sweep] {e}")
 
 
 SYNC_POLL_S = int(os.getenv("SYNC_POLL_S", "120"))  # auto-detect new/removed movies
@@ -492,13 +512,34 @@ async def _sync_channel(force: bool = False) -> int:
         if not acquired:
             return 0
         try:
-            existing_ids = set((await st.load_movies(redis_client)).keys())
+            existing_movies = await st.load_movies(redis_client)
+            existing_ids = set(existing_movies.keys())
+
+            # Full history walk only on forced syncs (manual /sync, instant
+            # post handler) and roughly every FULL_RECONCILE_S otherwise —
+            # routine polling uses min_id so it only pulls NEW messages
+            # instead of re-scanning the whole channel every cycle.
+            last_full = await redis_client.get(st.R_SYNC_FULL_TS)
+            do_full = force or not last_full or (time.time() - float(last_full)) > FULL_RECONCILE_S
+
+            min_id = 0
+            if not do_full:
+                raw_max = await redis_client.get(st.R_SYNC_MAX_ID)
+                min_id = int(raw_max) if raw_max else 0
 
             count = 0
-            found_ids = set()
+            found_ids = set(existing_ids) if not do_full else set()
+            max_id_seen = min_id
             active_tg = get_tg()
             try:
+                # Pyrogram 2.x get_chat_history has no min_id filter — it
+                # walks newest -> oldest via offset_id. For an incremental
+                # pass we just stop as soon as we hit a message id we've
+                # already synced, instead of paging through the full
+                # history every cycle.
                 async for msg in active_tg.get_chat_history(CHANNEL_USERNAME):
+                    if not do_full and msg.id <= min_id:
+                        break
                     try:
                         media = msg.video or msg.document
                         if not media: continue
@@ -514,6 +555,7 @@ async def _sync_channel(force: bool = False) -> int:
                         })
                         found_ids.add(mid)
                         count += 1
+                        max_id_seen = max(max_id_seen, msg.id)
                     except: continue
             except AuthKeyDuplicated as ae:
                 print(f"[sync] AuthKeyDuplicated on client. Marking client broken: {ae}")
@@ -525,15 +567,21 @@ async def _sync_channel(force: bool = False) -> int:
                 print(f"Sync: new movie detected, queued for prefetch: {mid}")
                 await prefetch_queue.put(mid)
 
-            # Clean up deleted movies
-            for mid in existing_ids - found_ids:
-                print(f"Sync: removing deleted movie {mid} from index")
-                await st.del_movie(redis_client, mid)
-                await download_manager.evict(mid, redis_client)
+            # Clean up deleted movies — only meaningful on a full walk;
+            # an incremental (min_id) pass never sees old messages so it
+            # must never be treated as evidence they were deleted.
+            if do_full:
+                for mid in existing_ids - found_ids:
+                    print(f"Sync: removing deleted movie {mid} from index")
+                    await st.del_movie(redis_client, mid)
+                    await download_manager.evict(mid, redis_client)
+                await redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
 
+            if max_id_seen > min_id:
+                await redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
             await redis_client.set(st.R_SYNC_TS, str(time.time()))
-            print(f"Sync: {count} movies")
-            return count
+            print(f"Sync: {count} new/updated movies ({'full' if do_full else 'incremental'})")
+            return await redis_client.hlen(st.R_MOVIES)
         finally:
             await redis_client.delete(st.R_SYNC_LCK)
 

@@ -421,6 +421,7 @@ class DownloadTask:
             except Exception:
                 pass
         finally:
+            self._finished_at = time.time()
             try:
                 from metrics import metrics
                 metrics.downloads_active = max(0, metrics.downloads_active - 1)
@@ -462,7 +463,11 @@ class DownloadManager:
     """
     Singleton registry. main.py imports and uses this directly.
     Handles task creation, dedup, eviction.
-    Only one download active at a time to avoid Telegram rate limits.
+
+    Up to MAX_CONCURRENT_DOWNLOADS movies may background-download at once
+    (default: min(2, pool size)). Previously this was hard-capped at 1
+    regardless of pool size, which left extra sessions idle for prefetch
+    whenever only one movie was actively caching.
     """
 
     def __init__(self):
@@ -475,14 +480,19 @@ class DownloadManager:
         # client concurrently instead of serialising everything through 1.
         self._dl_semaphore = asyncio.Semaphore(1)  # placeholder, resized in init_pool_size()
         self._active_movie_ids: set[str] = set()   # movies with a live DownloadTask
-        self._active_task_mid: Optional[str] = None  # the ONE movie allowed to actively download
+        self._active_task_mids: set[str] = set()    # movies currently allowed to actively download
+        self._priority_mids: set[str] = set()        # of the above, which were started as priority
+        self._max_concurrent_downloads = 1           # placeholder, resized in init_pool_size()
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
         the real number of sessions. Safe to call multiple times."""
         n = max(1, len(client_pool))
         self._dl_semaphore = asyncio.Semaphore(n)
-        print(f"[dm] download semaphore sized to {n} (matches client pool)")
+        default_concurrent = min(2, n)
+        self._max_concurrent_downloads = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", str(default_concurrent)))
+        print(f"[dm] download semaphore sized to {n} (matches client pool), "
+              f"max concurrent background downloads = {self._max_concurrent_downloads}")
 
     async def get_or_create(
         self,
@@ -521,21 +531,30 @@ class DownloadManager:
                     return None
             # ─────────────────────────────────────────────────────────────────
 
-            # Only ONE movie may actively download at a time. Priority
-            # requests (user pressed play) preempt a lower-priority
-            # (prefetch) download in progress — the preempted task's
-            # partial progress is already persisted to Redis, so it
-            # simply resumes later. Two priority requests never fight
-            # over this since actual playback also has the live-MTProto
-            # proxy fallback path and doesn't strictly need the bg task.
-            if self._active_task_mid and self._active_task_mid != movie_id:
-                other = self._tasks.get(self._active_task_mid)
-                if other and other._task and not other._task.done():
-                    if priority:
-                        print(f"[dm] preempting {self._active_task_mid} for priority download {movie_id}")
-                        other.cancel()
-                    else:
-                        return None  # low-priority (prefetch) — wait your turn
+            # Up to _max_concurrent_downloads movies may actively download
+            # at once. Priority requests (user pressed play) preempt a
+            # lower-priority (prefetch) download when at capacity — the
+            # preempted task's partial progress is already persisted to
+            # Redis, so it simply resumes later. Two priority requests
+            # never fight over this since actual playback also has the
+            # live-MTProto proxy fallback path and doesn't strictly need
+            # the bg task.
+            live_active = {
+                mid for mid in self._active_task_mids
+                if (t := self._tasks.get(mid)) and t._task and not t._task.done()
+            }
+            if movie_id not in live_active and len(live_active) >= self._max_concurrent_downloads:
+                if priority:
+                    # Preempt a non-priority slot first; only fall back to
+                    # preempting another priority download if every active
+                    # slot happens to be priority (rare).
+                    victim = next((m for m in live_active if m not in self._priority_mids), None)
+                    victim = victim or next(iter(live_active), None)
+                    if victim:
+                        print(f"[dm] preempting {victim} for priority download {movie_id}")
+                        self._tasks[victim].cancel()
+                else:
+                    return None  # low-priority (prefetch) — wait your turn
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
@@ -566,12 +585,14 @@ class DownloadManager:
             dt.start()
             self._tasks[movie_id] = dt
             self._active_movie_ids.add(movie_id)
-            self._active_task_mid = movie_id
+            self._active_task_mids.add(movie_id)
+            if priority:
+                self._priority_mids.add(movie_id)
 
             def _on_done(_t, mid=movie_id):
                 self._active_movie_ids.discard(mid)
-                if self._active_task_mid == mid:
-                    self._active_task_mid = None
+                self._active_task_mids.discard(mid)
+                self._priority_mids.discard(mid)
             dt._task.add_done_callback(_on_done)
 
             # Update access timestamp for LRU eviction
@@ -632,6 +653,30 @@ class DownloadManager:
             await self.evict(mid, redis)
             total -= size
             print(f"[dm] LRU evict {mid} freed {size/1024/1024:.0f}MB")
+
+    async def prune_finished_tasks(self, max_idle_s: float = 3600):
+        """Drop DownloadTask/Map/SparseFile entries for movies finished and
+        untouched for a while. self._tasks otherwise keeps every finished
+        task object forever, growing unbounded on a large catalog."""
+        now = time.time()
+        removed = 0
+        for mid in list(self._tasks.keys()):
+            task = self._tasks.get(mid)
+            if not task or not task._task or not task._task.done():
+                continue  # still running, leave alone
+            if mid in self._active_task_mids:
+                continue
+            finished_at = getattr(task, "_finished_at", None)
+            if finished_at is None:
+                continue  # hasn't gone through _run's finally yet
+            if (now - finished_at) > max_idle_s:
+                self._tasks.pop(mid, None)
+                self._maps.pop(mid, None)
+                self._files.pop(mid, None)
+                removed += 1
+        if removed:
+            print(f"[dm] pruned {removed} stale finished task entr{'y' if removed == 1 else 'ies'}")
+        return removed
 
     async def shutdown(self):
         for task in self._tasks.values():

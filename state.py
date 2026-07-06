@@ -11,11 +11,33 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 
+# Shared connection-pooled client — a fresh httpx.AsyncClient per call
+# (the old behaviour) re-does a TLS handshake every poster/Cinemeta lookup.
+# Created lazily so importing this module has no side effect at import time.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+    return _http_client
+
+
+async def close_http_client():
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 # ── Key templates ─────────────────────────────────────────────────────────────
 R_MOVIES   = "tgstream:movies"
 R_POSTER   = "tgstream:poster:{}"
 R_SYNC_TS  = "tgstream:last_sync"
 R_SYNC_LCK = "tgstream:rate:sync"
+R_SYNC_MAX_ID = "tgstream:sync:max_msg_id"
+R_SYNC_FULL_TS = "tgstream:sync:last_full"
 
 
 # ── Movie index ───────────────────────────────────────────────────────────────
@@ -63,29 +85,42 @@ async def _fetch_poster(filename: str) -> str:
         return "https://via.placeholder.com/300x450?text=No+Poster"
     query = f"{title} {year}".strip()
     try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(
-                f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json",
-                follow_redirects=True
-            )
-            metas = r.json().get("metas", [])
-            if metas and metas[0].get("poster"):
-                return metas[0]["poster"]
+        c = _get_http_client()
+        r = await c.get(
+            f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json",
+        )
+        metas = r.json().get("metas", [])
+        if metas and metas[0].get("poster"):
+            return metas[0]["poster"]
     except Exception:
         pass
-    return f"https://via.placeholder.com/300x450?text={title.replace(' ', '+')}"
+    # Self-hosted-independent fallback: no third-party placeholder service
+    # (via.placeholder.com has a history of being flaky/unavailable).
+    return _local_placeholder_poster(title)
+
+
+def _local_placeholder_poster(title: str) -> str:
+    """Inline SVG data URI — no external dependency, never 404s/times out."""
+    import base64
+    safe_title = (title or "No Poster")[:40].replace("&", "and")
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450">'
+        f'<rect width="300" height="450" fill="#1a1a1a"/>'
+        f'<text x="150" y="225" fill="#888" font-family="sans-serif" '
+        f'font-size="18" text-anchor="middle" dominant-baseline="middle">'
+        f'{safe_title}</text></svg>'
+    )
+    b64 = base64.b64encode(svg.encode()).decode()
+    return f"data:image/svg+xml;base64,{b64}"
 
 
 async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json",
-                follow_redirects=True
-            )
-            meta = r.json().get("meta", {})
-            year_val = meta.get("year") or meta.get("releaseInfo") or ""
-            return meta.get("name", ""), str(year_val)
+        c = _get_http_client()
+        r = await c.get(f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json")
+        meta = r.json().get("meta", {})
+        year_val = meta.get("year") or meta.get("releaseInfo") or ""
+        return meta.get("name", ""), str(year_val)
     except Exception:
         return "", ""
 

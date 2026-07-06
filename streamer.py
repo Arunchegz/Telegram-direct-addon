@@ -119,6 +119,17 @@ class ByteStreamer:
         if hasattr(self, "_msg_cache") and key in self._msg_cache:
             del self._msg_cache[key]
 
+    def prune_msg_cache(self, max_age_s: float = 3000):
+        """Drop entries older than max_age_s. Cache has no natural eviction
+        otherwise and grows forever on a long-lived process."""
+        if not hasattr(self, "_msg_cache"):
+            return 0
+        now = time.time()
+        stale = [k for k, (_, ts) in self._msg_cache.items() if (now - ts) > max_age_s]
+        for k in stale:
+            del self._msg_cache[k]
+        return len(stale)
+
     async def yield_file(
         self,
         msg,
