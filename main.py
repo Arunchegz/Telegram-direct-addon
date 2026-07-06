@@ -967,7 +967,28 @@ async def catalog(type: str, id: str):
 async def meta(type: str, id: str):
     if id.startswith("tt"):
         title, year = await st.get_cinemeta(type, id)
-        return JSONResponse({"meta": {"id": id, "type": type, "name": title, "year": year}})
+        meta_obj = {"id": id, "type": type, "name": title, "year": year}
+        if type == "series" and title:
+            movies = await st.load_movies(redis_client)
+            videos = []
+            seen_episodes = set()
+            matching = [m for m in movies.values() if st.flex_match(title, m.get("file_name",""))]
+            matching.sort(key=lambda m: m.get("file_name",""))
+            for m in matching:
+                fn = m.get("file_name","")
+                info = st.parse_series(fn)
+                s = info["season"] if info else 1
+                ep = info["episode"] if info else 1
+                key = (s, ep)
+                if key in seen_episodes: continue
+                seen_episodes.add(key)
+                videos.append({
+                    "id": f"{id}:{s}:{ep}", "season": s, "episode": ep, "title": f"Episode {ep}",
+                    "released": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(m.get("synced_at", time.time()))),
+                })
+            videos.sort(key=lambda x: (x["season"], x["episode"]))
+            meta_obj["videos"] = videos
+        return JSONResponse({"meta": meta_obj})
         
     prefix = "tgm:" if type == "movie" else "tgs:"
     clean  = id[len(prefix):] if id.startswith(prefix) else id
