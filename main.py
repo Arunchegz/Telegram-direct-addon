@@ -31,7 +31,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, AuthKeyDuplicated
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, RawUpdateHandler
+from pyrogram.raw.types import UpdateDeleteChannelMessages
 from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
@@ -72,7 +73,7 @@ if CHANNEL_USERNAME:
 
 REDIS_URL          = os.getenv("REDIS_URL", "")
 SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
-FULL_RECONCILE_S   = int(os.getenv("FULL_RECONCILE_S", "3600"))  # full history rescan cadence (deletions)
+FULL_RECONCILE_S   = int(os.getenv("FULL_RECONCILE_S", "300"))  # full history rescan cadence (deletions)
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 2MB initial fetch
@@ -82,6 +83,7 @@ DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* en
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
 tg: Client = None
+source_chat_id: int | None = None
 
 def get_tg() -> Client:
     global tg
@@ -109,7 +111,7 @@ def _log_task_exception(task: asyncio.Task):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg, redis_client, byte_streamer, stream_sem
+    global tg, source_chat_id, redis_client, byte_streamer, stream_sem
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     # Configure Redis with retry and connection pool settings for resilience
     redis_client = aioredis.from_url(
@@ -124,6 +126,13 @@ async def lifespan(app: FastAPI):
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
     tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
+    if CHANNEL_USERNAME:
+        try:
+            source_chat = await tg.get_chat(CHANNEL_USERNAME)
+            source_chat_id = source_chat.id
+            print(f"[listener] Resolved source channel id: {source_chat_id}")
+        except Exception as e:
+            print(f"[listener] failed to resolve source channel id for delete listener: {e}")
 
     # Register real-time Pyrogram update listener for instant prefetching on new channel posts
     async def _instant_sync_handler(client, message):
@@ -150,11 +159,26 @@ async def lifespan(app: FastAPI):
         except Exception as se:
             print(f"[listener] Pyrogram instant sync failed: {se}")
 
+    async def _instant_delete_handler(client, update, users, chats):
+        if not isinstance(update, UpdateDeleteChannelMessages):
+            return
+        if source_chat_id is None:
+            return
+        if _channel_update_chat_id(update) != source_chat_id:
+            return
+        try:
+            removed = await _remove_deleted_messages(set(update.messages), "telegram channel delete update")
+            if removed:
+                await redis_client.set(st.R_SYNC_TS, str(time.time()))
+        except Exception as se:
+            print(f"[listener] instant delete cleanup failed: {se}")
+
     if CHANNEL_USERNAME:
         chat_filter = filters.chat(CHANNEL_USERNAME)
         media_filter = filters.video | filters.document
         tg.add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))
-        print(f"[listener] Registered Pyrogram instant post handler for {CHANNEL_USERNAME}")
+        tg.add_handler(RawUpdateHandler(_instant_delete_handler))
+        print(f"[listener] Registered Pyrogram instant post/delete handlers for {CHANNEL_USERNAME}")
 
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
@@ -194,6 +218,31 @@ async def _fetch_msg(msg_id: int, client: Client = None):
         if alt_c != c:
             return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
         raise ae
+
+
+def _channel_update_chat_id(update: UpdateDeleteChannelMessages) -> int:
+    return int(f"-100{update.channel_id}")
+
+
+async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete update") -> int:
+    if not message_ids:
+        return 0
+
+    movies = await st.load_movies(redis_client)
+    removed = []
+    for mid, movie in movies.items():
+        if int(movie.get("message_id", 0) or 0) in message_ids:
+            removed.append((mid, movie.get("file_name", mid)))
+
+    for mid, file_name in removed:
+        print(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
+        await st.del_movie(redis_client, mid)
+        await download_manager.evict(mid, redis_client)
+        deferred_notifications.pop(mid, None)
+
+    if removed:
+        await _notify_send(f"🗑 Removed {len(removed)} deleted movie{'s' if len(removed) != 1 else ''}")
+    return len(removed)
 
 
 SWEEP_INTERVAL_S = int(os.getenv("SWEEP_INTERVAL_S", "1800"))  # prune stale caches every 30min

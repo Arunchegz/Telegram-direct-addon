@@ -24,6 +24,7 @@ SESSION_STRING      = (generate below)
 CHANNEL_USERNAME    = @yourchannel (or -100xxxxxxxxx for private channels)
 BASE_URL            = https://<your-service>.up.railway.app
 SYNC_INTERVAL       = 300
+FULL_RECONCILE_S    = 300
 STREAM_CONCURRENCY  = 5
 ```
 
