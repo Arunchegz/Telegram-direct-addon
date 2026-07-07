@@ -33,8 +33,9 @@ from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated
-from pyrogram.handlers import MessageHandler, RawUpdateHandler
+from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
 from pyrogram.raw.types import UpdateDeleteChannelMessages
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
@@ -134,11 +135,42 @@ async def lifespan(app: FastAPI):
         try:
             bot_client = Client(
                 "notify_bot", api_id=API_ID, api_hash=API_HASH,
-                bot_token=BOT_TOKEN, in_memory=True, no_updates=True,
+                bot_token=BOT_TOKEN, in_memory=True, no_updates=False,
                 parse_mode=ParseMode.DISABLED,
             )
             await bot_client.start()
             print("[notify] bot_client started (MTProto, used for reliable notify send/edit)")
+
+            if ADMIN_USER_ID:
+                async def _pyro_admin_command(client, message):
+                    if not message.from_user or str(message.from_user.id) != ADMIN_USER_ID:
+                        return
+                    text = message.text or ""
+                    if text.startswith("/"):
+                        try:
+                            await _handle_admin_command(message.chat.id, text)
+                        except Exception as e:
+                            print(f"[bot] admin command failed: {type(e).__name__}: {e!r}")
+
+                async def _pyro_admin_callback(client, callback_query):
+                    if not callback_query.from_user or str(callback_query.from_user.id) != ADMIN_USER_ID:
+                        return
+                    cq_dict = {
+                        "id": callback_query.id,
+                        "data": callback_query.data,
+                        "message": {
+                            "chat": {"id": callback_query.message.chat.id},
+                            "message_id": callback_query.message.id,
+                        },
+                    }
+                    try:
+                        await _handle_admin_callback(cq_dict)
+                    except Exception as e:
+                        print(f"[bot] callback failed: {type(e).__name__}: {e!r}")
+
+                bot_client.add_handler(MessageHandler(_pyro_admin_command, filters.private & filters.text))
+                bot_client.add_handler(CallbackQueryHandler(_pyro_admin_callback))
+                print(f"[bot] MTProto admin command/callback handlers registered for user {ADMIN_USER_ID}")
         except Exception as e:
             print(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
             bot_client = None
@@ -313,20 +345,28 @@ async def _register_bot_commands():
     """Registers the / command menu shown by Telegram's client UI.
     Purely cosmetic — commands already work when typed manually via
     _handle_admin_command regardless of this call."""
+    commands = [
+        ("status", "Pool/cache/queue snapshot"),
+        ("list", "Browse catalog, cache state, tap to delete"),
+        ("pause", "Pause background prefetching"),
+        ("resume", "Resume background prefetching"),
+        ("evict", "Drop a cached movie: /evict <id>"),
+        ("find", "Search catalog: /find <name>"),
+        ("help", "Show available commands"),
+    ]
+    if bot_client and bot_client.is_connected:
+        try:
+            await bot_client.set_bot_commands([BotCommand(c, d) for c, d in commands])
+            print("[bot] command menu registered (via bot_client)")
+            return
+        except Exception as e:
+            print(f"[bot] set_bot_commands via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
-    commands = [
-        {"command": "status", "description": "Pool/cache/queue snapshot"},
-        {"command": "list", "description": "Browse catalog, cache state, tap to delete"},
-        {"command": "pause", "description": "Pause background prefetching"},
-        {"command": "resume", "description": "Resume background prefetching"},
-        {"command": "evict", "description": "Drop a cached movie: /evict <id>"},
-        {"command": "find", "description": "Search catalog: /find <name>"},
-        {"command": "help", "description": "Show available commands"},
-    ]
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{_TG_API}/setMyCommands", json={"commands": commands})
+            r = await c.post(f"{_TG_API}/setMyCommands",
+                              json={"commands": [{"command": c, "description": d} for c, d in commands]})
             data = r.json()
             if data.get("ok"):
                 print("[bot] command menu registered")
@@ -492,9 +532,14 @@ prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue()
 
 
 async def _bot_reply(chat_id, text: str):
-    """Plain HTTP Bot API sendMessage — used for admin command replies,
-    which go to whatever DM chat the command came from (not necessarily
-    NOTIFY_CHAT_ID)."""
+    """Admin command replies — prefers MTProto bot_client (reliable on hosts
+    where HTTPS to api.telegram.org is flaky/blocked), HTTP as fallback."""
+    if bot_client and bot_client.is_connected:
+        try:
+            await bot_client.send_message(chat_id, text)
+            return
+        except Exception as e:
+            print(f"[bot] reply via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
@@ -549,7 +594,21 @@ async def _render_list_page(page: int = 0):
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
+def _to_pyro_markup(keyboard: dict) -> InlineKeyboardMarkup:
+    rows = keyboard.get("inline_keyboard", [])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(btn["text"], callback_data=btn["callback_data"]) for btn in row]
+        for row in rows
+    ])
+
+
 async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
+    if bot_client and bot_client.is_connected:
+        try:
+            msg = await bot_client.send_message(chat_id, text, reply_markup=_to_pyro_markup(keyboard))
+            return msg.id
+        except Exception as e:
+            print(f"[bot] list send via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return None
     try:
@@ -563,6 +622,15 @@ async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
 
 
 async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
+    if bot_client and bot_client.is_connected:
+        try:
+            await bot_client.edit_message_text(chat_id, message_id, text, reply_markup=_to_pyro_markup(keyboard))
+            return
+        except Exception as e:
+            desc = str(e)
+            if "MESSAGE_NOT_MODIFIED" in desc:
+                return
+            print(f"[bot] list edit via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
@@ -575,6 +643,12 @@ async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
 
 
 async def _bot_answer_callback(callback_id: str, text: str | None = None):
+    if bot_client and bot_client.is_connected:
+        try:
+            await bot_client.answer_callback_query(callback_id, text=text or "")
+            return
+        except Exception as e:
+            print(f"[bot] answerCallbackQuery via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
