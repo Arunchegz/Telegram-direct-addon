@@ -314,7 +314,7 @@ async def _notify_send(text: str) -> int | None:
                               json={"chat_id": NOTIFY_CHAT_ID, "text": text})
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"[notify] HTTP send failed: {e}")
+        print(f"[notify] HTTP send failed: {type(e).__name__}: {e!r}")
         return None
 
 
@@ -350,7 +350,7 @@ async def _notify_edit(msg_id: int, text: str) -> float:
                     print(f"[notify] HTTP edit rejected: {desc}")
             return 0
     except Exception as e:
-        print(f"[notify] HTTP edit failed: {e}")
+        print(f"[notify] HTTP edit failed: {type(e).__name__}: {e!r}")
         return 0
 
 
@@ -433,7 +433,7 @@ async def _bot_reply(chat_id, text: str):
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(f"{_TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
     except Exception as e:
-        print(f"[bot] reply failed: {e}")
+        print(f"[bot] reply failed: {type(e).__name__}: {e!r}")
 
 
 LIST_PAGE_SIZE = 8
@@ -490,7 +490,7 @@ async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
                               json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"[bot] list send failed: {e}")
+        print(f"[bot] list send failed: {type(e).__name__}: {e!r}")
         return None
 
 
@@ -503,7 +503,7 @@ async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
                           json={"chat_id": chat_id, "message_id": message_id,
                                 "text": text, "reply_markup": keyboard})
     except Exception as e:
-        print(f"[bot] list edit failed: {e}")
+        print(f"[bot] list edit failed: {type(e).__name__}: {e!r}")
 
 
 async def _bot_answer_callback(callback_id: str, text: str | None = None):
@@ -516,7 +516,7 @@ async def _bot_answer_callback(callback_id: str, text: str | None = None):
                 payload["text"] = text
             await c.post(f"{_TG_API}/answerCallbackQuery", json=payload)
     except Exception as e:
-        print(f"[bot] answerCallbackQuery failed: {e}")
+        print(f"[bot] answerCallbackQuery failed: {type(e).__name__}: {e!r}")
 
 
 async def _handle_admin_callback(cq: dict):
