@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated
 from pyrogram.handlers import MessageHandler, RawUpdateHandler
 from pyrogram.raw.types import UpdateDeleteChannelMessages
@@ -93,6 +94,7 @@ redis_client: aioredis.Redis = None
 byte_streamer: ByteStreamer = None
 stream_sem: asyncio.Semaphore = None
 _sync_lock = asyncio.Lock()
+bot_client: Client = None  # dedicated Pyrogram client logged in as the bot (MTProto, not HTTPS)
 
 
 def _schedule(coro):
@@ -112,7 +114,7 @@ def _log_task_exception(task: asyncio.Task):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg, source_chat_id, redis_client, byte_streamer, stream_sem
+    global tg, source_chat_id, redis_client, byte_streamer, stream_sem, bot_client
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     # Configure Redis with retry and connection pool settings for resilience
     redis_client = aioredis.from_url(
@@ -127,6 +129,19 @@ async def lifespan(app: FastAPI):
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
     tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
+
+    if BOT_TOKEN:
+        try:
+            bot_client = Client(
+                "notify_bot", api_id=API_ID, api_hash=API_HASH,
+                bot_token=BOT_TOKEN, in_memory=True, no_updates=True,
+                parse_mode=ParseMode.DISABLED,
+            )
+            await bot_client.start()
+            print("[notify] bot_client started (MTProto, used for reliable notify send/edit)")
+        except Exception as e:
+            print(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
+            bot_client = None
     if CHANNEL_USERNAME:
         try:
             source_chat = await tg.get_chat(CHANNEL_USERNAME)
@@ -197,6 +212,8 @@ async def lifespan(app: FastAPI):
     yield
     await download_manager.shutdown()
     await client_pool.stop()
+    if bot_client:
+        await bot_client.stop()
     await redis_client.aclose()
     await st.close_http_client()
 
@@ -305,7 +322,16 @@ async def _notify_send(text: str) -> int | None:
     except ValueError:
         pass
 
-    # Send via bot HTTP API (keeps notify messages posted as the bot, not the user session)
+    # Prefer MTProto via dedicated bot_client — bypasses the api.telegram.org
+    # HTTPS ConnectTimeout issues seen on some hosts, still posts as the bot.
+    if bot_client and bot_client.is_connected:
+        try:
+            msg = await bot_client.send_message(chat_id, text)
+            return msg.id
+        except Exception as pe:
+            print(f"[notify] bot_client send failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
+
+    # Fallback: HTTP Bot API
     if not BOT_TOKEN:
         return None
     try:
@@ -332,7 +358,21 @@ async def _notify_edit(msg_id: int, text: str) -> float:
     except ValueError:
         pass
 
-    # Edit via bot HTTP API (keeps notify messages posted as the bot, not the user session)
+    # Prefer MTProto via dedicated bot_client, same reasoning as _notify_send
+    if bot_client and bot_client.is_connected:
+        try:
+            await bot_client.edit_message_text(chat_id, msg_id, text)
+            return 0
+        except FloodWait as fw:
+            print(f"[notify] bot_client edit rate-limited, backing off {fw.value}s")
+            return float(fw.value)
+        except Exception as pe:
+            desc = str(pe)
+            if "MESSAGE_NOT_MODIFIED" in desc or "not modified" in desc.lower():
+                return 0
+            print(f"[notify] bot_client edit failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
+
+    # Fallback: HTTP Bot API
     if not BOT_TOKEN:
         return 0
     try:
@@ -768,9 +808,15 @@ async def _prefetch_worker(worker_id: int = 0):
                 reporter.cancel()
                 # Cancelled mid-way by a priority (play) request? -> not really
                 # done, put back at the end of the queue to finish later.
+                # But if the user explicitly paused/evicted it from the
+                # dashboard, respect that instead of instantly restarting.
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+                stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
                 if done_val == b"1":
                     await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                elif stopped == b"1":
+                    print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
+                    await _notify_edit(msg_id, f"⏸ Paused: {fn}")
                 else:
                     print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
                     await prefetch_queue.put(movie_id)
@@ -1529,6 +1575,7 @@ async def start_download_media(movie_id: str):
         except:
             raise HTTPException(status_code=502, detail="Telegram unavailable")
             
+    await redis_client.delete(f"tgstream:dl:stopped:{movie_id}")
     _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
     return {"status": "ok"}
 
@@ -1537,6 +1584,7 @@ async def start_download_media(movie_id: str):
 async def pause_download_media(movie_id: str):
     task = download_manager.get(movie_id)
     if task:
+        await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
         task.cancel()
         return {"status": "ok"}
     return {"status": "ignored"}
@@ -1544,6 +1592,7 @@ async def pause_download_media(movie_id: str):
 
 @app.post("/api/media/{movie_id}/evict")
 async def evict_cache_media(movie_id: str):
+    await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
     await download_manager.evict(movie_id, redis_client)
     return {"status": "ok"}
 
