@@ -14,6 +14,7 @@ Proxy logic (the core of this rewrite):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -435,6 +436,127 @@ async def _bot_reply(chat_id, text: str):
         print(f"[bot] reply failed: {e}")
 
 
+LIST_PAGE_SIZE = 8
+
+
+def _short_id(mid: str) -> str:
+    """Short stable hash for callback_data — movie_id itself is often
+    too long for Telegram's 64-byte callback_data limit."""
+    return hashlib.sha1(mid.encode()).hexdigest()[:10]
+
+
+async def _render_list_page(page: int = 0):
+    """Builds (text, inline_keyboard) for /list — cached symbol per movie,
+    one delete button per row, prev/next nav."""
+    movies = await st.load_movies(redis_client)
+    items = sorted(movies.items(), key=lambda kv: kv[1].get("file_name", kv[0]))
+    total = len(items)
+    pages = max(1, math.ceil(total / LIST_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * LIST_PAGE_SIZE: page * LIST_PAGE_SIZE + LIST_PAGE_SIZE]
+
+    lines = [f"🎬 Catalog ({total}) — page {page+1}/{pages}", ""]
+    keyboard = []
+    for mid, m in chunk:
+        cached = await redis_client.get(f"tgstream:dl:done:{mid}")
+        symbol = "✅" if cached == b"1" else "⬜"
+        fn = m.get("file_name", mid)
+        lines.append(f"{symbol} {fn}")
+        keyboard.append([{
+            "text": f"🗑 Delete: {fn[:30]}",
+            "callback_data": f"del:{_short_id(mid)}:{page}",
+        }])
+
+    nav = []
+    if page > 0:
+        nav.append({"text": "⬅ Prev", "callback_data": f"pg:{page-1}"})
+    if page < pages - 1:
+        nav.append({"text": "Next ➡", "callback_data": f"pg:{page+1}"})
+    if nav:
+        keyboard.append(nav)
+
+    if not chunk:
+        lines.append("(empty)")
+
+    return "\n".join(lines), {"inline_keyboard": keyboard}
+
+
+async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
+    if not BOT_TOKEN:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{_TG_API}/sendMessage",
+                              json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
+            return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        print(f"[bot] list send failed: {e}")
+        return None
+
+
+async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
+    if not BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{_TG_API}/editMessageText",
+                          json={"chat_id": chat_id, "message_id": message_id,
+                                "text": text, "reply_markup": keyboard})
+    except Exception as e:
+        print(f"[bot] list edit failed: {e}")
+
+
+async def _bot_answer_callback(callback_id: str, text: str | None = None):
+    if not BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            payload = {"callback_query_id": callback_id}
+            if text:
+                payload["text"] = text
+            await c.post(f"{_TG_API}/answerCallbackQuery", json=payload)
+    except Exception as e:
+        print(f"[bot] answerCallbackQuery failed: {e}")
+
+
+async def _handle_admin_callback(cq: dict):
+    """Handles inline-button presses from /list: pagination + delete."""
+    data = cq.get("data", "")
+    msg = cq.get("message", {}) or {}
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    cq_id = cq.get("id")
+    if chat_id is None or message_id is None:
+        return
+
+    if data.startswith("pg:"):
+        page = int(data.split(":", 1)[1])
+        text, kb = await _render_list_page(page)
+        await _bot_edit_keyboard(chat_id, message_id, text, kb)
+        await _bot_answer_callback(cq_id)
+        return
+
+    if data.startswith("del:"):
+        _, short, page_s = data.split(":", 2)
+        page = int(page_s)
+        movies = await st.load_movies(redis_client)
+        target = next((mid for mid in movies if _short_id(mid) == short), None)
+        if not target:
+            await _bot_answer_callback(cq_id, "Not found (already deleted?)")
+            text, kb = await _render_list_page(page)
+            await _bot_edit_keyboard(chat_id, message_id, text, kb)
+            return
+        fn = movies[target].get("file_name", target)
+        await download_manager.evict(target, redis_client)
+        await st.del_movie(redis_client, target)
+        await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
+        text, kb = await _render_list_page(page)
+        await _bot_edit_keyboard(chat_id, message_id, text, kb)
+        return
+
+    await _bot_answer_callback(cq_id)
+
+
 async def _handle_admin_command(chat_id, text: str):
     """Minimal remote control over DM. Only responds to ADMIN_USER_ID."""
     parts = text.strip().split(maxsplit=1)
@@ -497,11 +619,16 @@ async def _handle_admin_command(chat_id, text: str):
             lines.append(f"{m.get('file_name', mid)} ({state_tag})\nid: {mid}")
         await _bot_reply(chat_id, "🔎 Matches:\n\n" + "\n\n".join(lines))
 
+    elif cmd == "/list":
+        text, kb = await _render_list_page(0)
+        await _bot_send_keyboard(chat_id, text, kb)
+
     elif cmd in ("/help", "/start"):
         await _bot_reply(chat_id,
             "Commands:\n"
             "/status — pool/cache/queue snapshot\n"
             "/pause /resume — toggle background prefetching\n"
+            "/list — browse catalog, ✅/⬜ cache state, tap to delete\n"
             "/evict <id> — drop a cached movie\n"
             "/find <name> — search catalog + cache state")
 
@@ -530,7 +657,7 @@ async def _bot_channel_listener():
             try:
                 r = await c.get(f"{_TG_API}/getUpdates", params={
                     "offset": offset, "timeout": 30,
-                    "allowed_updates": '["channel_post","message"]',
+                    "allowed_updates": '["channel_post","message","callback_query"]',
                 })
                 if r.status_code != 200:
                     print(f"[listener] HTTP error {r.status_code}: {r.text[:200]}")
@@ -571,6 +698,16 @@ async def _bot_channel_listener():
                                 await _handle_admin_command(dm["chat"]["id"], text)
                             except Exception as e:
                                 print(f"[listener] admin command failed: {e}")
+                        continue
+
+                    cq = upd.get("callback_query")
+                    if cq and ADMIN_USER_ID:
+                        sender_id = str(cq.get("from", {}).get("id", ""))
+                        if sender_id == ADMIN_USER_ID:
+                            try:
+                                await _handle_admin_callback(cq)
+                            except Exception as e:
+                                print(f"[listener] callback failed: {e}")
             except Exception as e:
                 import traceback
                 print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
