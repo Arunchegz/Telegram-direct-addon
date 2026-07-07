@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
             bot_client = None
+        await _register_bot_commands()
     if CHANNEL_USERNAME:
         try:
             source_chat = await tg.get_chat(CHANNEL_USERNAME)
@@ -306,6 +307,33 @@ _TG_API        = f"{TG_API_BASE}/bot{BOT_TOKEN}"
 DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower() == "true"
 ADMIN_USER_ID  = os.getenv("ADMIN_USER_ID", "").strip()  # Telegram user id allowed to issue /commands via DM
 _START_TIME    = time.time()
+
+
+async def _register_bot_commands():
+    """Registers the / command menu shown by Telegram's client UI.
+    Purely cosmetic — commands already work when typed manually via
+    _handle_admin_command regardless of this call."""
+    if not BOT_TOKEN:
+        return
+    commands = [
+        {"command": "status", "description": "Pool/cache/queue snapshot"},
+        {"command": "list", "description": "Browse catalog, cache state, tap to delete"},
+        {"command": "pause", "description": "Pause background prefetching"},
+        {"command": "resume", "description": "Resume background prefetching"},
+        {"command": "evict", "description": "Drop a cached movie: /evict <id>"},
+        {"command": "find", "description": "Search catalog: /find <name>"},
+        {"command": "help", "description": "Show available commands"},
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{_TG_API}/setMyCommands", json={"commands": commands})
+            data = r.json()
+            if data.get("ok"):
+                print("[bot] command menu registered")
+            else:
+                print(f"[bot] setMyCommands rejected: {data.get('description')}")
+    except Exception as e:
+        print(f"[bot] setMyCommands failed: {type(e).__name__}: {e!r}")
 
 
 async def _notify_send(text: str) -> int | None:
