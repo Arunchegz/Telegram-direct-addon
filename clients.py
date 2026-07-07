@@ -19,6 +19,7 @@ import time
 from typing import Dict, List, Tuple
 
 from pyrogram import Client
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 
@@ -84,13 +85,13 @@ class ClientPool:
                     c = Client(
                         f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                         bot_token=sess, no_updates=no_updates, workers=16,
-                        sleep_threshold=0, in_memory=True,
+                        sleep_threshold=0, in_memory=True, parse_mode=ParseMode.DISABLED,
                     )
                 else:
                     c = Client(
                         f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                         session_string=sess, no_updates=no_updates, workers=16,
-                        sleep_threshold=0, in_memory=True,
+                        sleep_threshold=0, in_memory=True, parse_mode=ParseMode.DISABLED,
                     )
                 await c.start()
                 if channel_username:
@@ -114,7 +115,8 @@ class ClientPool:
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                     bot_token=sess if ":" in sess else None,
                     session_string=None if ":" in sess else sess,
-                    no_updates=no_updates, workers=1, in_memory=True
+                    no_updates=no_updates, workers=1, in_memory=True,
+                    parse_mode=ParseMode.DISABLED,
                 )
                 self.clients.append(c)
                 self.mark_broken(i)
@@ -125,7 +127,8 @@ class ClientPool:
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                     bot_token=sess if ":" in sess else None,
                     session_string=None if ":" in sess else sess,
-                    no_updates=no_updates, workers=1, in_memory=True
+                    no_updates=no_updates, workers=1, in_memory=True,
+                    parse_mode=ParseMode.DISABLED,
                 )
                 self.clients.append(c)
                 self.mark_broken(i)
