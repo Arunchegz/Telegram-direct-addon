@@ -304,19 +304,7 @@ async def _notify_send(text: str) -> int | None:
     except ValueError:
         pass
 
-    # Try Pyrogram first (MTProto bypasses api.telegram.org blocks)
-    active_tg = get_tg()
-    if active_tg and active_tg.is_connected:
-        try:
-            msg = await active_tg.send_message(chat_id, text)
-            return msg.id
-        except AuthKeyDuplicated as ae:
-            print(f"[notify] AuthKeyDuplicated on client. Marking client broken: {ae}")
-            client_pool.mark_broken_by_client(active_tg)
-        except Exception as pe:
-            print(f"[notify] Pyrogram send failed, falling back to HTTP: {pe}")
-
-    # Fallback to standard HTTP Bot API
+    # Send via bot HTTP API (keeps notify messages posted as the bot, not the user session)
     if not BOT_TOKEN:
         return None
     try:
@@ -343,26 +331,7 @@ async def _notify_edit(msg_id: int, text: str) -> float:
     except ValueError:
         pass
 
-    # Try Pyrogram first (MTProto)
-    active_tg = get_tg()
-    if active_tg and active_tg.is_connected:
-        try:
-            await active_tg.edit_message_text(chat_id, msg_id, text)
-            return 0
-        except AuthKeyDuplicated as ae:
-            print(f"[notify] AuthKeyDuplicated on client. Marking client broken: {ae}")
-            client_pool.mark_broken_by_client(active_tg)
-            return 0
-        except FloodWait as fw:
-            print(f"[notify] Pyrogram edit rate-limited, backing off {fw.value}s")
-            return float(fw.value)
-        except Exception as pe:
-            desc = str(pe)
-            if "MESSAGE_NOT_MODIFIED" in desc or "not modified" in desc.lower():
-                return 0
-            print(f"[notify] Pyrogram edit failed, falling back to HTTP: {pe}")
-
-    # Fallback to standard HTTP Bot API
+    # Edit via bot HTTP API (keeps notify messages posted as the bot, not the user session)
     if not BOT_TOKEN:
         return 0
     try:
