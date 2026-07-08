@@ -202,6 +202,7 @@ async def lifespan(app: FastAPI):
                             "quality": st.quality(fn), "source": st.source(fn),
                             "synced_at": int(time.time()),
                         })
+                        # Genuine new upload event -> auto-prefetch.
                         await prefetch_queue.put(mid)
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=True))
@@ -1016,11 +1017,11 @@ async def _sync_channel(force: bool = False) -> int:
                 client_pool.mark_broken_by_client(active_tg)
                 raise ae
 
-            # New movies -> queue for one-at-a-time auto-prefetch
+            # New movies get added to the catalog only — no auto-prefetch.
+            # Download starts on demand (Stremio stream request or dashboard).
             new_ids = found_ids - existing_ids
             for mid in new_ids:
-                print(f"Sync: new movie detected, queued for prefetch: {mid}")
-                await prefetch_queue.put(mid)
+                print(f"Sync: new movie detected (catalog only, no auto-prefetch): {mid}")
 
             # Clean up deleted movies — only meaningful on a full walk;
             # an incremental (min_id) pass never sees old messages so it
