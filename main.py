@@ -1149,20 +1149,23 @@ async def catalog(type: str, id: str):
         print(f"Catalog sync failed: {e}")
     
     movies = await st.load_movies(redis_client)
-    def is_series(m): return bool(re.search(r"s\d{2}e\d{2}|season\s*\d|episode\s*\d", m.get("file_name","").lower()))
+    def is_series(m): return bool(st.IS_SERIES_RE.search(m.get("file_name","")))
     
     if type == "movie":
         filtered = {mid: m for mid, m in movies.items() if not is_series(m)}
         async def build(mid, m):
             fn = m.get("file_name","Unknown")
             try:
-                poster = await st.get_poster(redis_client, fn)
+                poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
             except Exception as e:
                 print(f"[catalog] Poster fetch failed for {fn}: {e}")
-                poster = "https://via.placeholder.com/300x450?text=No+Poster"
+                poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
             title, year = st.parse_title_year(fn)
-            return {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
+            meta = {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
                     "poster": poster, "posterShape": "poster", "year": year}
+            if imdb_id:
+                meta["imdb_id"] = imdb_id
+            return meta
         # Process movies in batches to avoid overwhelming Redis
         metas = []
         batch_size = 5
@@ -1191,18 +1194,21 @@ async def catalog(type: str, id: str):
         async def build_series(sid, group):
             fn = group["files"][0][1].get("file_name","Unknown")
             try:
-                poster = await st.get_poster(redis_client, fn)
+                poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
             except Exception as e:
                 print(f"[catalog] Poster fetch failed for {fn}: {e}")
-                poster = "https://via.placeholder.com/300x450?text=No+Poster"
+                poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
             year = ""
             for _, m in group["files"]:
                 _, y = st.parse_title_year(m.get("file_name",""))
                 if y:
                     year = y
                     break
-            return {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
+            meta = {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
                     "poster": poster, "posterShape": "poster", "year": year}
+            if imdb_id:
+                meta["imdb_id"] = imdb_id
+            return meta
         # Process series in batches to avoid overwhelming Redis
         metas = []
         batch_size = 5
