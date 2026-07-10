@@ -34,6 +34,7 @@ async def close_http_client():
 # ── Key templates ─────────────────────────────────────────────────────────────
 R_MOVIES   = "tgstream:movies"
 R_POSTER   = "tgstream:poster:{}"
+R_IMDB     = "tgstream:imdb:{}"
 R_SYNC_TS  = "tgstream:last_sync"
 R_SYNC_LCK = "tgstream:rate:sync"
 R_SYNC_MAX_ID = "tgstream:sync:max_msg_id"
@@ -55,25 +56,9 @@ async def del_movie(redis: aioredis.Redis, mid: str):
 
 
 # ── Poster cache ──────────────────────────────────────────────────────────────
-async def get_poster(redis: aioredis.Redis, filename: str) -> str:
-    key = R_POSTER.format(filename[:80])
-    try:
-        cached = await redis.get(key)
-        if cached:
-            return cached.decode()
-    except Exception as e:
-        print(f"[poster] Redis get failed for {filename}: {e}")
-    url = await _fetch_poster(filename)
-    try:
-        await redis.setex(key, 86400, url)
-    except Exception as e:
-        print(f"[poster] Redis set failed for {filename}: {e}")
-    return url
-
-
-async def _fetch_poster(filename: str) -> str:
-    # Detect series by SxxExx / Season N pattern
-    is_series = bool(re.search(r"[Ss]\d{1,2}[Ee]\d{1,3}|[Ss]eason\s*\d+|[Ee]pisode\s*\d+", filename))
+async def _fetch_poster(filename: str) -> tuple[str, str]:
+    """Returns (poster_url, imdb_id). imdb_id is \'\' if not found."""
+    is_series = bool(IS_SERIES_RE.search(filename))
     if is_series:
         title = parse_show_title(filename)
         year = ""
@@ -82,7 +67,7 @@ async def _fetch_poster(filename: str) -> str:
         title, year = parse_title_year(filename)
         catalog_type = "movie"
     if not title:
-        return "https://via.placeholder.com/300x450?text=No+Poster"
+        return _local_placeholder_poster(""), ""
     query = f"{title} {year}".strip()
     try:
         c = _get_http_client()
@@ -90,13 +75,42 @@ async def _fetch_poster(filename: str) -> str:
             f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json",
         )
         metas = r.json().get("metas", [])
-        if metas and metas[0].get("poster"):
-            return metas[0]["poster"]
+        if metas:
+            poster = metas[0].get("poster") or _local_placeholder_poster(title)
+            imdb_id = metas[0].get("id", "")
+            if not imdb_id.startswith("tt"):
+                imdb_id = ""
+            return poster, imdb_id
     except Exception:
         pass
-    # Self-hosted-independent fallback: no third-party placeholder service
-    # (via.placeholder.com has a history of being flaky/unavailable).
-    return _local_placeholder_poster(title)
+    return _local_placeholder_poster(title), ""
+
+
+async def get_poster(redis: aioredis.Redis, filename: str) -> str:
+    """Legacy compat: returns only poster URL."""
+    poster, _ = await get_poster_and_imdb(redis, filename)
+    return poster
+
+
+async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str, str]:
+    """Returns (poster_url, imdb_id). Both cached in Redis for 24h."""
+    poster_key = R_POSTER.format(filename[:80])
+    imdb_key = R_IMDB.format(filename[:80])
+    try:
+        cached_poster = await redis.get(poster_key)
+        cached_imdb = await redis.get(imdb_key)
+        if cached_poster:
+            return cached_poster.decode(), (cached_imdb.decode() if cached_imdb else "")
+    except Exception as e:
+        print(f"[poster] Redis get failed for {filename}: {e}")
+    poster, imdb_id = await _fetch_poster(filename)
+    try:
+        await redis.setex(poster_key, 86400, poster)
+        if imdb_id:
+            await redis.setex(imdb_key, 86400, imdb_id)
+    except Exception as e:
+        print(f"[poster] Redis set failed for {filename}: {e}")
+    return poster, imdb_id
 
 
 def _local_placeholder_poster(title: str) -> str:
@@ -198,13 +212,27 @@ def parse_title_year(filename: str) -> tuple[str, str]:
     return re.sub(r"\s+", " ", cut).strip().title(), year
 
 
+# Unified series-detection regex — used by is_series() checks everywhere
+IS_SERIES_RE = re.compile(
+    r"[Ss]\d{1,2}[Ee]\d{1,3}"          # S01E01 / S1E5
+    r"|[Ss]eason[\s._-]*\d+"            # Season.2 / Season 2
+    r"|[Ee]pisode[\s._-]*\d+",          # Episode.3 / Episode 3
+    re.IGNORECASE,
+)
+
 def parse_series(filename: str) -> Optional[dict]:
+    # SxxExx / S1E5
     m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
     if m:
         return {"season": int(m.group(1)), "episode": int(m.group(2))}
-    m2 = re.search(r"[Ss]eason\s*(\d+).*?[Ee]pisode\s*(\d+)", filename, re.IGNORECASE)
+    # Season N ... Episode N (dots/spaces/dashes as separators)
+    m2 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
     if m2:
         return {"season": int(m2.group(1)), "episode": int(m2.group(2))}
+    # Season N only — no episode marker
+    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m3:
+        return {"season": int(m3.group(1)), "episode": 1}
     return None
 
 
