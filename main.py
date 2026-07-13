@@ -1050,7 +1050,7 @@ async def _sync_channel(force: bool = False) -> int:
 MANIFEST = {
     "id": "org.tgstream.hybrid", "version": "2.0.0", "name": "TGStream",
     "description": "Hybrid predictive streaming from Telegram via Stremio",
-    "resources": ["catalog", "meta", "stream"], "types": ["movie", "series"],
+    "resources": ["catalog", "meta", "stream", "subtitles"], "types": ["movie", "series"],
     "idPrefixes": ["tgm:", "tgs:"],
     "catalogs": [
         {"type": "movie",  "id": "tgstream_movies", "name": "TG Movies"},
@@ -1406,6 +1406,65 @@ async def stream(type: str, id: str):
     label = "TGStream ⚡" if cached else "TGStream"
     return JSONResponse({"streams": [{"name":label,
         "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}"}]})
+
+
+@app.get("/subtitles/{type}/{id}.json")
+async def subtitles(type: str, id: str):
+    prefix = "tgm:" if type == "movie" else "tgs:"
+    if not id.startswith(prefix):
+        return JSONResponse({"subtitles": []})
+    
+    clean = id[len(prefix):]
+    movies = await st.load_movies(redis_client)
+    
+    # Resolve file name
+    filename = ""
+    season, episode = None, None
+    if type == "movie":
+        movie = movies.get(clean)
+        if movie:
+            filename = movie.get("file_name", "")
+    else:  # type == "series"
+        # tgs:show_id:season:episode
+        parts = clean.split(":")
+        if len(parts) >= 3:
+            sid = parts[0]
+            try:
+                season = int(parts[1])
+                episode = int(parts[2])
+            except:
+                pass
+            for m in movies.values():
+                if st.show_id(m.get("file_name", "")) == sid:
+                    info = st.parse_series(m.get("file_name", ""))
+                    if info and info["season"] == season and info["episode"] == episode:
+                        filename = m.get("file_name", "")
+                        break
+
+    if not filename:
+        return JSONResponse({"subtitles": []})
+        
+    # Get IMDB ID
+    _, imdb_id = await st.get_poster_and_imdb(redis_client, filename)
+    if not imdb_id:
+        return JSONResponse({"subtitles": []})
+        
+    # Format OpenSubtitles request ID
+    if type == "movie":
+        os_id = imdb_id
+    else:
+        os_id = f"{imdb_id}:{season}:{episode}"
+        
+    # Query OpenSubtitles v3 addon
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+    except Exception as e:
+        print(f"[subtitles] failed to fetch from OpenSubtitles: {e}")
+        
+    return JSONResponse({"subtitles": []})
 
 
 async def _ensure_download(movie_id: str, file_size: int, message_id: int):
