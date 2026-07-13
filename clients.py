@@ -171,9 +171,12 @@ class ClientPool:
         async with self._lock:
             avail = self._available()
             if not avail:
-                soonest = min(self._cooldown_until.values())
-                wait = max(0.0, soonest - time.time())
-                print(f"[clients] all {len(self.clients)} client(s) cooling down, waiting {wait:.1f}s")
+                if self._cooldown_until:
+                    soonest = min(self._cooldown_until.values())
+                    wait = max(0.0, soonest - time.time())
+                else:
+                    wait = 5.0
+                print(f"[clients] all {len(self.clients)} client(s) unavailable, waiting {wait:.1f}s")
                 if wait > 30:
                     self._fire_alert("all_cooldown", f"🟡 All {len(self.clients)} Telegram client(s) cooling down, waiting {wait:.0f}s")
                 await asyncio.sleep(wait)

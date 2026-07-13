@@ -85,12 +85,10 @@ SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 
 DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
-tg: Client = None
 source_chat_id: int | None = None
 
 def get_tg() -> Client:
-    global tg
-    return client_pool.primary() or tg
+    return client_pool.primary()
 redis_client: aioredis.Redis = None
 byte_streamer: ByteStreamer = None
 stream_sem: asyncio.Semaphore = None
@@ -110,12 +108,12 @@ def _log_task_exception(task: asyncio.Task):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[task] {e}")
+        print(f"[task] {type(e).__name__}: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg, source_chat_id, redis_client, byte_streamer, stream_sem, bot_client
+    global source_chat_id, redis_client, byte_streamer, stream_sem, bot_client
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     # Configure Redis with retry and connection pool settings for resilience
     redis_client = aioredis.from_url(
@@ -129,7 +127,6 @@ async def lifespan(app: FastAPI):
     stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
-    tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
 
     if BOT_TOKEN:
         try:
@@ -177,7 +174,7 @@ async def lifespan(app: FastAPI):
         await _register_bot_commands()
     if CHANNEL_USERNAME:
         try:
-            source_chat = await tg.get_chat(CHANNEL_USERNAME)
+            source_chat = await get_tg().get_chat(CHANNEL_USERNAME)
             source_chat_id = source_chat.id
             print(f"[listener] Resolved source channel id: {source_chat_id}")
         except Exception as e:
@@ -226,8 +223,8 @@ async def lifespan(app: FastAPI):
     if CHANNEL_USERNAME:
         chat_filter = filters.chat(CHANNEL_USERNAME)
         media_filter = filters.video | filters.document
-        tg.add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))
-        tg.add_handler(RawUpdateHandler(_instant_delete_handler))
+        get_tg().add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))
+        get_tg().add_handler(RawUpdateHandler(_instant_delete_handler))
         print(f"[listener] Registered Pyrogram instant post/delete handlers for {CHANNEL_USERNAME}")
 
     byte_streamer = ByteStreamer(client_pool)
@@ -377,19 +374,24 @@ async def _register_bot_commands():
         print(f"[bot] setMyCommands failed: {type(e).__name__}: {e!r}")
 
 
+def _resolve_chat_id(raw: str) -> int | str:
+    if not raw:
+        return ""
+    try:
+        if raw.startswith("-") and raw[1:].isdigit():
+            return int(raw)
+        elif raw.isdigit():
+            return int(raw)
+    except ValueError:
+        pass
+    return raw
+
+
 async def _notify_send(text: str) -> int | None:
     if not NOTIFY_CHAT_ID:
         return None
 
-    # Resolve NOTIFY_CHAT_ID
-    chat_id = NOTIFY_CHAT_ID
-    try:
-        if chat_id.startswith("-") and chat_id[1:].isdigit():
-            chat_id = int(chat_id)
-        elif chat_id.isdigit():
-            chat_id = int(chat_id)
-    except ValueError:
-        pass
+    chat_id = _resolve_chat_id(NOTIFY_CHAT_ID)
 
     # Prefer MTProto via dedicated bot_client — bypasses the api.telegram.org
     # HTTPS ConnectTimeout issues seen on some hosts, still posts as the bot.
@@ -418,14 +420,7 @@ async def _notify_edit(msg_id: int, text: str) -> float:
     if not NOTIFY_CHAT_ID or not msg_id:
         return 0
 
-    chat_id = NOTIFY_CHAT_ID
-    try:
-        if chat_id.startswith("-") and chat_id[1:].isdigit():
-            chat_id = int(chat_id)
-        elif chat_id.isdigit():
-            chat_id = int(chat_id)
-    except ValueError:
-        pass
+    chat_id = _resolve_chat_id(NOTIFY_CHAT_ID)
 
     # Prefer MTProto via dedicated bot_client, same reasoning as _notify_send
     if bot_client and bot_client.is_connected:
@@ -790,14 +785,17 @@ async def _bot_channel_listener():
     if not BOT_TOKEN:
         print("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
+    if bot_client and bot_client.is_connected:
+        print("[listener] MTProto bot_client is active, skipping HTTP long-poll updates listener")
+        return
     if ADMIN_USER_ID:
         print(f"[listener] admin commands enabled for user {ADMIN_USER_ID}")
     else:
         print("[listener] ADMIN_USER_ID not set — /status /pause /resume /evict /find disabled")
     offset = 0
-    async with httpx.AsyncClient(timeout=45) as c:
-        while True:
-            try:
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=45) as c:
                 r = await c.get(f"{_TG_API}/getUpdates", params={
                     "offset": offset, "timeout": 30,
                     "allowed_updates": '["channel_post","message","callback_query"]',
@@ -851,12 +849,12 @@ async def _bot_channel_listener():
                                 await _handle_admin_callback(cq)
                             except Exception as e:
                                 print(f"[listener] callback failed: {e}")
-            except Exception as e:
-                import traceback
-                print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
-                if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
-                    traceback.print_exc()
-                await asyncio.sleep(10)
+        except Exception as e:
+            import traceback
+            print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
+            if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
+                traceback.print_exc()
+            await asyncio.sleep(10)
 
 
 deferred_notifications = {}
@@ -907,8 +905,10 @@ async def _prefetch_worker(worker_id: int = 0):
                 reporter = asyncio.create_task(
                     _progress_reporter(movie_id, fn, m["file_size"], msg_id)
                 )
-                await task._task  # wait till done/cancelled/evicted before next queued item
-                reporter.cancel()
+                try:
+                    await task._task  # wait till done/cancelled/evicted before next queued item
+                finally:
+                    reporter.cancel()
                 # Cancelled mid-way by a priority (play) request? -> not really
                 # done, put back at the end of the queue to finish later.
                 # But if the user explicitly paused/evicted it from the
@@ -1011,7 +1011,7 @@ async def _sync_channel(force: bool = False) -> int:
                         found_ids.add(mid)
                         count += 1
                         max_id_seen = max(max_id_seen, msg.id)
-                    except: continue
+                    except Exception: continue
             except AuthKeyDuplicated as ae:
                 print(f"[sync] AuthKeyDuplicated on client. Marking client broken: {ae}")
                 client_pool.mark_broken_by_client(active_tg)
@@ -1051,7 +1051,7 @@ MANIFEST = {
     "id": "org.tgstream.hybrid", "version": "2.0.0", "name": "TGStream",
     "description": "Hybrid predictive streaming from Telegram via Stremio",
     "resources": ["catalog", "meta", "stream"], "types": ["movie", "series"],
-    "idPrefixes": ["tgm:", "tgs:", "tt"],
+    "idPrefixes": ["tgm:", "tgs:"],
     "catalogs": [
         {"type": "movie",  "id": "tgstream_movies", "name": "TG Movies"},
         {"type": "series", "id": "tgstream_series", "name": "TG Series"},
@@ -1338,6 +1338,11 @@ async def stream(type: str, id: str):
             if season and episode:
                 info = st.parse_series(fn)
                 if info and (info["season"]!=season or info["episode"]!=episode): continue
+            try:
+                fs = m.get("file_size")
+                _schedule(_ensure_download(mid, fs, m["message_id"]))
+            except Exception as e:
+                print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid)
             label = "TGStream ⚡" if cached else "TGStream"
@@ -1441,35 +1446,7 @@ async def _hydrate_if_cached(movie_id: str, file_size: int) -> bool:
     so proxy Path A can pread immediately.
     Never touches Telegram.
     """
-    sparse_path = STORAGE_DIR / f"{movie_id}.bin"
-    if not sparse_path.exists():
-        return False
-
-    # In-memory map already covers full range?
-    dl_map = download_manager.get_map(movie_id)
-    dl_file = download_manager.get_file(movie_id)
-    if dl_map and dl_map.has_range(0, file_size - 1):
-        return True
-
-    # Cheap Redis flag check
-    done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
-    if done_val != b"1":
-        # Last resort: load map and verify coverage
-        dl_map = await download_manager._load_map(movie_id, redis_client)
-        if not dl_map.has_range(0, file_size - 1):
-            return False
-        # Coverage confirmed — backfill flag
-        await redis_client.set(f"tgstream:dl:done:{movie_id}", b"1")
-
-    # Hydrate in-memory state so Path A works
-    if download_manager.get_map(movie_id) is None:
-        dl_map = await download_manager._load_map(movie_id, redis_client)
-        download_manager._maps[movie_id] = dl_map
-    if download_manager.get_file(movie_id) is None:
-        from downloader import SparseFile
-        download_manager._files[movie_id] = SparseFile(sparse_path)
-
-    return True
+    return await download_manager.hydrate_cached(movie_id, file_size, redis_client)
 
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
@@ -1532,7 +1509,7 @@ async def proxy(movie_id: str, request: Request):
                 if len(p) > 1 and p[1]: end = int(p[1])
         except:
             return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-
+    end = min(end, file_size - 1)
     req_start = start
     req_end = end
 

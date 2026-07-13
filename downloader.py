@@ -133,54 +133,67 @@ class DownloadMap:
 
 
 # ────────────────────────────────────────────────────────────────────────[...]
-# SparseFile: pre-truncated file, pwrite semantics
+# SparseFile: pre-truncated file, pwrite/pread with persistent fd
 # ────────────────────────────────────────────────────────────────────────[...]
 class SparseFile:
     """
     Pre-allocated (sparse) file. Supports concurrent pwrite + pread.
     Uses asyncio.to_thread for blocking I/O so event loop stays free.
+    Avoids repeatedly opening and closing the file per chunk.
     """
 
     def __init__(self, path: Path):
         self.path = path
+        self._fd: Optional[int] = None
         self._lock = asyncio.Lock()
 
     @classmethod
     async def create(cls, path: Path, size: int) -> "SparseFile":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            # ftruncate creates sparse file (no disk allocation until written)
-            await asyncio.to_thread(_truncate_file, path, size)
-        return cls(path)
+        self = cls(path)
+        fd = await self._get_fd()
+        # Truncate to size using ftruncate in worker thread
+        await asyncio.to_thread(self._ensure_size, fd, size)
+        return self
+
+    def _ensure_size(self, fd: int, size: int):
+        stat = os.fstat(fd)
+        if stat.st_size != size:
+            os.ftruncate(fd, size)
+
+    async def _get_fd(self) -> int:
+        async with self._lock:
+            if self._fd is None or self._fd < 0:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
+            return self._fd
 
     async def pwrite(self, data: bytes, offset: int) -> None:
-        await asyncio.to_thread(_pwrite, self.path, data, offset)
+        fd = await self._get_fd()
+        await asyncio.to_thread(os.pwrite, fd, data, offset)
 
     async def pread(self, offset: int, length: int) -> bytes:
-        return await asyncio.to_thread(_pread, self.path, offset, length)
+        fd = await self._get_fd()
+        return await asyncio.to_thread(os.pread, fd, length, offset)
 
     def exists(self) -> bool:
         return self.path.exists()
 
     async def delete(self) -> None:
+        async with self._lock:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = None
         await asyncio.to_thread(self.path.unlink, missing_ok=True)
 
-
-def _truncate_file(path: Path, size: int):
-    with open(path, "wb") as f:
-        f.truncate(size)
-
-
-def _pwrite(path: Path, data: bytes, offset: int):
-    with open(path, "r+b") as f:
-        f.seek(offset)
-        f.write(data)
-
-
-def _pread(path: Path, offset: int, length: int) -> bytes:
-    with open(path, "rb") as f:
-        f.seek(offset)
-        return f.read(length)
+    def __del__(self):
+        if hasattr(self, "_fd") and self._fd is not None:
+            try:
+                os.close(self._fd)
+            except Exception:
+                pass
 
 
 # ────────────────────────────────────────────────────────────────────────[...]
@@ -292,9 +305,10 @@ class DownloadTask:
 
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
               f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
+        completed = False
         try:
             from metrics import metrics
-            metrics.downloads_active += 1
+            await metrics.record_download_start()
         except Exception:
             pass
 
@@ -429,18 +443,20 @@ class DownloadTask:
             self._done = True
             await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
+            completed = True
             try:
                 from metrics import metrics
-                metrics.downloads_completed += 1
+                await metrics.record_download_complete()
             except Exception:
                 pass
         finally:
             self._finished_at = time.time()
-            try:
-                from metrics import metrics
-                metrics.downloads_active = max(0, metrics.downloads_active - 1)
-            except Exception:
-                pass
+            if not completed:
+                try:
+                    from metrics import metrics
+                    await metrics.record_download_stop()
+                except Exception:
+                    pass
 
 
     def _find_next_gap(self, from_offset: int) -> int:
@@ -748,29 +764,30 @@ class DownloadManager:
         if not sparse_path.exists():
             return False
 
-        # In-memory map already covers full range?
-        dl_map = self.get_map(movie_id)
-        if dl_map and dl_map.has_range(0, file_size - 1):
+        async with self._lock:
+            # In-memory map already covers full range?
+            dl_map = self.get_map(movie_id)
+            if dl_map and dl_map.has_range(0, file_size - 1):
+                return True
+
+            # Cheap Redis flag check
+            done_val = await redis.get(R_DL_DONE.format(movie_id))
+            if done_val != b"1":
+                # Last resort: load map and verify coverage
+                dl_map = await self._load_map(movie_id, redis)
+                if not dl_map.has_range(0, file_size - 1):
+                    return False
+                # Coverage confirmed — backfill flag
+                await redis.set(R_DL_DONE.format(movie_id), b"1")
+
+            # Hydrate in-memory state so Path A works
+            if self.get_map(movie_id) is None:
+                dl_map = await self._load_map(movie_id, redis)
+                self._maps[movie_id] = dl_map
+            if self.get_file(movie_id) is None:
+                self._files[movie_id] = SparseFile(sparse_path)
+
             return True
-
-        # Cheap Redis flag check
-        done_val = await redis.get(R_DL_DONE.format(movie_id))
-        if done_val != b"1":
-            # Last resort: load map and verify coverage
-            dl_map = await self._load_map(movie_id, redis)
-            if not dl_map.has_range(0, file_size - 1):
-                return False
-            # Coverage confirmed — backfill flag
-            await redis.set(R_DL_DONE.format(movie_id), b"1")
-
-        # Hydrate in-memory state so Path A works
-        if self.get_map(movie_id) is None:
-            dl_map = await self._load_map(movie_id, redis)
-            self._maps[movie_id] = dl_map
-        if self.get_file(movie_id) is None:
-            self._files[movie_id] = SparseFile(sparse_path)
-
-        return True
 
 
 # Module-level singleton — imported by main.py

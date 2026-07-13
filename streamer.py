@@ -33,8 +33,8 @@ class ByteStreamer:
         self.client = client
         self._last_invoke_time: dict = {}      # key: c_idx (None for single-client mode)
         self._throttle_locks: dict = {}        # per-client lock, created lazily
-        self._session_lock = asyncio.Lock()   # Lock to serialize session creation
-        self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
+        self._session_locks: dict = {}         # Lock to serialize session creation per client
+        self._backoff_until = {}  # Per-client and DC backoff state: {(c_idx, dc_id): until_timestamp}
         # If `client` is actually a ClientPool (has __len__), scale concurrent
         # GetFile slots to the pool size — one slot per session — instead of
         # serializing every stream in the process through a single global lock.
@@ -74,14 +74,14 @@ class ByteStreamer:
                 await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
             self._last_invoke_time[c_idx] = time.time()
 
-    async def _wait_backoff(self, dc_id: int, flood_wait_s: int) -> None:
+    async def _wait_backoff(self, dc_id: int, flood_wait_s: int, c_idx: int | None = None) -> None:
         """Exponential backoff with jitter on FloodWait."""
         # Add jitter: ±20% to spread requests
         jitter = random.uniform(0.8, 1.2)
         wait_s = min(flood_wait_s * jitter, MAX_BACKOFF_S)
         until = time.time() + wait_s
-        self._backoff_until[dc_id] = until
-        print(f"[streamer] DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
+        self._backoff_until[(c_idx, dc_id)] = until
+        print(f"[streamer] Client {c_idx} DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
         try:
             from metrics import metrics
             await metrics.record_rate_limit(dc_id, wait_s)
@@ -168,14 +168,15 @@ class ByteStreamer:
         off     = offset
         dc_id   = fid.dc_id
 
-        # Check if DC is in backoff; if so, wait
-        if dc_id in self._backoff_until:
-            until = self._backoff_until[dc_id]
+        # Check if DC is in backoff for the chosen client; if so, wait
+        backoff_key = (initial_c_idx, dc_id)
+        if backoff_key in self._backoff_until:
+            until = self._backoff_until[backoff_key]
             if time.time() < until:
                 remaining = until - time.time()
-                print(f"[streamer] Waiting for DC {dc_id} backoff: {remaining:.1f}s")
+                print(f"[streamer] Waiting for Client {initial_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
                 await asyncio.sleep(remaining)
-            del self._backoff_until[dc_id]
+            del self._backoff_until[backoff_key]
 
         try:
             async with self._concurrent_semaphore:
@@ -188,7 +189,7 @@ class ByteStreamer:
                     wait_s = e.value if hasattr(e, 'value') else 5
                     if initial_c_idx is not None and hasattr(self.client, "mark_cooldown"):
                         self.client.mark_cooldown(initial_c_idx, wait_s)
-                    await self._wait_backoff(dc_id, wait_s)
+                    await self._wait_backoff(dc_id, wait_s, initial_c_idx)
                     # Retry after backoff — re-pick client to distribute load
                     if _retry:
                         # Re-pick a fresh client (don't reuse the rate-limited one)
@@ -270,7 +271,7 @@ class ByteStreamer:
                 wait_s = e.value if hasattr(e, 'value') else 5
                 if current_c_idx is not None and hasattr(self.client, "mark_cooldown"):
                     self.client.mark_cooldown(current_c_idx, wait_s)
-                await self._wait_backoff(dc_id, wait_s)
+                await self._wait_backoff(dc_id, wait_s, current_c_idx)
                 # Retry after backoff — re-pick client to distribute load
                 if _retry:
                     # Re-pick a fresh client (don't reuse the rate-limited one)
@@ -309,7 +310,8 @@ class ByteStreamer:
         if dc in c.media_sessions:
             return c.media_sessions[dc]
 
-        async with self._session_lock:
+        lock = self._session_locks.setdefault(c, asyncio.Lock())
+        async with lock:
             # Double check inside lock
             if dc in c.media_sessions:
                 return c.media_sessions[dc]
