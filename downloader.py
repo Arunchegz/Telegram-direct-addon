@@ -737,6 +737,41 @@ class DownloadManager:
             }
         return result
 
+    async def hydrate_cached(self, movie_id: str, file_size: int, redis: aioredis.Redis) -> bool:
+        """
+        Returns True if the file is fully downloaded locally and ready to serve.
+        Side-effect: ensures self._maps/_files are populated for this movie_id
+        so proxy Path A can pread immediately.
+        Never touches Telegram.
+        """
+        sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+        if not sparse_path.exists():
+            return False
+
+        # In-memory map already covers full range?
+        dl_map = self.get_map(movie_id)
+        if dl_map and dl_map.has_range(0, file_size - 1):
+            return True
+
+        # Cheap Redis flag check
+        done_val = await redis.get(R_DL_DONE.format(movie_id))
+        if done_val != b"1":
+            # Last resort: load map and verify coverage
+            dl_map = await self._load_map(movie_id, redis)
+            if not dl_map.has_range(0, file_size - 1):
+                return False
+            # Coverage confirmed — backfill flag
+            await redis.set(R_DL_DONE.format(movie_id), b"1")
+
+        # Hydrate in-memory state so Path A works
+        if self.get_map(movie_id) is None:
+            dl_map = await self._load_map(movie_id, redis)
+            self._maps[movie_id] = dl_map
+        if self.get_file(movie_id) is None:
+            self._files[movie_id] = SparseFile(sparse_path)
+
+        return True
+
 
 # Module-level singleton — imported by main.py
 download_manager = DownloadManager()
