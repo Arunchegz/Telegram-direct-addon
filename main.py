@@ -259,32 +259,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 app.mount("/dashboard", StaticFiles(directory="static", html=True), name="dashboard")
 
 
-async def _resolve_chat_id() -> int:
-    """Resolve CHANNEL_USERNAME to a numeric chat id, caching the result."""
-    global source_chat_id
-    if source_chat_id is not None:
-        return source_chat_id
-    if CHANNEL_USERNAME:
-        try:
-            source_chat = await tg.get_chat(CHANNEL_USERNAME)
-            source_chat_id = source_chat.id
-            print(f"[resolve_chat_id] Resolved source channel id: {source_chat_id}")
-        except Exception as e:
-            print(f"[resolve_chat_id] failed to resolve source channel id: {e}")
-    return source_chat_id
-
-
 async def _fetch_msg(msg_id: int, client: Client = None):
     c = client or get_tg()
     try:
-        chat_id = await _resolve_chat_id()
-        return await c.get_messages(chat_id, msg_id)
+        return await c.get_messages(CHANNEL_USERNAME, msg_id)
     except AuthKeyDuplicated as ae:
         print(f"[_fetch_msg] AuthKeyDuplicated on client. Marking client broken: {ae}")
         client_pool.mark_broken_by_client(c)
         alt_c = get_tg()
         if alt_c != c:
-            return await alt_c.get_messages(await _resolve_chat_id(), msg_id)
+            return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
         raise ae
 
 
@@ -571,18 +555,8 @@ LIST_PAGE_SIZE = 8
 
 def _short_id(mid: str) -> str:
     """Short stable hash for callback_data — movie_id itself is often
-    too long for Telegram's 64-byte callback_data limit.
-    Detects and logs sha1 collisions (rare but possible)."""
-    short = hashlib.sha1(mid.encode()).hexdigest()[:10]
-    # Simple collision check against known mids in this session
-    if hasattr(_short_id, "_seen"):
-        existing_mid = _short_id._seen.get(short)
-        if existing_mid and existing_mid != mid:
-            print(f"[sha1_collision] Collision detected: {mid} and {existing_mid} both map to {short}")
-    else:
-        _short_id._seen = {}
-    _short_id._seen[short] = mid
-    return short
+    too long for Telegram's 64-byte callback_data limit."""
+    return hashlib.sha1(mid.encode()).hexdigest()[:10]
 
 
 async def _render_list_page(page: int = 0):
@@ -698,35 +672,32 @@ async def _handle_admin_callback(cq: dict):
     if chat_id is None or message_id is None:
         return
 
-    try:
-        if data.startswith("pg:"):
-            page = int(data.split(":", 1)[1])
-            text, kb = await _render_list_page(page)
-            await _bot_edit_keyboard(chat_id, message_id, text, kb)
-            await _bot_answer_callback(cq_id)
-            return
-
-        if data.startswith("del:"):
-            _, short, page_s = data.split(":", 2)
-            page = int(page_s)
-            movies = await st.load_movies(redis_client)
-            target = next((mid for mid in movies if _short_id(mid) == short), None)
-            if not target:
-                await _bot_answer_callback(cq_id, "Not found (already deleted?)")
-                text, kb = await _render_list_page(page)
-                await _bot_edit_keyboard(chat_id, message_id, text, kb)
-                return
-            fn = movies[target].get("file_name", target)
-            await download_manager.evict(target, redis_client)
-            await st.del_movie(redis_client, target)
-            await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
-            text, kb = await _render_list_page(page)
-            await _bot_edit_keyboard(chat_id, message_id, text, kb)
-            return
-    except Exception as e:
-        print(f"[callback] error handling {data}: {type(e).__name__}: {e!r}")
-    finally:
+    if data.startswith("pg:"):
+        page = int(data.split(":", 1)[1])
+        text, kb = await _render_list_page(page)
+        await _bot_edit_keyboard(chat_id, message_id, text, kb)
         await _bot_answer_callback(cq_id)
+        return
+
+    if data.startswith("del:"):
+        _, short, page_s = data.split(":", 2)
+        page = int(page_s)
+        movies = await st.load_movies(redis_client)
+        target = next((mid for mid in movies if _short_id(mid) == short), None)
+        if not target:
+            await _bot_answer_callback(cq_id, "Not found (already deleted?)")
+            text, kb = await _render_list_page(page)
+            await _bot_edit_keyboard(chat_id, message_id, text, kb)
+            return
+        fn = movies[target].get("file_name", target)
+        await download_manager.evict(target, redis_client)
+        await st.del_movie(redis_client, target)
+        await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
+        text, kb = await _render_list_page(page)
+        await _bot_edit_keyboard(chat_id, message_id, text, kb)
+        return
+
+    await _bot_answer_callback(cq_id)
 
 
 async def _handle_admin_command(chat_id, text: str):
@@ -889,7 +860,6 @@ async def _bot_channel_listener():
 
 
 deferred_notifications = {}
-_DEFERRED_MAX = 200  # Bound deferred notifications to avoid unbounded growth
 
 async def _prefetch_worker(worker_id: int = 0):
     """Pulls one movie_id at a time, downloads it fully in background.
@@ -928,39 +898,31 @@ async def _prefetch_worker(worker_id: int = 0):
 
             # Send notification afterwards (if task successfully started)
             msg_id = deferred_notifications.pop(movie_id, None)
-            reporter = None
-            try:
-                if task and task._task:
-                    if msg_id:
-                        await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
-                    else:
-                        msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
-                    
-                    reporter = asyncio.create_task(
-                        _progress_reporter(movie_id, fn, m["file_size"], msg_id)
-                    )
-                    await task._task  # wait till done/cancelled/evicted before next queued item
-            finally:
-                if reporter and not reporter.done():
-                    reporter.cancel()
-                    try:
-                        await reporter
-                    except asyncio.CancelledError:
-                        pass
-            # Cancelled mid-way by a priority (play) request? -> not really
-            # done, put back at the end of the queue to finish later.
-            # But if the user explicitly paused/evicted it from the
-            # dashboard, respect that instead of instantly restarting.
-            done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
-            stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
-            if done_val == b"1":
-                await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
-            elif stopped == b"1":
-                print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
-                await _notify_edit(msg_id, f"⏸ Paused: {fn}")
-            else:
-                print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
-                await prefetch_queue.put(movie_id)
+            if task and task._task:
+                if msg_id:
+                    await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
+                else:
+                    msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
+                
+                reporter = asyncio.create_task(
+                    _progress_reporter(movie_id, fn, m["file_size"], msg_id)
+                )
+                await task._task  # wait till done/cancelled/evicted before next queued item
+                reporter.cancel()
+                # Cancelled mid-way by a priority (play) request? -> not really
+                # done, put back at the end of the queue to finish later.
+                # But if the user explicitly paused/evicted it from the
+                # dashboard, respect that instead of instantly restarting.
+                done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+                stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
+                if done_val == b"1":
+                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                elif stopped == b"1":
+                    print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
+                    await _notify_edit(msg_id, f"⏸ Paused: {fn}")
+                else:
+                    print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
+                    await prefetch_queue.put(movie_id)
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
@@ -976,10 +938,6 @@ async def _prefetch_worker(worker_id: int = 0):
                     if msg_id:
                         await _notify_edit(msg_id, f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
                     else:
-                        # Bound deferred_notifications: evict oldest if at capacity
-                        if len(deferred_notifications) >= _DEFERRED_MAX:
-                            oldest_key = next(iter(sorted(deferred_notifications.keys())))
-                            deferred_notifications.pop(oldest_key, None)
                         msg_id = await _notify_send(f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
                     if msg_id:
                         deferred_notifications[movie_id] = msg_id
@@ -1053,8 +1011,7 @@ async def _sync_channel(force: bool = False) -> int:
                         found_ids.add(mid)
                         count += 1
                         max_id_seen = max(max_id_seen, msg.id)
-                    except Exception:
-                        continue
+                    except: continue
             except AuthKeyDuplicated as ae:
                 print(f"[sync] AuthKeyDuplicated on client. Marking client broken: {ae}")
                 client_pool.mark_broken_by_client(active_tg)
@@ -1094,7 +1051,7 @@ MANIFEST = {
     "id": "org.tgstream.hybrid", "version": "2.0.0", "name": "TGStream",
     "description": "Hybrid predictive streaming from Telegram via Stremio",
     "resources": ["catalog", "meta", "stream"], "types": ["movie", "series"],
-    "idPrefixes": ["tgm:", "tgs:"],
+    "idPrefixes": ["tgm:", "tgs:", "tt"],
     "catalogs": [
         {"type": "movie",  "id": "tgstream_movies", "name": "TG Movies"},
         {"type": "series", "id": "tgstream_series", "name": "TG Series"},
@@ -1480,10 +1437,39 @@ async def _yield_local_file(dl_file, start: int, length: int, request: Request):
 async def _hydrate_if_cached(movie_id: str, file_size: int) -> bool:
     """
     Returns True if the file is fully downloaded locally and ready to serve.
-    Delegates to download_manager.hydrate_cached() for the actual logic.
+    Side-effect: ensures download_manager._maps/_files are populated for this movie_id
+    so proxy Path A can pread immediately.
     Never touches Telegram.
     """
-    return await download_manager.hydrate_cached(movie_id, file_size, redis_client)
+    sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+    if not sparse_path.exists():
+        return False
+
+    # In-memory map already covers full range?
+    dl_map = download_manager.get_map(movie_id)
+    dl_file = download_manager.get_file(movie_id)
+    if dl_map and dl_map.has_range(0, file_size - 1):
+        return True
+
+    # Cheap Redis flag check
+    done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+    if done_val != b"1":
+        # Last resort: load map and verify coverage
+        dl_map = await download_manager._load_map(movie_id, redis_client)
+        if not dl_map.has_range(0, file_size - 1):
+            return False
+        # Coverage confirmed — backfill flag
+        await redis_client.set(f"tgstream:dl:done:{movie_id}", b"1")
+
+    # Hydrate in-memory state so Path A works
+    if download_manager.get_map(movie_id) is None:
+        dl_map = await download_manager._load_map(movie_id, redis_client)
+        download_manager._maps[movie_id] = dl_map
+    if download_manager.get_file(movie_id) is None:
+        from downloader import SparseFile
+        download_manager._files[movie_id] = SparseFile(sparse_path)
+
+    return True
 
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
