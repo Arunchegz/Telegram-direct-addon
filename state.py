@@ -273,35 +273,6 @@ def show_id(filename: str) -> str:
 
 # ── Advanced Matching Logic ──────────────────────────────────────────────────
 
-def _normalize_filename(text: str) -> str:
-    """Normalizes separators, strips extensions, normalizes numbers, and season/episode terms."""
-    if not text:
-        return ""
-    # Strip extension
-    text = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", text)
-    # Normalize separators to spaces
-    text = re.sub(r"[._\-–—+]", " ", text)
-    # Normalize numbers words to digits (basic)
-    text = re.sub(r"\bone\b", "1", text, flags=re.IGNORECASE)
-    text = re.sub(r"\btwo\b", "2", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bthree\b", "3", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bfour\b", "4", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bfive\b", "5", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bsix\b", "6", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bseven\b", "7", text, flags=re.IGNORECASE)
-    text = re.sub(r"\beight\b", "8", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bnine\b", "9", text, flags=re.IGNORECASE)
-    # Normalize season/episode terms
-    text = re.sub(r"\btemporada\b", "season", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bcapitulo\b", "episode", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bseason\b", "season", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bepisode\b", "episode", text, flags=re.IGNORECASE)
-    # Lowercase and clean
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9 ]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def parse_season_episode(filename: str) -> tuple[Optional[int], Optional[int]]:
     """
     Uses regexes to find (season, episode).
@@ -314,12 +285,12 @@ def parse_season_episode(filename: str) -> tuple[Optional[int], Optional[int]]:
         return int(m.group(1)), int(m.group(2))
     
     # Spanish/Portuguese: Temporada N Capitulo M
-    m2 = re.search(r"[Tt]emporada[\s._-]*(\d+)[\s\S]*?[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
+    m2 = re.search(r"[Tt]emporada[\s._-]*(\d+)[\s._-]*[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
     if m2:
         return int(m2.group(1)), int(m2.group(2))
         
     # English: Season N Episode M
-    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
+    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s._-]*[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
     if m3:
         return int(m3.group(1)), int(m3.group(2))
 
@@ -357,7 +328,7 @@ def normalize_title(title: str) -> str:
     # Simple replacement for common ones
     roman_map = {
         'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6',
-        'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10'
+        'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10', 'I': '1'
     }
     for roman, num in roman_map.items():
         # Use word boundaries to avoid replacing parts of other words
@@ -409,15 +380,19 @@ def matches_title(filename: str, title: str) -> bool:
         return True
         
     # Check if all major keywords from title are in prefix
-    title_words = set(norm_title.split())
-    prefix_words = set(norm_prefix.split())
-    
-    # Filter out very short words (like 'the', 'a', 'of') if desired, 
-    # but for robustness we check most.
-    # Let's require at least 70% of title words to be in prefix, min 1 word.
+    # Strip stopwords so 'The Dark Knight' matches 'Dark.Knight.2008.mkv'
+    _STOPWORDS = {'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'and', 'or'}
+    title_words = set(norm_title.split()) - _STOPWORDS
+    prefix_words = set(norm_prefix.split()) - _STOPWORDS
+
+    if not title_words:
+        # All words were stopwords — fall back to full set
+        title_words = set(norm_title.split())
+        prefix_words = set(norm_prefix.split())
+
     if not title_words:
         return False
-        
+
     matches = sum(1 for w in title_words if w in prefix_words)
     return matches >= max(1, len(title_words) * 0.7)
 
@@ -426,7 +401,7 @@ class VideoMatcher:
     """
     Robust score-based matching logic for Stremio/Telegram integration.
     """
-    DEFAULT_THRESHOLD = 55
+    DEFAULT_THRESHOLD = 35
 
     @staticmethod
     def calculate_match_score(filename: str, title: str, year: str, season: int, episode: int) -> int:
@@ -455,16 +430,13 @@ class VideoMatcher:
                     score += 20  # Exact year match
                 elif file_year and abs(file_year - meta_year) == 1:
                     score += 5   # Off-by-1 year tolerance
-                else:
-                    score -= 10  # Mismatch
+                elif file_year:
+                    score -= 10  # File has a year and it mismatches — penalize
+                # else: file has no year tag — neutral, no penalty
             except ValueError:
                 pass
         else:
-            # No year in meta, if file has year, slight penalty or neutral? 
-            # Spec says: no-year is +5. This implies if meta has no year, we give +5 if file has one? 
-            # Or if meta has no year, we don't penalize? 
-            # "no-year is +5" usually means if the meta object lacks a year, we give a small bonus for matching files that DO have a year (as it's better than no info).
-            # Let's interpret: If meta year is empty, we give +5 if file has a year.
+            # No year in meta — give small bonus if file has a year (extra info)
             if file_year:
                 score += 5
         
@@ -483,16 +455,13 @@ class VideoMatcher:
                 # This is a mismatch for specific SE request
                 score = 0
         else:
-            # No specific SE requested (e.g. movie or general series listing)
+            # No specific SE requested (movie or general series listing)
             if file_season is not None and file_episode is not None:
-                # File has SE, meta doesn't care. 
-                # Spec: "no SE in file is -10". 
-                # Implies: If file HAS SE, it's fine? Or is it neutral?
-                # Let's assume neutral if meta doesn't specify SE.
+                # File has SE tags but meta doesn't request a specific one — neutral
                 pass
             else:
-                # File has no SE info
-                score -= 10
+                # File has no SE info and none was requested — expected for movies, neutral
+                pass
 
         # Cap score
         score = max(0, min(100, score))
