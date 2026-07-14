@@ -11,6 +11,7 @@ import time
 import unicodedata
 from typing import Optional
 
+import PTN
 import httpx
 import redis.asyncio as aioredis
 
@@ -275,43 +276,42 @@ def show_id(filename: str) -> str:
 
 def parse_season_episode(filename: str) -> tuple[Optional[int], Optional[int]]:
     """
-    Uses regexes to find (season, episode).
-    Returns (season, episode) or (1, episode) for standalone episodes.
+    Extract (season, episode) from filename using PTN (parse-torrent-name)
+    with fallback regexes for Spanish/Portuguese patterns PTN doesn't cover.
+    Returns (season, episode) where season defaults to 1 for standalone episodes.
     Returns (None, None) if no SE found.
     """
-    # SxxExx / S1E5
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
+    r = PTN.parse(filename)
+
+    season = r.get("season")
+    episode = r.get("episode")
+
+    # PTN returns list for multi-episode (e.g. S01E01-E03 → [1,2,3]); take first
+    if isinstance(episode, list):
+        episode = episode[0] if episode else None
+    if isinstance(season, list):
+        season = season[0] if season else None
+
+    if season is not None and episode is not None:
+        return int(season), int(episode)
+    if episode is not None:
+        # Standalone episode (no season tag) — default season 1
+        return 1, int(episode)
+
+    # PTN fallback: Spanish/Portuguese — Temporada N Capitulo M
+    m = re.search(r"[Tt]emporada[\s._-]*(\d+)[\s._-]*[Cc]apitulo[\s._-]*(\d+)", filename)
     if m:
         return int(m.group(1)), int(m.group(2))
-    
-    # Spanish/Portuguese: Temporada N Capitulo M
-    m2 = re.search(r"[Tt]emporada[\s._-]*(\d+)[\s._-]*[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m2:
-        return int(m2.group(1)), int(m2.group(2))
-        
-    # English: Season N Episode M
-    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s._-]*[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m3:
-        return int(m3.group(1)), int(m3.group(2))
 
-    # Standalone Episode: Episode N or Capitulo N or just N at end (if context implies)
-    # We look for "Episode N" or "Capitulo N"
-    m4 = re.search(r"[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m4:
-        return 1, int(m4.group(1))
-        
-    m5 = re.search(r"[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m5:
-        return 1, int(m5.group(1))
+    # Temporada N only
+    m = re.search(r"[Tt]emporada[\s._-]*(\d+)", filename)
+    if m:
+        return int(m.group(1)), 1
 
-    # Season N only
-    m6 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m6:
-        return int(m6.group(1)), 1
-        
-    m7 = re.search(r"[Tt]emporada[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m7:
-        return int(m7.group(1)), 1
+    # Capitulo N only → season 1
+    m = re.search(r"[Cc]apitulo[\s._-]*(\d+)", filename)
+    if m:
+        return 1, int(m.group(1))
 
     return None, None
 
@@ -338,27 +338,27 @@ def normalize_title(title: str) -> str:
 
 
 def _clean_title_prefix(filename: str) -> str:
-    """Extracts filename prefix up to the season/episode or year."""
+    """Extracts title from filename. Uses PTN as primary, regex strip as fallback."""
+    # PTN extracts title directly — handles most patterns reliably
+    r = PTN.parse(filename)
+    ptn_title = r.get("title", "")
+    if ptn_title:
+        return ptn_title.lower().strip()
+
+    # Fallback: manual strip for unusual filenames PTN fails on
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
     name = re.sub(r"[._\-–—+]", " ", name)
-    
-    # Remove Season/Episode markers
-    name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name)
     name = re.sub(r"\b[Ss]eason\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b[Ee]pisode\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b[Tt]emporada\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b[Cc]apitulo\s*\d+\b", "", name, flags=re.IGNORECASE)
-    
-    # Remove Year
     name = re.sub(r"\b(?:19|20)\d{2}\b", "", name)
-    
-    # Remove Quality/Source keywords
     name = re.sub(
-        r"\b(?:1080p|2160p|720p|480p|bluray|webrip|web dl|"
+        r"\b(?:1080p|2160p|720p|480p|bluray|webrip|web.dl|"
         r"bdrip|hdrip|remux|x264|x265|hevc|avc|h264|h265|aac|dts|atmos|10bit)\b",
         "", name, flags=re.IGNORECASE
     )
-    
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
