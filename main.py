@@ -1066,7 +1066,7 @@ MANIFEST = {
     "id": "org.tgstream.hybrid", "version": "2.0.0", "name": "TGStream",
     "description": "Hybrid predictive streaming from Telegram via Stremio",
     "resources": ["catalog", "meta", "stream", "subtitles"], "types": ["movie", "series"],
-    "idPrefixes": ["tgm:", "tgs:"],
+    "idPrefixes": ["tgm:", "tgs:", "tt"],
     "catalogs": [
         {"type": "movie",  "id": "tgstream_movies", "name": "TG Movies"},
         {"type": "series", "id": "tgstream_series", "name": "TG Series"},
@@ -1360,11 +1360,17 @@ async def stream(type: str, id: str):
             score = st.VideoMatcher.calculate_match_score(fn, title, year, season, episode)
             if score >= st.VideoMatcher.DEFAULT_THRESHOLD:
                 scored_files.append((score, mid, m))
-                try:
-                    fs = m.get("file_size")
-                    _schedule(_ensure_download(mid, fs, m["message_id"]))
-                except Exception as e:
-                    print(f"[stream] warn: {e}")
+        
+        # Sort by score descending
+        scored_files.sort(key=lambda x: x[0], reverse=True)
+
+        for score, mid, m in scored_files:
+            fn = m.get("file_name","")
+            try:
+                fs = m.get("file_size")
+                _schedule(_ensure_download(mid, fs, m["message_id"]))
+            except Exception as e:
+                print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid)
             label = "TGStream ⚡" if cached else "TGStream"
