@@ -1156,13 +1156,6 @@ async def debug_downloads(request: Request):
 
 @app.get("/catalog/{type}/{id}.json")
 async def catalog(type: str, id: str):
-    # Always trigger sync on catalog request for freshest data (using rate-limiting inside _sync_channel)
-    print(f"Catalog request: triggering fresh sync")
-    try:
-        await _sync_channel(force=False)
-    except Exception as e:
-        print(f"Catalog sync failed: {e}")
-    
     movies = await st.load_movies(redis_client)
     def is_series(m): return bool(st.IS_SERIES_RE.search(m.get("file_name","")))
     
