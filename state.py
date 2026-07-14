@@ -68,8 +68,20 @@ async def _fetch_poster(filename: str) -> tuple[str, str]:
         year = ""
         catalog_type = "series"
     else:
+        try:
+            from movie_matcher import resolve_movie
+            meta = await resolve_movie(filename)
+            if meta:
+                poster = meta.get("poster") or _local_placeholder_poster(meta.get("name", ""))
+                imdb_id = meta.get("id", "")
+                if imdb_id and imdb_id.startswith("tt"):
+                    return poster, imdb_id
+        except Exception as e:
+            print(f"[fetch_poster] resolve_movie failed for {filename}: {e}")
+
         title, year = parse_title_year(filename)
         catalog_type = "movie"
+
     if not title:
         return _local_placeholder_poster(""), ""
     query = f"{title} {year}".strip()
