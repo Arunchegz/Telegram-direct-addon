@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import httpx
 import json
 import math
 import os
 import re
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -200,7 +202,10 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         # Genuine new upload event -> auto-prefetch.
-                        await prefetch_queue.put(mid)
+                        try:
+                            prefetch_queue.put_nowait(mid)
+                        except asyncio.QueueFull:
+                            print(f"[listener] prefetch_queue full, dropping {mid}")
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=True))
         except Exception as se:
@@ -230,6 +235,7 @@ async def lifespan(app: FastAPI):
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
     download_manager.on_alert = _notify_send
+    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)  # #2
     client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
@@ -327,8 +333,6 @@ async def _sync_loop():
             print(f"[sync_loop] {e}")
         await asyncio.sleep(SYNC_POLL_S)
 
-
-import httpx
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bot must be admin
@@ -524,7 +528,7 @@ async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_
         await asyncio.sleep(1)
 
 
-prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue()
+prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=200)
 
 
 async def _bot_reply(chat_id, text: str):
@@ -793,10 +797,10 @@ async def _bot_channel_listener():
     else:
         print("[listener] ADMIN_USER_ID not set — /status /pause /resume /evict /find disabled")
     offset = 0
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=45) as c:
-                r = await c.get(f"{_TG_API}/getUpdates", params={
+    async with httpx.AsyncClient(timeout=45) as poll_client:
+        while True:
+            try:
+                r = await poll_client.get(f"{_TG_API}/getUpdates", params={
                     "offset": offset, "timeout": 30,
                     "allowed_updates": '["channel_post","message","callback_query"]',
                 })
@@ -849,12 +853,11 @@ async def _bot_channel_listener():
                                 await _handle_admin_callback(cq)
                             except Exception as e:
                                 print(f"[listener] callback failed: {e}")
-        except Exception as e:
-            import traceback
-            print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
-            if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
-                traceback.print_exc()
-            await asyncio.sleep(10)
+            except Exception as e:
+                print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
+                if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
+                    traceback.print_exc()
+                await asyncio.sleep(10)
 
 
 deferred_notifications = {}
@@ -874,7 +877,10 @@ async def _prefetch_worker(worker_id: int = 0):
             if download_manager.paused:
                 print(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
                 await asyncio.sleep(15)
-                await prefetch_queue.put(movie_id)
+                try:
+                    prefetch_queue.put_nowait(movie_id)
+                except asyncio.QueueFull:
+                    print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on pause requeue")
                 continue
             movies = await st.load_movies(redis_client)
             m = movies.get(movie_id)
@@ -896,6 +902,7 @@ async def _prefetch_worker(worker_id: int = 0):
 
             # Send notification afterwards (if task successfully started)
             msg_id = deferred_notifications.pop(movie_id, None)
+            reporter = None  # N5: initialize before any await so finally can always cancel
             if task and task._task:
                 if msg_id:
                     await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
@@ -922,7 +929,10 @@ async def _prefetch_worker(worker_id: int = 0):
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
                 else:
                     print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
-                    await prefetch_queue.put(movie_id)
+                    try:
+                        prefetch_queue.put_nowait(movie_id)
+                    except asyncio.QueueFull:
+                        print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on preempt requeue")
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
@@ -942,10 +952,15 @@ async def _prefetch_worker(worker_id: int = 0):
                     if msg_id:
                         deferred_notifications[movie_id] = msg_id
                     await asyncio.sleep(15)
-                    await prefetch_queue.put(movie_id)
+                    try:
+                        prefetch_queue.put_nowait(movie_id)
+                    except asyncio.QueueFull:
+                        print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on deferred requeue")
             print(f"[prefetch:{worker_id}] finished {movie_id}")
         except Exception as e:
             print(f"[prefetch:{worker_id}] {movie_id} failed: {e}")
+            if reporter is not None and not reporter.done():
+                reporter.cancel()
         finally:
             prefetch_queue.task_done()
 
@@ -1330,7 +1345,7 @@ async def stream(type: str, id: str):
                 try:
                     my = int(year)
                     if not any(str(my+d) in fn for d in (-1,0,1)): continue
-                except:
+                except Exception:
                     m4 = re.match(r"(\d{4})", year)
                     if m4:
                         if m4.group(1) not in fn: continue
@@ -1357,7 +1372,7 @@ async def stream(type: str, id: str):
         try:
             season = int(parts[1])
             episode = int(parts[2])
-        except:
+        except Exception:
             return JSONResponse({"streams": []})
             
         streams = []
@@ -1432,7 +1447,7 @@ async def subtitles(type: str, id: str):
             try:
                 season = int(parts[1])
                 episode = int(parts[2])
-            except:
+            except Exception:
                 pass
             for m in movies.values():
                 if st.show_id(m.get("file_name", "")) == sid:
@@ -1532,7 +1547,7 @@ async def proxy(movie_id: str, request: Request):
         try:
             msg       = await _fetch_msg(movie["message_id"])
             file_size = (msg.video or msg.document).file_size
-        except: raise HTTPException(502, "Telegram unavailable")
+        except Exception: raise HTTPException(502, "Telegram unavailable")
 
     etag = f'"{movie["message_id"]}-{file_size}"'
 
@@ -1566,7 +1581,7 @@ async def proxy(movie_id: str, request: Request):
                 p = spec.split("-")
                 if p[0]: start = int(p[0])
                 if len(p) > 1 and p[1]: end = int(p[1])
-        except:
+        except Exception:
             return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
     end = min(end, file_size - 1)
     req_start = start
@@ -1653,7 +1668,7 @@ async def proxy(movie_id: str, request: Request):
                 yield chunk
             async with stream_sem:
                 try: msg = await _fetch_msg(movie["message_id"])
-                except: return
+                except Exception: return
                 aligned   = (rest_start // TG_CHUNK) * TG_CHUNK
                 first_cut = rest_start - aligned
                 last_cut  = (end % TG_CHUNK) + 1
@@ -1677,7 +1692,7 @@ async def proxy(movie_id: str, request: Request):
         msg = await _fetch_msg(movie["message_id"])
     except FloodWait as e:
         raise HTTPException(503, f"Rate limited — retry after {e.value}s")
-    except:
+    except Exception:
         raise HTTPException(502, "Telegram unavailable")
 
     if not (msg.video or msg.document):
@@ -1717,7 +1732,7 @@ async def start_download_media(movie_id: str):
         try:
             msg = await _fetch_msg(movie["message_id"])
             file_size = (msg.video or msg.document).file_size
-        except:
+        except Exception:
             raise HTTPException(status_code=502, detail="Telegram unavailable")
             
     await redis_client.delete(f"tgstream:dl:stopped:{movie_id}")
@@ -1739,6 +1754,7 @@ async def pause_download_media(movie_id: str):
 async def evict_cache_media(movie_id: str):
     await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
     await download_manager.evict(movie_id, redis_client)
+    deferred_notifications.pop(movie_id, None)  # #2: prevent leak on API eviction
     return {"status": "ok"}
 
 
@@ -1751,6 +1767,7 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
     
     # 1. Evict cache from downloader
     await download_manager.evict(movie_id, redis_client)
+    deferred_notifications.pop(movie_id, None)  # #2: prevent leak on delete
     
     # 2. Optionally delete from Telegram
     if delete_tg:

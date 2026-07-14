@@ -404,7 +404,7 @@ class DownloadTask:
 
                     try:
                         from metrics import metrics
-                        metrics.total_downloaded_mb += len(data) / 1024 / 1024
+                        await metrics.record_download_chunk(len(data))
                     except Exception:
                         pass
 
@@ -515,6 +515,7 @@ class DownloadManager:
         self._max_concurrent_downloads = 1           # placeholder, resized in init_pool_size()
         self.paused = False    # set via /pause admin command — blocks new prefetch starts
         self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
+        self.on_evict = None   # optional fn(movie_id) called on every eviction (sync, for cleanup hooks)
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -666,11 +667,27 @@ class DownloadManager:
             R_DL_TS.format(movie_id),
         )
         print(f"[dm] evicted {movie_id}")
+        if self.on_evict:
+            try:
+                self.on_evict(movie_id)
+            except Exception as e:
+                print(f"[dm] on_evict hook failed for {movie_id}: {e}")
+
+    @staticmethod
+    def _disk_usage(path) -> int:
+        """Actual bytes on disk for a sparse file — st_blocks*512, not st_size.
+        st_size is always the full truncated size regardless of how little
+        has been written, so it would make LRU think every file is 'full'."""
+        try:
+            st = path.stat()
+            return st.st_blocks * 512
+        except OSError:
+            return 0
 
     async def evict_lru_if_needed(self, redis: aioredis.Redis):
         """Evict oldest accessed movies if total local storage > MAX_LOCAL_GB."""
         total = sum(
-            f.path.stat().st_size
+            self._disk_usage(f.path)
             for f in self._files.values()
             if f.path.exists()
         )
@@ -693,7 +710,7 @@ class DownloadManager:
             if total <= limit:
                 break
             f = self._files.get(mid)
-            size = f.path.stat().st_size if f and f.path.exists() else 0
+            size = self._disk_usage(f.path) if f else 0
             await self.evict(mid, redis)
             total -= size
             print(f"[dm] LRU evict {mid} freed {size/1024/1024:.0f}MB")
@@ -744,7 +761,7 @@ class DownloadManager:
         for mid, task in self._tasks.items():
             f = self._files.get(mid)
             dm = self._maps.get(mid)
-            size_on_disk = f.path.stat().st_size if f and f.path.exists() else 0
+            size_on_disk = self._disk_usage(f.path) if f and f.path.exists() else 0
             result[mid] = {
                 "done":           task.is_done(),
                 "downloaded_mb":  round(dm.total_bytes() / 1024 / 1024, 1) if dm else 0,

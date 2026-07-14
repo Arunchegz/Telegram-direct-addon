@@ -3,6 +3,8 @@ state.py — Redis helpers for movie index + poster cache.
 Download state lives in downloader.py (separate key namespace).
 """
 from __future__ import annotations
+import base64
+import hashlib
 import json
 import re
 import time
@@ -115,7 +117,6 @@ async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str
 
 def _local_placeholder_poster(title: str) -> str:
     """Inline SVG data URI — no external dependency, never 404s/times out."""
-    import base64
     safe_title = (title or "No Poster")[:40].replace("&", "and")
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450">'
@@ -141,7 +142,9 @@ async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
 
 # ── String helpers ────────────────────────────────────────────────────────────
 def movie_id(filename: str) -> str:
-    return re.sub(r"[^a-z0-9_]", "_", filename.lower())
+    slug = re.sub(r"[^a-z0-9_]", "_", filename.lower())
+    suffix = hashlib.md5(filename.encode()).hexdigest()[:8]
+    return f"{slug}_{suffix}"
 
 
 def fmt_size(size) -> str:

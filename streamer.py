@@ -35,6 +35,7 @@ class ByteStreamer:
         self._throttle_locks: dict = {}        # per-client lock, created lazily
         self._session_locks: dict = {}         # Lock to serialize session creation per client
         self._backoff_until = {}  # Per-client and DC backoff state: {(c_idx, dc_id): until_timestamp}
+        self._msg_cache: dict = {}  # (chat_id, msg_id, c_idx) -> (msg, fetched_at)
         # If `client` is actually a ClientPool (has __len__), scale concurrent
         # GetFile slots to the pool size — one slot per session — instead of
         # serializing every stream in the process through a single global lock.
@@ -93,8 +94,6 @@ class ByteStreamer:
         """Get or fetch a fresh message for the specific client."""
         now = time.time()
         key = (chat_id, message_id, client_idx if client_idx is not None else client)
-        if not hasattr(self, "_msg_cache"):
-            self._msg_cache = {}
         cached_msg, fetched_at = self._msg_cache.get(key, (None, 0.0))
         if cached_msg is None or (now - fetched_at) > 3000:
             try:
@@ -116,14 +115,12 @@ class ByteStreamer:
 
     def _invalidate_msg_cache(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
         key = (chat_id, message_id, client_idx if client_idx is not None else client)
-        if hasattr(self, "_msg_cache") and key in self._msg_cache:
+        if key in self._msg_cache:
             del self._msg_cache[key]
 
     def prune_msg_cache(self, max_age_s: float = 3000):
         """Drop entries older than max_age_s. Cache has no natural eviction
         otherwise and grows forever on a long-lived process."""
-        if not hasattr(self, "_msg_cache"):
-            return 0
         now = time.time()
         stale = [k for k, (_, ts) in self._msg_cache.items() if (now - ts) > max_age_s]
         for k in stale:
