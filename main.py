@@ -1248,15 +1248,28 @@ async def meta(type: str, id: str):
             movies = await st.load_movies(redis_client)
             videos = []
             seen_episodes = set()
-            matching = [m for m in movies.values() if st.flex_match(title, m.get("file_name",""))]
-            matching.sort(key=lambda m: m.get("file_name",""))
-            for m in matching:
-                fn = m.get("file_name","")
+            
+            # Use VideoMatcher for scoring
+            scored_files = []
+            for m in movies.values():
+                fn = m.get("file_name", "")
+                # Parse SE from file for the video object
                 info = st.parse_series(fn)
                 s = info["season"] if info else 1
                 ep = info["episode"] if info else 1
+                
+                # Calculate score
+                score = st.VideoMatcher.calculate_match_score(fn, title, year, s, ep)
+                if score >= st.VideoMatcher.DEFAULT_THRESHOLD:
+                    scored_files.append((score, m, s, ep))
+            
+            # Sort by score descending
+            scored_files.sort(key=lambda x: x[0], reverse=True)
+            
+            for score, m, s, ep in scored_files:
                 key = (s, ep)
-                if key in seen_episodes: continue
+                if key in seen_episodes: 
+                    continue
                 seen_episodes.add(key)
                 videos.append({
                     "id": f"{id}:{s}:{ep}", "season": s, "episode": ep, "title": f"Episode {ep}",
@@ -1338,26 +1351,20 @@ async def stream(type: str, id: str):
         title, year = await st.get_cinemeta(type, imdb_id)
         if not title: return JSONResponse({"streams": []})
         streams = []
+        
+        # Use VideoMatcher for scoring
+        scored_files = []
         for mid, m in movies.items():
             fn = m.get("file_name","")
-            if not st.flex_match(title, fn): continue
-            if year and type == "movie":
+            # Calculate score
+            score = st.VideoMatcher.calculate_match_score(fn, title, year, season, episode)
+            if score >= st.VideoMatcher.DEFAULT_THRESHOLD:
+                scored_files.append((score, mid, m))
                 try:
-                    my = int(year)
-                    if not any(str(my+d) in fn for d in (-1,0,1)): continue
-                except Exception:
-                    m4 = re.match(r"(\d{4})", year)
-                    if m4:
-                        if m4.group(1) not in fn: continue
-                    elif year not in fn: continue
-            if season and episode:
-                info = st.parse_series(fn)
-                if info and (info["season"]!=season or info["episode"]!=episode): continue
-            try:
-                fs = m.get("file_size")
-                _schedule(_ensure_download(mid, fs, m["message_id"]))
-            except Exception as e:
-                print(f"[stream] warn: {e}")
+                    fs = m.get("file_size")
+                    _schedule(_ensure_download(mid, fs, m["message_id"]))
+                except Exception as e:
+                    print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid)
             label = "TGStream ⚡" if cached else "TGStream"
@@ -1421,6 +1428,7 @@ async def stream(type: str, id: str):
     label = "TGStream ⚡" if cached else "TGStream"
     return JSONResponse({"streams": [{"name":label,
         "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}"}]})
+
 
 
 @app.get("/subtitles/{type}/{id}.json")

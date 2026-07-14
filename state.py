@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from typing import Optional
 
 import httpx
@@ -59,7 +60,7 @@ async def del_movie(redis: aioredis.Redis, mid: str):
 
 # ── Poster cache ──────────────────────────────────────────────────────────────
 async def _fetch_poster(filename: str) -> tuple[str, str]:
-    """Returns (poster_url, imdb_id). imdb_id is \'\' if not found."""
+    """Returns (poster_url, imdb_id). imdb_id is '' if not found."""
     is_series = bool(IS_SERIES_RE.search(filename))
     if is_series:
         title = parse_show_title(filename)
@@ -268,3 +269,231 @@ def parse_show_title(filename: str) -> str:
 def show_id(filename: str) -> str:
     title = parse_show_title(filename)
     return movie_id(title)
+
+
+# ── Advanced Matching Logic ──────────────────────────────────────────────────
+
+def _normalize_filename(text: str) -> str:
+    """Normalizes separators, strips extensions, normalizes numbers, and season/episode terms."""
+    if not text:
+        return ""
+    # Strip extension
+    text = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", text)
+    # Normalize separators to spaces
+    text = re.sub(r"[._\-–—+]", " ", text)
+    # Normalize numbers words to digits (basic)
+    text = re.sub(r"\bone\b", "1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\btwo\b", "2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bthree\b", "3", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bfour\b", "4", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bfive\b", "5", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsix\b", "6", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bseven\b", "7", text, flags=re.IGNORECASE)
+    text = re.sub(r"\beight\b", "8", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bnine\b", "9", text, flags=re.IGNORECASE)
+    # Normalize season/episode terms
+    text = re.sub(r"\btemporada\b", "season", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bcapitulo\b", "episode", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bseason\b", "season", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bepisode\b", "episode", text, flags=re.IGNORECASE)
+    # Lowercase and clean
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9 ]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_season_episode(filename: str) -> tuple[Optional[int], Optional[int]]:
+    """
+    Uses regexes to find (season, episode).
+    Returns (season, episode) or (1, episode) for standalone episodes.
+    Returns (None, None) if no SE found.
+    """
+    # SxxExx / S1E5
+    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    
+    # Spanish/Portuguese: Temporada N Capitulo M
+    m2 = re.search(r"[Tt]emporada[\s._-]*(\d+)[\s\S]*?[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m2:
+        return int(m2.group(1)), int(m2.group(2))
+        
+    # English: Season N Episode M
+    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m3:
+        return int(m3.group(1)), int(m3.group(2))
+
+    # Standalone Episode: Episode N or Capitulo N or just N at end (if context implies)
+    # We look for "Episode N" or "Capitulo N"
+    m4 = re.search(r"[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m4:
+        return 1, int(m4.group(1))
+        
+    m5 = re.search(r"[Cc]apitulo[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m5:
+        return 1, int(m5.group(1))
+
+    # Season N only
+    m6 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m6:
+        return int(m6.group(1)), 1
+        
+    m7 = re.search(r"[Tt]emporada[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m7:
+        return int(m7.group(1)), 1
+
+    return None, None
+
+
+def normalize_title(title: str) -> str:
+    """Removes diacritics, converts Roman numerals (II-X to 2-10), and lowers/strips."""
+    if not title:
+        return ""
+    # Remove diacritics via NFD decomposition
+    nfkd = unicodedata.normalize('NFD', title)
+    title = ''.join(c for c in nfkd if unicodedata.category(c) != 'Mn')
+    
+    # Convert Roman Numerals II to X to numbers
+    # Simple replacement for common ones
+    roman_map = {
+        'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6',
+        'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10'
+    }
+    for roman, num in roman_map.items():
+        # Use word boundaries to avoid replacing parts of other words
+        title = re.sub(r'\b' + roman + r'\b', num, title, flags=re.IGNORECASE)
+        
+    return title.lower().strip()
+
+
+def _clean_title_prefix(filename: str) -> str:
+    """Extracts filename prefix up to the season/episode or year."""
+    name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = re.sub(r"[._\-–—+]", " ", name)
+    
+    # Remove Season/Episode markers
+    name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b[Ss]eason\s*\d+\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b[Ee]pisode\s*\d+\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b[Tt]emporada\s*\d+\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b[Cc]apitulo\s*\d+\b", "", name, flags=re.IGNORECASE)
+    
+    # Remove Year
+    name = re.sub(r"\b(?:19|20)\d{2}\b", "", name)
+    
+    # Remove Quality/Source keywords
+    name = re.sub(
+        r"\b(?:1080p|2160p|720p|480p|bluray|webrip|web dl|"
+        r"bdrip|hdrip|remux|x264|x265|hevc|avc|h264|h265|aac|dts|atmos|10bit)\b",
+        "", name, flags=re.IGNORECASE
+    )
+    
+    return re.sub(r"\s+", " ", name).strip().lower()
+
+
+def matches_title(filename: str, title: str) -> bool:
+    """Checks if title is in prefix, or all major keywords are in prefix."""
+    prefix = _clean_title_prefix(filename)
+    norm_title = normalize_title(title)
+    norm_prefix = normalize_title(prefix)
+    
+    if not norm_title or not norm_prefix:
+        return False
+        
+    # Exact match of normalized strings
+    if norm_title == norm_prefix:
+        return True
+        
+    # Title is contained in prefix
+    if norm_title in norm_prefix:
+        return True
+        
+    # Check if all major keywords from title are in prefix
+    title_words = set(norm_title.split())
+    prefix_words = set(norm_prefix.split())
+    
+    # Filter out very short words (like 'the', 'a', 'of') if desired, 
+    # but for robustness we check most.
+    # Let's require at least 70% of title words to be in prefix, min 1 word.
+    if not title_words:
+        return False
+        
+    matches = sum(1 for w in title_words if w in prefix_words)
+    return matches >= max(1, len(title_words) * 0.7)
+
+
+class VideoMatcher:
+    """
+    Robust score-based matching logic for Stremio/Telegram integration.
+    """
+    DEFAULT_THRESHOLD = 55
+
+    @staticmethod
+    def calculate_match_score(filename: str, title: str, year: str, season: int, episode: int) -> int:
+        """
+        Calculates a match score between a file and a meta object.
+        Returns score between 0 and 100.
+        """
+        score = 0
+        
+        # 1. Title Match
+        if not matches_title(filename, title):
+            return 0  # Immediate rejection if title doesn't match at all
+        
+        score += 20  # Base score for title match
+
+        # 2. Year Match
+        file_year = None
+        ym = re.search(r"\b(19|20)\d{2}\b", filename)
+        if ym:
+            file_year = int(ym.group(0))
+        
+        if year:
+            try:
+                meta_year = int(year)
+                if file_year == meta_year:
+                    score += 20  # Exact year match
+                elif file_year and abs(file_year - meta_year) == 1:
+                    score += 5   # Off-by-1 year tolerance
+                else:
+                    score -= 10  # Mismatch
+            except ValueError:
+                pass
+        else:
+            # No year in meta, if file has year, slight penalty or neutral? 
+            # Spec says: no-year is +5. This implies if meta has no year, we give +5 if file has one? 
+            # Or if meta has no year, we don't penalize? 
+            # "no-year is +5" usually means if the meta object lacks a year, we give a small bonus for matching files that DO have a year (as it's better than no info).
+            # Let's interpret: If meta year is empty, we give +5 if file has a year.
+            if file_year:
+                score += 5
+        
+        # 3. Season/Episode Match
+        file_season, file_episode = parse_season_episode(filename)
+        
+        if season is not None and episode is not None:
+            # Specific SE requested
+            if file_season is not None and file_episode is not None:
+                if file_season == season and file_episode == episode:
+                    score += 20  # Exact SE match
+                else:
+                    score = 0    # Mismatch is immediate rejection (0)
+            else:
+                # File has no SE info, but meta requests specific SE
+                # This is a mismatch for specific SE request
+                score = 0
+        else:
+            # No specific SE requested (e.g. movie or general series listing)
+            if file_season is not None and file_episode is not None:
+                # File has SE, meta doesn't care. 
+                # Spec: "no SE in file is -10". 
+                # Implies: If file HAS SE, it's fine? Or is it neutral?
+                # Let's assume neutral if meta doesn't specify SE.
+                pass
+            else:
+                # File has no SE info
+                score -= 10
+
+        # Cap score
+        score = max(0, min(100, score))
+        return score
