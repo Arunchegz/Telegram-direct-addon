@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI):
                         # Catalog-only — no auto-prefetch (matches sync handler policy).
                         # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
-            _schedule(_sync_channel(force=True))
+            _schedule(_sync_channel(force=False))
         except Exception as se:
             print(f"[listener] Pyrogram instant sync failed: {se}")
 
