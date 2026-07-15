@@ -165,28 +165,32 @@ class ClientPool:
     async def pick(self) -> Tuple[int, Client]:
         """Round-robin among clients not currently in cooldown.
 
-        If all are cooling down, sleeps until the soonest one is free
-        rather than picking a client guaranteed to FloodWait again.
+        If all are cooling down, releases the lock, sleeps until the soonest
+        one is free, then re-acquires — so other coroutines are not blocked
+        during the wait.
         """
-        async with self._lock:
-            avail = self._available()
-            if not avail:
+        while True:
+            async with self._lock:
+                avail = self._available()
+                if avail:
+                    # Rotate over the full client count, not len(avail) — avail
+                    # shrinks whenever a client is cooling down, which skewed
+                    # the round-robin toward whichever clients were available.
+                    self._rr_counter = (self._rr_counter + 1) % len(self.clients)
+                    chosen = avail[self._rr_counter % len(avail)]
+                    return chosen, self.clients[chosen]
+                # All cooling down — compute wait outside sleep (lock held only briefly)
                 if self._cooldown_until:
                     soonest = min(self._cooldown_until.values())
                     wait = max(0.0, soonest - time.time())
                 else:
                     wait = 5.0
-                print(f"[clients] all {len(self.clients)} client(s) unavailable, waiting {wait:.1f}s")
+                n = len(self.clients)
+                print(f"[clients] all {n} client(s) unavailable, waiting {wait:.1f}s")
                 if wait > 30:
-                    self._fire_alert("all_cooldown", f"🟡 All {len(self.clients)} Telegram client(s) cooling down, waiting {wait:.0f}s")
-                await asyncio.sleep(wait)
-                avail = self._available() or list(range(len(self.clients)))
-            # Rotate over the full client count, not len(avail) — avail shrinks
-            # whenever a client is cooling down, which skewed the round-robin
-            # toward whichever clients happened to be available at pick time.
-            self._rr_counter = (self._rr_counter + 1) % len(self.clients)
-            chosen = avail[self._rr_counter % len(avail)]
-            return chosen, self.clients[chosen]
+                    self._fire_alert("all_cooldown", f"🟡 All {n} Telegram client(s) cooling down, waiting {wait:.0f}s")
+            # Lock released — sleep without blocking other callers
+            await asyncio.sleep(wait)
 
     def primary(self) -> Client:
         """Client used for cheap metadata calls (get_messages etc) that
