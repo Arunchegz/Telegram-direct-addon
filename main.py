@@ -228,8 +228,14 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         _invalidate_movies_cache()
-                        # Catalog-only — no auto-prefetch (matches sync handler policy).
-                        # Download starts on demand (Stremio stream request or dashboard).
+                        # Auto-prefetch: enqueue new movie for background download.
+                        stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+                        if stopped != b"1":
+                            try:
+                                prefetch_queue.put_nowait(mid)
+                                print(f"[listener] queued {mid} for prefetch")
+                            except asyncio.QueueFull:
+                                print(f"[listener] prefetch_queue full, skipping auto-prefetch for {mid}")
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=False))
         except Exception as se:
