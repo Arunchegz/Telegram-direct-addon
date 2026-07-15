@@ -184,6 +184,11 @@ class ByteStreamer:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
+                    # NOTE: semaphore only wraps the first GetFile call.
+                    # Subsequent chunks in the loop below invoke without it —
+                    # intentional: per-chunk throttling + per-client round-robin
+                    # provide sufficient rate-limit protection without serialising
+                    # an entire multi-chunk stream through a single semaphore slot.
                 except (FloodWait, Timeout, RpcConnectFailed) as e:
                     wait_s = e.value if hasattr(e, 'value') else 5
                     if initial_c_idx is not None and hasattr(self.client, "mark_cooldown"):
@@ -304,16 +309,16 @@ class ByteStreamer:
 
     async def _session(self, c: Client, fid: FileId) -> Session:
         dc = fid.dc_id
-        if not hasattr(c, "media_sessions"):
-            c.media_sessions = {}
-        if dc in c.media_sessions:
-            return c.media_sessions[dc]
-
+        # Lazily create the per-client session lock first (lock dict is only
+        # written from the event-loop thread, so no race on the dict itself).
         if c not in self._session_locks:
             self._session_locks[c] = asyncio.Lock()
         lock = self._session_locks[c]
         async with lock:
-            # Double check inside lock
+            # Initialise media_sessions inside the lock so two coroutines
+            # cannot both pass the hasattr check and both assign the dict.
+            if not hasattr(c, "media_sessions"):
+                c.media_sessions = {}
             if dc in c.media_sessions:
                 return c.media_sessions[dc]
 
