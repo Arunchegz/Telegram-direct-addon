@@ -303,7 +303,12 @@ class DownloadTask:
         pool_size = len(self.streamer.client) if hasattr(self.streamer.client, "__len__") else 1
         if hasattr(self.streamer.client, "acquire_download_slot"):
             self._pinned_client_idx, _initial_c = await self.streamer.client.acquire_download_slot()
-        c_idx, c = (None, None) if hasattr(self.streamer.client, "pick") else (None, self.streamer.client)
+        # Resolve an initial client immediately so _fresh_msg always gets a
+        # real Client, even before the first chunk's pick() call in the loop.
+        if hasattr(self.streamer.client, "pick"):
+            c_idx, c = await self.streamer.client.pick()
+        else:
+            c_idx, c = None, self.streamer.client
 
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
               f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
