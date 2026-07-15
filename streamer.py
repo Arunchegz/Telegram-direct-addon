@@ -276,7 +276,7 @@ class ByteStreamer:
                     # Re-pick a fresh client (don't reuse the rate-limited one)
                     if hasattr(self.client, "pick"):
                         c_idx, c = await self.client.pick()
-                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, c, c_idx):
+                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, c, c_idx):
                         yield b
                     return
                 else:
@@ -298,7 +298,7 @@ class ByteStreamer:
                     refresh_c_idx, refresh_client = await self.client.pick()
                     msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
                 # Continue from current offset with fresh client selection
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, refresh_client, refresh_c_idx):
+                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, refresh_client, refresh_c_idx):
                     yield b
                 return
 
