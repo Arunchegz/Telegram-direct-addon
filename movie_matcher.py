@@ -8,56 +8,45 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 TMDB_URL = "https://api.themoviedb.org/3"
 CINEMETA_URL = "https://v3-cinemeta.strem.io"
 
+# Shared connection-pooled client — avoids a TLS handshake per resolve call.
+# Mirrors the pattern in state.py (_get_http_client).
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+    return _http_client
+
 
 # --------------------------------------------------
 # Parse filename
+# Delegates to state.parse_title_year so both modules share one parser
+# and produce identical titles → consistent cache keys.
 # --------------------------------------------------
 
 def parse_title_year(filename: str):
+    """Thin wrapper that reuses state.parse_title_year for consistency."""
+    try:
+        from state import parse_title_year as _st_parse
+        title, year_str = _st_parse(filename)
+        year = int(year_str) if year_str and year_str.isdigit() else None
+        return title, year
+    except Exception:
+        pass
+    # Fallback (state not importable): local implementation
     name = os.path.splitext(filename)[0]
-
-    name = name.replace(".", " ")
-    name = name.replace("_", " ")
-
+    name = name.replace(".", " ").replace("_", " ")
     year = None
-
     m = re.search(r"(19|20)\d{2}", name)
     if m:
         year = int(m.group())
         name = name[:m.start()]
-
-    junk = [
-        "1080p",
-        "720p",
-        "2160p",
-        "hdrip",
-        "webrip",
-        "webdl",
-        "bluray",
-        "x264",
-        "x265",
-        "hevc",
-        "10bit",
-        "aac",
-        "dd5",
-        "esub",
-        "proper",
-        "hq",
-        "hdr",
-        "dv",
-    ]
-
-    for word in junk:
-        name = re.sub(
-            rf"\b{word}\b",
-            "",
-            name,
-            flags=re.I,
-        )
-
-    title = re.sub(r"\s+", " ", name).strip()
-
-    return title, year
+    for word in ["1080p","720p","2160p","hdrip","webrip","webdl","bluray",
+                 "x264","x265","hevc","10bit","aac","dd5","esub","proper","hq","hdr","dv"]:
+        name = re.sub(rf"\b{word}\b", "", name, flags=re.I)
+    return re.sub(r"\s+", " ", name).strip(), year
 
 
 # --------------------------------------------------
@@ -73,11 +62,11 @@ async def tmdb_search(title, year):
     if year:
         params["year"] = year
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{TMDB_URL}/search/movie",
-            params=params,
-        )
+    client = _get_http_client()
+    r = await client.get(
+        f"{TMDB_URL}/search/movie",
+        params=params,
+    )
 
     if r.status_code != 200:
         return None
@@ -95,13 +84,11 @@ async def tmdb_search(title, year):
 # --------------------------------------------------
 
 async def tmdb_to_imdb(tmdb_id):
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{TMDB_URL}/movie/{tmdb_id}/external_ids",
-            params={
-                "api_key": TMDB_API_KEY
-            },
-        )
+    client = _get_http_client()
+    r = await client.get(
+        f"{TMDB_URL}/movie/{tmdb_id}/external_ids",
+        params={"api_key": TMDB_API_KEY},
+    )
 
     if r.status_code != 200:
         return None
@@ -114,10 +101,10 @@ async def tmdb_to_imdb(tmdb_id):
 # --------------------------------------------------
 
 async def cinemeta_from_imdb(imdb_id):
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{CINEMETA_URL}/meta/movie/{imdb_id}.json"
-        )
+    client = _get_http_client()
+    r = await client.get(
+        f"{CINEMETA_URL}/meta/movie/{imdb_id}.json"
+    )
 
     if r.status_code != 200:
         return None
@@ -130,10 +117,10 @@ async def cinemeta_from_imdb(imdb_id):
 # --------------------------------------------------
 
 async def cinemeta_search(title):
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{CINEMETA_URL}/catalog/movie/top/search={title}.json"
-        )
+    client = _get_http_client()
+    r = await client.get(
+        f"{CINEMETA_URL}/catalog/movie/top/search={title}.json"
+    )
 
     if r.status_code != 200:
         return []
