@@ -101,14 +101,12 @@ class Metrics:
 
     async def record_download_complete(self) -> None:
         """Decrement active download count (if any) and increment completed count."""
-        if self.downloads_active > 0:
-            self.downloads_active -= 1
+        self.downloads_active = max(0, self.downloads_active - 1)
         self.downloads_completed += 1
 
     async def record_download_stop(self) -> None:
         """Decrement active download count safely."""
-        if self.downloads_active > 0:
-            self.downloads_active -= 1
+        self.downloads_active = max(0, self.downloads_active - 1)
 
     def get_rate_limit_events(self) -> List[Tuple[float, int, float]]:
         """Return a copy of the rate limit events."""
