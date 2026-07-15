@@ -245,6 +245,7 @@ class DownloadTask:
         self._consecutive_errors = 0     # for stuck-download alerting
         self._alerted_stuck = False      # avoid repeat alerts for the same stuck streak
         self._seek_event = asyncio.Event()       # fires on large seek, aborts current batch
+        self._pinned_client_idx: Optional[int] = None  # client slot held via acquire_download_slot
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
     # Jump threshold: if player seeks > 30MB ahead of current batch, abort and re-anchor
@@ -296,11 +297,12 @@ class DownloadTask:
           - Never waits for 90% triggers or batch boundaries.
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        # No longer pin one client for the whole task lifetime — client
-        # selection now happens per chunk below, alternating across the
-        # pool so a single background download uses both sessions' worth
-        # of throughput instead of one client doing all the work.
+        # Acquire a download slot so ClientPool._download_load tracking stays
+        # accurate — this is what makes acquire_download_slot's least-loaded
+        # selection meaningful for concurrent downloads.
         pool_size = len(self.streamer.client) if hasattr(self.streamer.client, "__len__") else 1
+        if hasattr(self.streamer.client, "acquire_download_slot"):
+            self._pinned_client_idx, _initial_c = await self.streamer.client.acquire_download_slot()
         c_idx, c = (None, None) if hasattr(self.streamer.client, "pick") else (None, self.streamer.client)
 
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
@@ -338,12 +340,15 @@ class DownloadTask:
                 # ONLY if a DIFFERENT movie is actively streaming.
                 # If the user is streaming THIS movie, we want to download it
                 # as fast as possible to catch up and cache ahead of the play-head!
-                live_movies = getattr(self.streamer, "live_movie_ids", set())
+                # Snapshot the set before iterating — mark_live_end() can
+                # mutate live_movie_ids concurrently and cause RuntimeError
+                # "Set changed size during iteration" on Python ≥ 3.11.
+                live_movies = set(getattr(self.streamer, "live_movie_ids", set()))
                 while any(mid != self.movie_id for mid in live_movies):
                     await asyncio.sleep(0.5)
                     if self._seek_event.is_set():
                         break  # re-check seek/offset before resuming below
-                    live_movies = getattr(self.streamer, "live_movie_ids", set())
+                    live_movies = set(getattr(self.streamer, "live_movie_ids", set()))
 
                 # Alternate clients per chunk — each chunk independently
                 # picks whichever session is least recently used pool-wide,
@@ -451,6 +456,10 @@ class DownloadTask:
                 pass
         finally:
             self._finished_at = time.time()
+            # Release the per-client load slot acquired at task start
+            if self._pinned_client_idx is not None and hasattr(self.streamer.client, "release_download_slot"):
+                self.streamer.client.release_download_slot(self._pinned_client_idx)
+                self._pinned_client_idx = None
             if not completed:
                 try:
                     from metrics import metrics
@@ -509,7 +518,6 @@ class DownloadManager:
         # bucket in streamer.py, so we can safely run one download per
         # client concurrently instead of serialising everything through 1.
         self._dl_semaphore = asyncio.Semaphore(1)  # placeholder, resized in init_pool_size()
-        self._active_movie_ids: set[str] = set()   # movies with a live DownloadTask
         self._active_task_mids: set[str] = set()    # movies currently allowed to actively download
         self._priority_mids: set[str] = set()        # of the above, which were started as priority
         self._max_concurrent_downloads = 1           # placeholder, resized in init_pool_size()
@@ -625,13 +633,11 @@ class DownloadManager:
             )
             dt.start()
             self._tasks[movie_id] = dt
-            self._active_movie_ids.add(movie_id)
             self._active_task_mids.add(movie_id)
             if priority:
                 self._priority_mids.add(movie_id)
 
             def _on_done(_t, mid=movie_id):
-                self._active_movie_ids.discard(mid)
                 self._active_task_mids.discard(mid)
                 self._priority_mids.discard(mid)
             dt._task.add_done_callback(_on_done)
@@ -652,14 +658,17 @@ class DownloadManager:
 
     async def evict(self, movie_id: str, redis: aioredis.Redis):
         """Cancel task, delete local file, clear Redis download state."""
+        # Pop state inside lock, then do I/O (cancel + file delete) outside
+        # so the lock isn't held across blocking operations — avoids stalling
+        # concurrent get_or_create / hydrate_cached callers.
         async with self._lock:
             task = self._tasks.pop(movie_id, None)
-            if task:
-                task.cancel()
-            f = self._files.pop(movie_id, None)
-            if f:
-                await f.delete()
+            f    = self._files.pop(movie_id, None)
             self._maps.pop(movie_id, None)
+        if task:
+            task.cancel()
+        if f:
+            await f.delete()
         await redis.delete(
             R_DL_MAP.format(movie_id),
             R_DL_DONE.format(movie_id),
@@ -776,35 +785,43 @@ class DownloadManager:
         Side-effect: ensures self._maps/_files are populated for this movie_id
         so proxy Path A can pread immediately.
         Never touches Telegram.
+
+        Lock strategy: check in-memory state under lock (cheap), release before
+        any Redis I/O, then re-acquire to write back hydrated state.
         """
         sparse_path = STORAGE_DIR / f"{movie_id}.bin"
         if not sparse_path.exists():
             return False
 
+        # Fast path: in-memory map already covers full range (no Redis needed)
         async with self._lock:
-            # In-memory map already covers full range?
             dl_map = self.get_map(movie_id)
             if dl_map and dl_map.has_range(0, file_size - 1):
                 return True
+            need_hydrate = self.get_map(movie_id) is None or self.get_file(movie_id) is None
 
-            # Cheap Redis flag check
-            done_val = await redis.get(R_DL_DONE.format(movie_id))
-            if done_val != b"1":
-                # Last resort: load map and verify coverage
-                dl_map = await self._load_map(movie_id, redis)
-                if not dl_map.has_range(0, file_size - 1):
-                    return False
-                # Coverage confirmed — backfill flag
-                await redis.set(R_DL_DONE.format(movie_id), b"1")
+        # Slow path: check Redis — done outside lock to avoid blocking proxy requests
+        done_val = await redis.get(R_DL_DONE.format(movie_id))
+        if done_val != b"1":
+            # Last resort: load interval map and verify coverage
+            dl_map = await self._load_map(movie_id, redis)
+            if not dl_map.has_range(0, file_size - 1):
+                return False
+            # Coverage confirmed — backfill the done flag
+            await redis.set(R_DL_DONE.format(movie_id), b"1")
+        else:
+            dl_map = None  # will load below if needed
 
-            # Hydrate in-memory state so Path A works
+        # Write hydrated state back under lock
+        async with self._lock:
             if self.get_map(movie_id) is None:
-                dl_map = await self._load_map(movie_id, redis)
+                if dl_map is None:
+                    dl_map = await self._load_map(movie_id, redis)
                 self._maps[movie_id] = dl_map
             if self.get_file(movie_id) is None:
                 self._files[movie_id] = SparseFile(sparse_path)
 
-            return True
+        return True
 
 
 # Module-level singleton — imported by main.py

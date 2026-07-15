@@ -67,7 +67,9 @@ class ByteStreamer:
         clients can therefore sustain ~N req/s combined instead of being
         capped at ~1 req/s system-wide regardless of pool size.
         """
-        lock = self._throttle_locks.setdefault(c_idx, asyncio.Lock())
+        if c_idx not in self._throttle_locks:
+            self._throttle_locks[c_idx] = asyncio.Lock()
+        lock = self._throttle_locks[c_idx]
         async with lock:
             last = self._last_invoke_time.get(c_idx, 0.0)
             elapsed = (time.time() - last) * 1000
@@ -307,7 +309,9 @@ class ByteStreamer:
         if dc in c.media_sessions:
             return c.media_sessions[dc]
 
-        lock = self._session_locks.setdefault(c, asyncio.Lock())
+        if c not in self._session_locks:
+            self._session_locks[c] = asyncio.Lock()
+        lock = self._session_locks[c]
         async with lock:
             # Double check inside lock
             if dc in c.media_sessions:

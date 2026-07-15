@@ -193,7 +193,7 @@ async def lifespan(app: FastAPI):
                     mid = st.movie_id(fn)
                     existing_movies = await st.load_movies(redis_client)
                     if mid not in existing_movies:
-                        print(f"[listener] instantly adding new movie: {mid}")
+                        print(f"[listener] instantly adding new movie to catalog: {mid}")
                         await st.save_movie(redis_client, mid, {
                             "message_id": message.id, "file_name": fn,
                             "file_size": media.file_size,
@@ -201,11 +201,8 @@ async def lifespan(app: FastAPI):
                             "quality": st.quality(fn), "source": st.source(fn),
                             "synced_at": int(time.time()),
                         })
-                        # Genuine new upload event -> auto-prefetch.
-                        try:
-                            prefetch_queue.put_nowait(mid)
-                        except asyncio.QueueFull:
-                            print(f"[listener] prefetch_queue full, dropping {mid}")
+                        # Catalog-only — no auto-prefetch (matches sync handler policy).
+                        # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=True))
         except Exception as se:

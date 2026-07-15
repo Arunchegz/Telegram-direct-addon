@@ -110,8 +110,11 @@ async def get_poster(redis: aioredis.Redis, filename: str) -> str:
 
 async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str, str]:
     """Returns (poster_url, imdb_id). Both cached in Redis for 24h."""
-    poster_key = R_POSTER.format(filename[:80])
-    imdb_key = R_IMDB.format(filename[:80])
+    # Use movie_id (slug + MD5 suffix) as cache key — avoids collisions between
+    # filenames that share the same first N characters.
+    cache_key = movie_id(filename)
+    poster_key = R_POSTER.format(cache_key)
+    imdb_key = R_IMDB.format(cache_key)
     try:
         cached_poster = await redis.get(poster_key)
         cached_imdb = await redis.get(imdb_key)
@@ -156,7 +159,7 @@ async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
 
 # ── String helpers ────────────────────────────────────────────────────────────
 def movie_id(filename: str) -> str:
-    slug = re.sub(r"[^a-z0-9_]", "_", filename.lower())
+    slug = re.sub(r"[^a-z0-9_]", "_", filename.lower())[:50]  # cap slug — MD5 suffix guarantees uniqueness
     suffix = hashlib.md5(filename.encode()).hexdigest()[:8]
     return f"{slug}_{suffix}"
 
