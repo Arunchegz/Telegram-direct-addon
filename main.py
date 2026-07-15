@@ -89,6 +89,32 @@ DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* en
 
 source_chat_id: int | None = None
 
+# ── In-process movie catalog cache ───────────────────────────────────────────
+# load_movies() does HGETALL on every call. Proxy, stream, catalog, and meta
+# endpoints all call it — that's one Redis round-trip per chunk request.
+# A 2-second TTL snapshot eliminates the redundant round-trips while keeping
+# catalog updates (sync, instant post, delete) visible within 2 seconds.
+_movies_cache: dict = {}
+_movies_cache_ts: float = 0.0
+_MOVIES_CACHE_TTL = 2.0  # seconds
+
+
+async def _get_movies() -> dict:
+    global _movies_cache, _movies_cache_ts
+    now = time.time()
+    if now - _movies_cache_ts < _MOVIES_CACHE_TTL:
+        return _movies_cache
+    _movies_cache = await st.load_movies(redis_client)
+    _movies_cache_ts = now
+    return _movies_cache
+
+
+def _invalidate_movies_cache():
+    """Call after any write to the movie index so next read is fresh."""
+    global _movies_cache_ts
+    _movies_cache_ts = 0.0
+
+
 def get_tg() -> Client:
     return client_pool.primary()
 redis_client: aioredis.Redis = None
@@ -201,6 +227,7 @@ async def lifespan(app: FastAPI):
                             "quality": st.quality(fn), "source": st.source(fn),
                             "synced_at": int(time.time()),
                         })
+                        _invalidate_movies_cache()
                         # Catalog-only — no auto-prefetch (matches sync handler policy).
                         # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
@@ -291,6 +318,8 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
         await st.del_movie(redis_client, mid)
         await download_manager.evict(mid, redis_client)
         deferred_notifications.pop(mid, None)
+    if removed:
+        _invalidate_movies_cache()
 
     if removed:
         await _notify_send(f"🗑 Removed {len(removed)} deleted movie{'s' if len(removed) != 1 else ''}")
@@ -558,7 +587,7 @@ def _short_id(mid: str) -> str:
 async def _render_list_page(page: int = 0):
     """Builds (text, inline_keyboard) for /list — cached symbol per movie,
     one delete button per row, prev/next nav."""
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     items = sorted(movies.items(), key=lambda kv: kv[1].get("file_name", kv[0]))
     total = len(items)
     pages = max(1, math.ceil(total / LIST_PAGE_SIZE))
@@ -678,7 +707,7 @@ async def _handle_admin_callback(cq: dict):
     if data.startswith("del:"):
         _, short, page_s = data.split(":", 2)
         page = int(page_s)
-        movies = await st.load_movies(redis_client)
+        movies = await _get_movies()
         target = next((mid for mid in movies if _short_id(mid) == short), None)
         if not target:
             await _bot_answer_callback(cq_id, "Not found (already deleted?)")
@@ -688,6 +717,7 @@ async def _handle_admin_callback(cq: dict):
         fn = movies[target].get("file_name", target)
         await download_manager.evict(target, redis_client)
         await st.del_movie(redis_client, target)
+        _invalidate_movies_cache()
         await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
         text, kb = await _render_list_page(page)
         await _bot_edit_keyboard(chat_id, message_id, text, kb)
@@ -709,7 +739,7 @@ async def _handle_admin_command(chat_id, text: str):
         stats = download_manager.stats()
         active = sum(1 for s in stats.values() if s["task_running"])
         total_local = sum(s["size_on_disk_mb"] for s in stats.values())
-        movies = await st.load_movies(redis_client)
+        movies = await _get_movies()
         await _bot_reply(chat_id,
             f"📊 Status\n"
             f"Uptime: {uptime}\n"
@@ -732,7 +762,7 @@ async def _handle_admin_command(chat_id, text: str):
         if not arg:
             await _bot_reply(chat_id, "Usage: /evict <movie_id>")
             return
-        movies = await st.load_movies(redis_client)
+        movies = await _get_movies()
         if arg not in movies:
             await _bot_reply(chat_id, f"Not found: {arg}")
             return
@@ -743,7 +773,7 @@ async def _handle_admin_command(chat_id, text: str):
         if not arg:
             await _bot_reply(chat_id, "Usage: /find <name>")
             return
-        movies = await st.load_movies(redis_client)
+        movies = await _get_movies()
         matches = [
             (mid, m) for mid, m in movies.items()
             if st.flex_match(arg, m.get("file_name", ""))
@@ -879,7 +909,7 @@ async def _prefetch_worker(worker_id: int = 0):
                 except asyncio.QueueFull:
                     print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on pause requeue")
                 continue
-            movies = await st.load_movies(redis_client)
+            movies = await _get_movies()
             m = movies.get(movie_id)
             if not m:
                 continue
@@ -1022,6 +1052,7 @@ async def _sync_channel(force: bool = False) -> int:
                         })
                         found_ids.add(mid)
                         count += 1
+                        _invalidate_movies_cache()
                         max_id_seen = max(max_id_seen, msg.id)
                     except Exception: continue
             except AuthKeyDuplicated as ae:
@@ -1045,6 +1076,8 @@ async def _sync_channel(force: bool = False) -> int:
                     print(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(redis_client, mid)
                     await download_manager.evict(mid, redis_client)
+                if removed_ids:
+                    _invalidate_movies_cache()
                 await redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
 
             if new_ids or removed_ids:
@@ -1110,7 +1143,7 @@ async def _debug_auth(request: Request):
 @app.get("/debug/movies")
 async def debug_movies(request: Request):
     await _debug_auth(request)
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     for mid, m in movies.items():
         task = download_manager.get(mid)
         dl_map = download_manager.get_map(mid)
@@ -1141,7 +1174,7 @@ async def debug_movies(request: Request):
 async def debug_downloads(request: Request):
     await _debug_auth(request)
     stats  = download_manager.stats()
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     for mid, s in stats.items():
         movie = movies.get(mid, {})
         fs    = movie.get("file_size", 0)
@@ -1153,7 +1186,7 @@ async def debug_downloads(request: Request):
 
 @app.get("/catalog/{type}/{id}.json")
 async def catalog(type: str, id: str):
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     def is_series(m): return bool(st.IS_SERIES_RE.search(m.get("file_name","")))
     
     if type == "movie":
@@ -1235,7 +1268,7 @@ async def meta(type: str, id: str):
         title, year = await st.get_cinemeta(type, id)
         meta_obj = {"id": id, "type": type, "name": title, "year": year}
         if type == "series" and title:
-            movies = await st.load_movies(redis_client)
+            movies = await _get_movies()
             videos = []
             seen_episodes = set()
             
@@ -1271,7 +1304,7 @@ async def meta(type: str, id: str):
         
     prefix = "tgm:" if type == "movie" else "tgs:"
     clean  = id[len(prefix):] if id.startswith(prefix) else id
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     
     if type == "movie":
         movie = movies.get(clean)
@@ -1331,7 +1364,7 @@ async def meta(type: str, id: str):
 
 @app.get("/stream/{type}/{id}.json")
 async def stream(type: str, id: str):
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     prefix = "tgm:" if type == "movie" else "tgs:"
     if id.startswith("tt"):
         parts   = id.split(":")
@@ -1357,8 +1390,9 @@ async def stream(type: str, id: str):
         for score, mid, m in scored_files:
             fn = m.get("file_name","")
             try:
-                fs = m.get("file_size")
-                _schedule(_ensure_download(mid, fs, m["message_id"]))
+                fs = m.get("file_size") or 0
+                if fs:
+                    _schedule(_ensure_download(mid, fs, m["message_id"]))
             except Exception as e:
                 print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
@@ -1387,8 +1421,9 @@ async def stream(type: str, id: str):
             ep = info["episode"] if info else 1
             if s == season and ep == episode:
                 try:
-                    fs = m.get("file_size")
-                    _schedule(_ensure_download(mid, fs, m["message_id"]))
+                    fs = m.get("file_size") or 0
+                    if fs:
+                        _schedule(_ensure_download(mid, fs, m["message_id"]))
                 except Exception as e:
                     print(f"[stream] warn: {e}")
                 
@@ -1411,6 +1446,7 @@ async def stream(type: str, id: str):
         media = msg.video or msg.document
         if not media:
             await st.del_movie(redis_client, clean)
+            _invalidate_movies_cache()
             return JSONResponse({"streams": []})
         fs = movie.get("file_size") or media.file_size
         _schedule(_ensure_download(clean, fs, movie["message_id"]))
@@ -1434,7 +1470,7 @@ async def subtitles(type: str, id: str):
         return JSONResponse({"subtitles": []})
     
     clean = id[len(prefix):]
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     
     # Resolve file name
     filename = ""
@@ -1539,7 +1575,7 @@ async def proxy(movie_id: str, request: Request):
     """
     await metrics.record_proxy_request()
 
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     movie  = movies.get(movie_id)
     if not movie: raise HTTPException(404, "Not found")
 
@@ -1701,6 +1737,7 @@ async def proxy(movie_id: str, request: Request):
 
     if not (msg.video or msg.document):
         await st.del_movie(redis_client, movie_id)
+        _invalidate_movies_cache()
         raise HTTPException(404, "Deleted from Telegram")
 
     aligned   = (start // TG_CHUNK) * TG_CHUNK
@@ -1726,7 +1763,7 @@ async def proxy(movie_id: str, request: Request):
 # ── Media Control API Endpoints ───────────────────────────────────────────────
 @app.post("/api/media/{movie_id}/download")
 async def start_download_media(movie_id: str):
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     movie = movies.get(movie_id)
     if not movie:
         raise HTTPException(status_code=404, detail="Movie not found in index")
@@ -1764,7 +1801,7 @@ async def evict_cache_media(movie_id: str):
 
 @app.delete("/api/media/{movie_id}")
 async def delete_media(movie_id: str, delete_tg: bool = False):
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     movie = movies.get(movie_id)
     if not movie:
         raise HTTPException(status_code=404, detail="Movie not found in index")
@@ -1788,6 +1825,7 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
             
     # 3. Delete from index
     await st.del_movie(redis_client, movie_id)
+    _invalidate_movies_cache()
     return {"status": "ok"}
 
 
