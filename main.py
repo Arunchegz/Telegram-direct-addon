@@ -228,14 +228,8 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         _invalidate_movies_cache()
-                        # Auto-prefetch: enqueue new movie for background download.
-                        stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
-                        if stopped != b"1":
-                            try:
-                                prefetch_queue.put_nowait(mid)
-                                print(f"[listener] queued {mid} for prefetch")
-                            except asyncio.QueueFull:
-                                print(f"[listener] prefetch_queue full, skipping auto-prefetch for {mid}")
+                        # Catalog-only — no auto-prefetch (matches sync handler policy).
+                        # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=False))
         except Exception as se:
@@ -313,7 +307,7 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
     if not message_ids:
         return 0
 
-    movies = await st.load_movies(redis_client)
+    movies = await _get_movies()
     removed = []
     for mid, movie in movies.items():
         if int(movie.get("message_id", 0) or 0) in message_ids:
@@ -862,7 +856,11 @@ async def _bot_channel_listener():
                     if post and (post.get("video") or post.get("document")):
                         print("[listener] new channel post detected — instant sync")
                         try:
-                            await _sync_channel(force=True)
+                            # force=False: respect SYNC_INTERVAL cooldown.
+                            # This path only active when bot_client is absent
+                            # (MTProto _instant_sync_handler handles the real-time
+                            # catalog update when bot_client is present).
+                            await _sync_channel(force=False)
                         except Exception as e:
                             print(f"[listener] sync failed: {e}")
                         continue
@@ -906,6 +904,7 @@ async def _prefetch_worker(worker_id: int = 0):
     one movie at a time regardless of pool size."""
     while True:
         movie_id = await prefetch_queue.get()
+        reporter = None  # must be defined before try so except/finally can always cancel it
         try:
             if download_manager.paused:
                 print(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
@@ -935,7 +934,6 @@ async def _prefetch_worker(worker_id: int = 0):
 
             # Send notification afterwards (if task successfully started)
             msg_id = deferred_notifications.pop(movie_id, None)
-            reporter = None  # N5: initialize before any await so finally can always cancel
             if task and task._task:
                 if msg_id:
                     await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
@@ -1066,11 +1064,15 @@ async def _sync_channel(force: bool = False) -> int:
                 client_pool.mark_broken_by_client(active_tg)
                 raise ae
 
-            # New movies get added to the catalog only — no auto-prefetch.
-            # Download starts on demand (Stremio stream request or dashboard).
             new_ids = found_ids - existing_ids
             for mid in new_ids:
-                print(f"Sync: new movie detected (catalog only, no auto-prefetch): {mid}")
+                print(f"Sync: new movie detected, enqueueing for prefetch: {mid}")
+                stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+                if stopped != b"1":
+                    try:
+                        prefetch_queue.put_nowait(mid)
+                    except asyncio.QueueFull:
+                        print(f"Sync: prefetch_queue full, skipping {mid}")
 
             # Clean up deleted movies — only meaningful on a full walk;
             # an incremental (min_id) pass never sees old messages so it
@@ -1653,7 +1655,7 @@ async def proxy(movie_id: str, request: Request):
         # Path B: almost there, wait briefly then re-check
         if task:
             try:
-                await asyncio.wait_for(task.progress_event().wait(), timeout=0.3)
+                await asyncio.wait_for(task.progress_event().wait(), timeout=WAIT_TIMEOUT_S)
             except asyncio.TimeoutError:
                 pass
             covered = dl_map.covered_prefix(req_start)
