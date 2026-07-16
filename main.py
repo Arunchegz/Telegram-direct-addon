@@ -277,6 +277,10 @@ async def lifespan(app: FastAPI):
         await bot_client.stop()
     await redis_client.aclose()
     await st.close_http_client()
+    # Close movie_matcher's shared http client
+    import movie_matcher as _mm
+    if _mm._http_client is not None and not _mm._http_client.is_closed:
+        await _mm._http_client.aclose()
 
 
 app = FastAPI(title="TGStream", version="2.0.0", lifespan=lifespan, docs_url="/api/docs")
