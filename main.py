@@ -553,7 +553,11 @@ async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_
             last_sent_pct = pct
             last_sent_ts = now
         else:
-            rate_limit_cooldown = max(0.0, rate_limit_cooldown - 1)
+            if rate_limit_cooldown > 0:
+                # Sleep the actual cooldown Telegram returned, not 1s at a time
+                await asyncio.sleep(min(rate_limit_cooldown, 60))
+                rate_limit_cooldown = 0.0
+                continue
 
         await asyncio.sleep(1)
 

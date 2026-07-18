@@ -34,6 +34,7 @@ class ClientPool:
         self.on_health_event = None   # optional async fn(text), set by main.py for alerts
         self._last_alert_ts: Dict[str, float] = {}
         self._alert_min_interval_s = 300  # don't re-alert same condition more than once per 5min
+        self._bg_tasks: set = set()  # strong refs to fire-and-forget tasks to prevent GC
 
     def _fire_alert(self, key: str, text: str):
         """Fire-and-forget, rate-limited per `key` so a flapping client
@@ -45,9 +46,18 @@ class ClientPool:
             return
         self._last_alert_ts[key] = now
         try:
-            asyncio.get_running_loop().create_task(self.on_health_event(text))
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._safe_alert(text))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         except RuntimeError:
             pass  # no running loop (e.g. during early startup) — skip
+
+    async def _safe_alert(self, text: str):
+        try:
+            await self.on_health_event(text)
+        except Exception as e:
+            print(f"[clients] alert task failed: {e}")
 
     @staticmethod
     def _load_sessions() -> List[str]:
@@ -219,14 +229,25 @@ class ClientPool:
         DownloadTasks started close together can all land on the same client
         while others sit idle — the exact opposite of what the pool is for.
         Caller must call release_download_slot(idx) when the task ends.
+
+        Waits for a healthy client rather than falling back to broken/cooling
+        clients — mirrors pick() behaviour to avoid guaranteed FloodWait.
         """
-        async with self._lock:
-            avail = self._available()
-            if not avail:
-                avail = list(range(len(self.clients)))
-            chosen = min(avail, key=lambda i: self._download_load.get(i, 0))
-            self._download_load[chosen] = self._download_load.get(chosen, 0) + 1
-            return chosen, self.clients[chosen]
+        while True:
+            async with self._lock:
+                avail = self._available()
+                if avail:
+                    chosen = min(avail, key=lambda i: self._download_load.get(i, 0))
+                    self._download_load[chosen] = self._download_load.get(chosen, 0) + 1
+                    return chosen, self.clients[chosen]
+                # All clients cooling — compute wait and release lock before sleeping
+                if self._cooldown_until:
+                    soonest = min(self._cooldown_until.values())
+                    wait = max(1.0, soonest - time.time())
+                else:
+                    wait = 5.0
+                print(f"[clients] acquire_download_slot: all clients unavailable, waiting {wait:.1f}s")
+            await asyncio.sleep(wait)
 
     def release_download_slot(self, idx: int) -> None:
         if idx in self._download_load:

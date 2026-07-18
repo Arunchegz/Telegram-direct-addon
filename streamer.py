@@ -67,8 +67,7 @@ class ByteStreamer:
         clients can therefore sustain ~N req/s combined instead of being
         capped at ~1 req/s system-wide regardless of pool size.
         """
-        if c_idx not in self._throttle_locks:
-            self._throttle_locks[c_idx] = asyncio.Lock()
+        self._throttle_locks.setdefault(c_idx, asyncio.Lock())
         lock = self._throttle_locks[c_idx]
         async with lock:
             last = self._last_invoke_time.get(c_idx, 0.0)
@@ -95,7 +94,9 @@ class ByteStreamer:
     async def _get_fresh_msg(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
         """Get or fetch a fresh message for the specific client."""
         now = time.time()
-        key = (chat_id, message_id, client_idx if client_idx is not None else client)
+        # Use id(client) as scalar fallback — Client objects don't implement __hash__
+        # by session identity, so mixing object refs and ints as dict keys causes misses.
+        key = (chat_id, message_id, client_idx if client_idx is not None else id(client))
         cached_msg, fetched_at = self._msg_cache.get(key, (None, 0.0))
         if cached_msg is None or (now - fetched_at) > 3000:
             try:
@@ -116,7 +117,7 @@ class ByteStreamer:
         return cached_msg
 
     def _invalidate_msg_cache(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
-        key = (chat_id, message_id, client_idx if client_idx is not None else client)
+        key = (chat_id, message_id, client_idx if client_idx is not None else id(client))
         if key in self._msg_cache:
             del self._msg_cache[key]
 

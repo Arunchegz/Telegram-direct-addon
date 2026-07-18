@@ -10,6 +10,8 @@ import re
 import time
 import unicodedata
 from typing import Optional
+from urllib.parse import quote_plus
+from xml.sax.saxutils import escape as xml_escape
 
 import PTN
 import httpx
@@ -48,7 +50,13 @@ R_SYNC_FULL_TS = "tgstream:sync:last_full"
 # ── Movie index ───────────────────────────────────────────────────────────────
 async def load_movies(redis: aioredis.Redis) -> dict:
     raw = await redis.hgetall(R_MOVIES)
-    return {k.decode(): json.loads(v) for k, v in raw.items()}
+    movies = {}
+    for k, v in raw.items():
+        try:
+            movies[k.decode()] = json.loads(v)
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[load_movies] skipping corrupted Redis key {k.decode()!r}: {e}")
+    return movies
 
 
 async def save_movie(redis: aioredis.Redis, mid: str, data: dict):
@@ -84,7 +92,7 @@ async def _fetch_poster(filename: str) -> tuple[str, str]:
 
     if not title:
         return _local_placeholder_poster(""), ""
-    query = f"{title} {year}".strip()
+    query = quote_plus(f"{title} {year}".strip())
     try:
         c = _get_http_client()
         r = await c.get(
@@ -134,7 +142,7 @@ async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str
 
 def _local_placeholder_poster(title: str) -> str:
     """Inline SVG data URI — no external dependency, never 404s/times out."""
-    safe_title = (title or "No Poster")[:40].replace("&", "and")
+    safe_title = xml_escape((title or "No Poster")[:40])
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450">'
         f'<rect width="300" height="450" fill="#1a1a1a"/>'

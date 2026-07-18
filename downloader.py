@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import redis.asyncio as aioredis
+from pyrogram.errors import FloodWait
 
 from clients import pool as client_pool
 
@@ -423,6 +424,14 @@ class DownloadTask:
                 except asyncio.CancelledError:
                     print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
                     return
+                except FloodWait as e:
+                    # Telegram mandates we wait exactly e.value seconds — don't use our own backoff
+                    wait_s = max(e.value, 1) + 1  # +1s safety buffer
+                    print(f"[dl:{self.movie_id}] FloodWait {e.value}s at {current_offset/1024/1024:.1f}MB, sleeping {wait_s}s")
+                    self._consecutive_errors += 1
+                    self._msg = None
+                    await asyncio.sleep(wait_s)
+                    continue
                 except Exception as e:
                     backoff_s = DL_MIN_BACKOFF * self._error_backoff
                     self._error_backoff = min(self._error_backoff * 2, 8)
@@ -445,7 +454,9 @@ class DownloadTask:
                 if current_offset >= self.file_size:
                     if not self.dl_map.has_range(0, self.file_size - 1):
                         next_gap = self._find_next_gap(0)
-                        if next_gap < self.file_size:
+                        if next_gap < self.file_size and next_gap < current_offset:
+                            # Only wrap if gap is genuinely behind us — guards against
+                            # corrupted map returning the same offset and looping forever
                             current_offset = next_gap
                             print(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
 
