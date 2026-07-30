@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import Optional
 
 import redis.asyncio as aioredis
+from pyrogram.errors import FloodWait
 
 from clients import pool as client_pool
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
 # Import chunk sizes from streamer module to ensure consistency
 from streamer import TG_CHUNK, PREFETCH_CHUNK, TG_MAX_LIMIT
+from metrics import metrics
 
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
@@ -133,54 +135,67 @@ class DownloadMap:
 
 
 # ────────────────────────────────────────────────────────────────────────[...]
-# SparseFile: pre-truncated file, pwrite semantics
+# SparseFile: pre-truncated file, pwrite/pread with persistent fd
 # ────────────────────────────────────────────────────────────────────────[...]
 class SparseFile:
     """
     Pre-allocated (sparse) file. Supports concurrent pwrite + pread.
     Uses asyncio.to_thread for blocking I/O so event loop stays free.
+    Avoids repeatedly opening and closing the file per chunk.
     """
 
     def __init__(self, path: Path):
         self.path = path
+        self._fd: Optional[int] = None
         self._lock = asyncio.Lock()
 
     @classmethod
     async def create(cls, path: Path, size: int) -> "SparseFile":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            # ftruncate creates sparse file (no disk allocation until written)
-            await asyncio.to_thread(_truncate_file, path, size)
-        return cls(path)
+        self = cls(path)
+        fd = await self._get_fd()
+        # Truncate to size using ftruncate in worker thread
+        await asyncio.to_thread(self._ensure_size, fd, size)
+        return self
+
+    def _ensure_size(self, fd: int, size: int):
+        stat = os.fstat(fd)
+        if stat.st_size != size:
+            os.ftruncate(fd, size)
+
+    async def _get_fd(self) -> int:
+        async with self._lock:
+            if self._fd is None or self._fd < 0:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
+            return self._fd
 
     async def pwrite(self, data: bytes, offset: int) -> None:
-        await asyncio.to_thread(_pwrite, self.path, data, offset)
+        fd = await self._get_fd()
+        await asyncio.to_thread(os.pwrite, fd, data, offset)
 
     async def pread(self, offset: int, length: int) -> bytes:
-        return await asyncio.to_thread(_pread, self.path, offset, length)
+        fd = await self._get_fd()
+        return await asyncio.to_thread(os.pread, fd, length, offset)
 
     def exists(self) -> bool:
         return self.path.exists()
 
     async def delete(self) -> None:
+        async with self._lock:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = None
         await asyncio.to_thread(self.path.unlink, missing_ok=True)
 
-
-def _truncate_file(path: Path, size: int):
-    with open(path, "wb") as f:
-        f.truncate(size)
-
-
-def _pwrite(path: Path, data: bytes, offset: int):
-    with open(path, "r+b") as f:
-        f.seek(offset)
-        f.write(data)
-
-
-def _pread(path: Path, offset: int, length: int) -> bytes:
-    with open(path, "rb") as f:
-        f.seek(offset)
-        return f.read(length)
+    def __del__(self):
+        if hasattr(self, "_fd") and self._fd is not None:
+            try:
+                os.close(self._fd)
+            except Exception:
+                pass
 
 
 # ────────────────────────────────────────────────────────────────────────[...]
@@ -232,6 +247,8 @@ class DownloadTask:
         self._consecutive_errors = 0     # for stuck-download alerting
         self._alerted_stuck = False      # avoid repeat alerts for the same stuck streak
         self._seek_event = asyncio.Event()       # fires on large seek, aborts current batch
+        self._pinned_client_idx: Optional[int] = None  # client slot held via acquire_download_slot
+        self._last_persist_ts: float = 0.0
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
     # Jump threshold: if player seeks > 30MB ahead of current batch, abort and re-anchor
@@ -283,20 +300,23 @@ class DownloadTask:
           - Never waits for 90% triggers or batch boundaries.
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        # No longer pin one client for the whole task lifetime — client
-        # selection now happens per chunk below, alternating across the
-        # pool so a single background download uses both sessions' worth
-        # of throughput instead of one client doing all the work.
+        # Acquire a download slot so ClientPool._download_load tracking stays
+        # accurate — this is what makes acquire_download_slot's least-loaded
+        # selection meaningful for concurrent downloads.
         pool_size = len(self.streamer.client) if hasattr(self.streamer.client, "__len__") else 1
-        c_idx, c = (None, None) if hasattr(self.streamer.client, "pick") else (None, self.streamer.client)
+        if hasattr(self.streamer.client, "acquire_download_slot"):
+            self._pinned_client_idx, _initial_c = await self.streamer.client.acquire_download_slot()
+        # Resolve an initial client immediately so _fresh_msg always gets a
+        # real Client, even before the first chunk's pick() call in the loop.
+        if hasattr(self.streamer.client, "pick"):
+            c_idx, c = await self.streamer.client.pick()
+        else:
+            c_idx, c = None, self.streamer.client
 
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
               f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
-        try:
-            from metrics import metrics
-            metrics.downloads_active += 1
-        except Exception:
-            pass
+        completed = False
+        await metrics.record_download_start()
 
         try:
             current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
@@ -324,12 +344,15 @@ class DownloadTask:
                 # ONLY if a DIFFERENT movie is actively streaming.
                 # If the user is streaming THIS movie, we want to download it
                 # as fast as possible to catch up and cache ahead of the play-head!
-                live_movies = getattr(self.streamer, "live_movie_ids", set())
+                # Snapshot the set before iterating — mark_live_end() can
+                # mutate live_movie_ids concurrently and cause RuntimeError
+                # "Set changed size during iteration" on Python ≥ 3.11.
+                live_movies = set(getattr(self.streamer, "live_movie_ids", set()))
                 while any(mid != self.movie_id for mid in live_movies):
                     await asyncio.sleep(0.5)
                     if self._seek_event.is_set():
                         break  # re-check seek/offset before resuming below
-                    live_movies = getattr(self.streamer, "live_movie_ids", set())
+                    live_movies = set(getattr(self.streamer, "live_movie_ids", set()))
 
                 # Alternate clients per chunk — each chunk independently
                 # picks whichever session is least recently used pool-wide,
@@ -388,17 +411,21 @@ class DownloadTask:
                     self._consecutive_errors = 0
                     self._alerted_stuck = False
 
-                    try:
-                        from metrics import metrics
-                        metrics.total_downloaded_mb += len(data) / 1024 / 1024
-                    except Exception:
-                        pass
+                    await metrics.record_download_chunk(len(data))
 
                     await asyncio.sleep(DL_THROTTLE_S)
 
                 except asyncio.CancelledError:
                     print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
                     return
+                except FloodWait as e:
+                    # Telegram mandates we wait exactly e.value seconds — don't use our own backoff
+                    wait_s = max(e.value, 1) + 1  # +1s safety buffer
+                    print(f"[dl:{self.movie_id}] FloodWait {e.value}s at {current_offset/1024/1024:.1f}MB, sleeping {wait_s}s")
+                    self._consecutive_errors += 1
+                    self._msg = None
+                    await asyncio.sleep(wait_s)
+                    continue
                 except Exception as e:
                     backoff_s = DL_MIN_BACKOFF * self._error_backoff
                     self._error_backoff = min(self._error_backoff * 2, 8)
@@ -421,26 +448,28 @@ class DownloadTask:
                 if current_offset >= self.file_size:
                     if not self.dl_map.has_range(0, self.file_size - 1):
                         next_gap = self._find_next_gap(0)
-                        if next_gap < self.file_size:
+                        if next_gap < self.file_size and next_gap < current_offset:
+                            # Only wrap if gap is genuinely behind us — guards against
+                            # corrupted map returning the same offset and looping forever
                             current_offset = next_gap
                             print(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
 
             # EOF
             self._done = True
+            self._last_persist_ts = 0  # force final persist
+            await self._persist_map()
             await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
-            try:
-                from metrics import metrics
-                metrics.downloads_completed += 1
-            except Exception:
-                pass
+            completed = True
+            await metrics.record_download_complete()
         finally:
             self._finished_at = time.time()
-            try:
-                from metrics import metrics
-                metrics.downloads_active = max(0, metrics.downloads_active - 1)
-            except Exception:
-                pass
+            # Release the per-client load slot acquired at task start
+            if self._pinned_client_idx is not None and hasattr(self.streamer.client, "release_download_slot"):
+                self.streamer.client.release_download_slot(self._pinned_client_idx)
+                self._pinned_client_idx = None
+            if not completed:
+                await metrics.record_download_stop()
 
 
     def _find_next_gap(self, from_offset: int) -> int:
@@ -457,7 +486,11 @@ class DownloadTask:
         return candidate
 
     async def _persist_map(self):
-        """Save interval map to Redis for crash recovery."""
+        """Save interval map to Redis for crash recovery (debounced to max once per 10s)."""
+        now = time.time()
+        if now - self._last_persist_ts < 10:
+            return
+        self._last_persist_ts = now
         await self.redis.set(
             R_DL_MAP.format(self.movie_id),
             self.dl_map.to_json(),
@@ -493,12 +526,12 @@ class DownloadManager:
         # bucket in streamer.py, so we can safely run one download per
         # client concurrently instead of serialising everything through 1.
         self._dl_semaphore = asyncio.Semaphore(1)  # placeholder, resized in init_pool_size()
-        self._active_movie_ids: set[str] = set()   # movies with a live DownloadTask
         self._active_task_mids: set[str] = set()    # movies currently allowed to actively download
         self._priority_mids: set[str] = set()        # of the above, which were started as priority
         self._max_concurrent_downloads = 1           # placeholder, resized in init_pool_size()
         self.paused = False    # set via /pause admin command — blocks new prefetch starts
         self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
+        self.on_evict = None   # optional fn(movie_id) called on every eviction (sync, for cleanup hooks)
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -608,13 +641,11 @@ class DownloadManager:
             )
             dt.start()
             self._tasks[movie_id] = dt
-            self._active_movie_ids.add(movie_id)
             self._active_task_mids.add(movie_id)
             if priority:
                 self._priority_mids.add(movie_id)
 
             def _on_done(_t, mid=movie_id):
-                self._active_movie_ids.discard(mid)
                 self._active_task_mids.discard(mid)
                 self._priority_mids.discard(mid)
             dt._task.add_done_callback(_on_done)
@@ -635,14 +666,17 @@ class DownloadManager:
 
     async def evict(self, movie_id: str, redis: aioredis.Redis):
         """Cancel task, delete local file, clear Redis download state."""
+        # Pop state inside lock, then do I/O (cancel + file delete) outside
+        # so the lock isn't held across blocking operations — avoids stalling
+        # concurrent get_or_create / hydrate_cached callers.
         async with self._lock:
             task = self._tasks.pop(movie_id, None)
-            if task:
-                task.cancel()
-            f = self._files.pop(movie_id, None)
-            if f:
-                await f.delete()
+            f    = self._files.pop(movie_id, None)
             self._maps.pop(movie_id, None)
+        if task:
+            task.cancel()
+        if f:
+            await f.delete()
         await redis.delete(
             R_DL_MAP.format(movie_id),
             R_DL_DONE.format(movie_id),
@@ -650,11 +684,27 @@ class DownloadManager:
             R_DL_TS.format(movie_id),
         )
         print(f"[dm] evicted {movie_id}")
+        if self.on_evict:
+            try:
+                self.on_evict(movie_id)
+            except Exception as e:
+                print(f"[dm] on_evict hook failed for {movie_id}: {e}")
+
+    @staticmethod
+    def _disk_usage(path) -> int:
+        """Actual bytes on disk for a sparse file — st_blocks*512, not st_size.
+        st_size is always the full truncated size regardless of how little
+        has been written, so it would make LRU think every file is 'full'."""
+        try:
+            st = path.stat()
+            return st.st_blocks * 512
+        except OSError:
+            return 0
 
     async def evict_lru_if_needed(self, redis: aioredis.Redis):
         """Evict oldest accessed movies if total local storage > MAX_LOCAL_GB."""
         total = sum(
-            f.path.stat().st_size
+            self._disk_usage(f.path)
             for f in self._files.values()
             if f.path.exists()
         )
@@ -677,7 +727,7 @@ class DownloadManager:
             if total <= limit:
                 break
             f = self._files.get(mid)
-            size = f.path.stat().st_size if f and f.path.exists() else 0
+            size = self._disk_usage(f.path) if f else 0
             await self.evict(mid, redis)
             total -= size
             print(f"[dm] LRU evict {mid} freed {size/1024/1024:.0f}MB")
@@ -728,7 +778,7 @@ class DownloadManager:
         for mid, task in self._tasks.items():
             f = self._files.get(mid)
             dm = self._maps.get(mid)
-            size_on_disk = f.path.stat().st_size if f and f.path.exists() else 0
+            size_on_disk = self._disk_usage(f.path) if f and f.path.exists() else 0
             result[mid] = {
                 "done":           task.is_done(),
                 "downloaded_mb":  round(dm.total_bytes() / 1024 / 1024, 1) if dm else 0,
@@ -736,6 +786,50 @@ class DownloadManager:
                 "task_running":   bool(task._task and not task._task.done()),
             }
         return result
+
+    async def hydrate_cached(self, movie_id: str, file_size: int, redis: aioredis.Redis) -> bool:
+        """
+        Returns True if the file is fully downloaded locally and ready to serve.
+        Side-effect: ensures self._maps/_files are populated for this movie_id
+        so proxy Path A can pread immediately.
+        Never touches Telegram.
+
+        Lock strategy: check in-memory state under lock (cheap), release before
+        any Redis I/O, then re-acquire to write back hydrated state.
+        """
+        sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+        if not sparse_path.exists():
+            return False
+
+        # Fast path: in-memory map already covers full range (no Redis needed)
+        async with self._lock:
+            dl_map = self.get_map(movie_id)
+            if dl_map and dl_map.has_range(0, file_size - 1):
+                return True
+            need_hydrate = self.get_map(movie_id) is None or self.get_file(movie_id) is None
+
+        # Slow path: check Redis — done outside lock to avoid blocking proxy requests
+        done_val = await redis.get(R_DL_DONE.format(movie_id))
+        if done_val != b"1":
+            # Last resort: load interval map and verify coverage
+            dl_map = await self._load_map(movie_id, redis)
+            if not dl_map.has_range(0, file_size - 1):
+                return False
+            # Coverage confirmed — backfill the done flag
+            await redis.set(R_DL_DONE.format(movie_id), b"1")
+        else:
+            dl_map = None  # will load below if needed
+
+        # Write hydrated state back under lock
+        async with self._lock:
+            if self.get_map(movie_id) is None:
+                if dl_map is None:
+                    dl_map = await self._load_map(movie_id, redis)
+                self._maps[movie_id] = dl_map
+            if self.get_file(movie_id) is None:
+                self._files[movie_id] = SparseFile(sparse_path)
+
+        return True
 
 
 # Module-level singleton — imported by main.py

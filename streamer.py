@@ -26,6 +26,7 @@ TG_MAX_LIMIT = 1024 * 1024      # Telegram's maximum allowed limit per GetFile r
 MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))  # Throttle between GetFile calls (100ms default); lower is faster
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
+MAX_MSG_CACHE_SIZE = 500   # Auto-prune message cache above this threshold
 
 
 class ByteStreamer:
@@ -33,8 +34,9 @@ class ByteStreamer:
         self.client = client
         self._last_invoke_time: dict = {}      # key: c_idx (None for single-client mode)
         self._throttle_locks: dict = {}        # per-client lock, created lazily
-        self._session_lock = asyncio.Lock()   # Lock to serialize session creation
-        self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
+        self._session_locks: dict = {}         # Lock to serialize session creation per client
+        self._backoff_until = {}  # Per-client and DC backoff state: {(c_idx, dc_id): until_timestamp}
+        self._msg_cache: dict = {}  # (chat_id, msg_id, c_idx) -> (msg, fetched_at)
         # If `client` is actually a ClientPool (has __len__), scale concurrent
         # GetFile slots to the pool size — one slot per session — instead of
         # serializing every stream in the process through a single global lock.
@@ -66,7 +68,8 @@ class ByteStreamer:
         clients can therefore sustain ~N req/s combined instead of being
         capped at ~1 req/s system-wide regardless of pool size.
         """
-        lock = self._throttle_locks.setdefault(c_idx, asyncio.Lock())
+        self._throttle_locks.setdefault(c_idx, asyncio.Lock())
+        lock = self._throttle_locks[c_idx]
         async with lock:
             last = self._last_invoke_time.get(c_idx, 0.0)
             elapsed = (time.time() - last) * 1000
@@ -74,14 +77,14 @@ class ByteStreamer:
                 await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
             self._last_invoke_time[c_idx] = time.time()
 
-    async def _wait_backoff(self, dc_id: int, flood_wait_s: int) -> None:
+    async def _wait_backoff(self, dc_id: int, flood_wait_s: int, c_idx: int | None = None) -> None:
         """Exponential backoff with jitter on FloodWait."""
         # Add jitter: ±20% to spread requests
         jitter = random.uniform(0.8, 1.2)
         wait_s = min(flood_wait_s * jitter, MAX_BACKOFF_S)
         until = time.time() + wait_s
-        self._backoff_until[dc_id] = until
-        print(f"[streamer] DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
+        self._backoff_until[(c_idx, dc_id)] = until
+        print(f"[streamer] Client {c_idx} DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
         try:
             from metrics import metrics
             await metrics.record_rate_limit(dc_id, wait_s)
@@ -92,9 +95,9 @@ class ByteStreamer:
     async def _get_fresh_msg(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
         """Get or fetch a fresh message for the specific client."""
         now = time.time()
-        key = (chat_id, message_id, client_idx if client_idx is not None else client)
-        if not hasattr(self, "_msg_cache"):
-            self._msg_cache = {}
+        # Use id(client) as scalar fallback — Client objects don't implement __hash__
+        # by session identity, so mixing object refs and ints as dict keys causes misses.
+        key = (chat_id, message_id, client_idx if client_idx is not None else id(client))
         cached_msg, fetched_at = self._msg_cache.get(key, (None, 0.0))
         if cached_msg is None or (now - fetched_at) > 3000:
             try:
@@ -111,19 +114,19 @@ class ByteStreamer:
                     raise
                 msg = await client.get_messages(channel, message_id)
             self._msg_cache[key] = (msg, now)
+            if len(self._msg_cache) > MAX_MSG_CACHE_SIZE:
+                self.prune_msg_cache()
             return msg
         return cached_msg
 
     def _invalidate_msg_cache(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
-        key = (chat_id, message_id, client_idx if client_idx is not None else client)
-        if hasattr(self, "_msg_cache") and key in self._msg_cache:
+        key = (chat_id, message_id, client_idx if client_idx is not None else id(client))
+        if key in self._msg_cache:
             del self._msg_cache[key]
 
     def prune_msg_cache(self, max_age_s: float = 3000):
         """Drop entries older than max_age_s. Cache has no natural eviction
         otherwise and grows forever on a long-lived process."""
-        if not hasattr(self, "_msg_cache"):
-            return 0
         now = time.time()
         stale = [k for k, (_, ts) in self._msg_cache.items() if (now - ts) > max_age_s]
         for k in stale:
@@ -168,14 +171,15 @@ class ByteStreamer:
         off     = offset
         dc_id   = fid.dc_id
 
-        # Check if DC is in backoff; if so, wait
-        if dc_id in self._backoff_until:
-            until = self._backoff_until[dc_id]
+        # Check if DC is in backoff for the chosen client; if so, wait
+        backoff_key = (initial_c_idx, dc_id)
+        if backoff_key in self._backoff_until:
+            until = self._backoff_until[backoff_key]
             if time.time() < until:
                 remaining = until - time.time()
-                print(f"[streamer] Waiting for DC {dc_id} backoff: {remaining:.1f}s")
+                print(f"[streamer] Waiting for Client {initial_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
                 await asyncio.sleep(remaining)
-            del self._backoff_until[dc_id]
+            del self._backoff_until[backoff_key]
 
         try:
             async with self._concurrent_semaphore:
@@ -184,11 +188,16 @@ class ByteStreamer:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
+                    # NOTE: semaphore only wraps the first GetFile call.
+                    # Subsequent chunks in the loop below invoke without it —
+                    # intentional: per-chunk throttling + per-client round-robin
+                    # provide sufficient rate-limit protection without serialising
+                    # an entire multi-chunk stream through a single semaphore slot.
                 except (FloodWait, Timeout, RpcConnectFailed) as e:
                     wait_s = e.value if hasattr(e, 'value') else 5
                     if initial_c_idx is not None and hasattr(self.client, "mark_cooldown"):
                         self.client.mark_cooldown(initial_c_idx, wait_s)
-                    await self._wait_backoff(dc_id, wait_s)
+                    await self._wait_backoff(dc_id, wait_s, initial_c_idx)
                     # Retry after backoff — re-pick client to distribute load
                     if _retry:
                         # Re-pick a fresh client (don't reuse the rate-limited one)
@@ -270,13 +279,13 @@ class ByteStreamer:
                 wait_s = e.value if hasattr(e, 'value') else 5
                 if current_c_idx is not None and hasattr(self.client, "mark_cooldown"):
                     self.client.mark_cooldown(current_c_idx, wait_s)
-                await self._wait_backoff(dc_id, wait_s)
+                await self._wait_backoff(dc_id, wait_s, current_c_idx)
                 # Retry after backoff — re-pick client to distribute load
                 if _retry:
                     # Re-pick a fresh client (don't reuse the rate-limited one)
                     if hasattr(self.client, "pick"):
                         c_idx, c = await self.client.pick()
-                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, c, c_idx):
+                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, c, c_idx):
                         yield b
                     return
                 else:
@@ -298,19 +307,22 @@ class ByteStreamer:
                     refresh_c_idx, refresh_client = await self.client.pick()
                     msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
                 # Continue from current offset with fresh client selection
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, refresh_client, refresh_c_idx):
+                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, refresh_client, refresh_c_idx):
                     yield b
                 return
 
     async def _session(self, c: Client, fid: FileId) -> Session:
         dc = fid.dc_id
-        if not hasattr(c, "media_sessions"):
-            c.media_sessions = {}
-        if dc in c.media_sessions:
-            return c.media_sessions[dc]
-
-        async with self._session_lock:
-            # Double check inside lock
+        # Lazily create the per-client session lock first (lock dict is only
+        # written from the event-loop thread, so no race on the dict itself).
+        if c not in self._session_locks:
+            self._session_locks[c] = asyncio.Lock()
+        lock = self._session_locks[c]
+        async with lock:
+            # Initialise media_sessions inside the lock so two coroutines
+            # cannot both pass the hasattr check and both assign the dict.
+            if not hasattr(c, "media_sessions"):
+                c.media_sessions = {}
             if dc in c.media_sessions:
                 return c.media_sessions[dc]
 
