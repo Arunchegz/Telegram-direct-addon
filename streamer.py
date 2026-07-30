@@ -26,6 +26,7 @@ TG_MAX_LIMIT = 1024 * 1024      # Telegram's maximum allowed limit per GetFile r
 MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))  # Throttle between GetFile calls (100ms default); lower is faster
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
+MAX_MSG_CACHE_SIZE = 500   # Auto-prune message cache above this threshold
 
 
 class ByteStreamer:
@@ -113,6 +114,8 @@ class ByteStreamer:
                     raise
                 msg = await client.get_messages(channel, message_id)
             self._msg_cache[key] = (msg, now)
+            if len(self._msg_cache) > MAX_MSG_CACHE_SIZE:
+                self.prune_msg_cache()
             return msg
         return cached_msg
 

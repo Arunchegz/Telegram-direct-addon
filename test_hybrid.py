@@ -46,10 +46,10 @@ class TestStateHelpers(unittest.TestCase):
     def test_show_id(self):
         sid1 = show_id("Game.of.Thrones.S01E01.1080p.mkv")
         self.assertTrue(sid1.startswith("game_of_thrones_"))
-        self.assertEqual(len(sid1), len("game_of_thrones_") + 8)
+        self.assertEqual(len(sid1), len("game_of_thrones_") + 16)
         sid2 = show_id("Breaking.Bad.S05E12.Webrip.mkv")
         self.assertTrue(sid2.startswith("breaking_bad_"))
-        self.assertEqual(len(sid2), len("breaking_bad_") + 8)
+        self.assertEqual(len(sid2), len("breaking_bad_") + 16)
 
     def test_fmt_size(self):
         self.assertEqual(fmt_size(500), "500.0 B")
@@ -60,7 +60,7 @@ class TestStateHelpers(unittest.TestCase):
     def test_movie_id(self):
         mid = movie_id("The-Matrix (1999).mkv")
         self.assertTrue(mid.startswith("the_matrix__1999__mkv_"))
-        self.assertEqual(len(mid), len("the_matrix__1999__mkv_") + 8)
+        self.assertEqual(len(mid), len("the_matrix__1999__mkv_") + 16)
 
     def test_quality(self):
         self.assertEqual(quality("Movie.2160p.mkv"), "2160P")

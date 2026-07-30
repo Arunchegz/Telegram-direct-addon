@@ -77,7 +77,7 @@ if CHANNEL_USERNAME:
         pass
 
 REDIS_URL          = os.getenv("REDIS_URL", "")
-SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
+SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "600"))
 FULL_RECONCILE_S   = int(os.getenv("FULL_RECONCILE_S", "300"))  # full history rescan cadence (deletions)
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
@@ -96,7 +96,7 @@ source_chat_id: int | None = None
 # catalog updates (sync, instant post, delete) visible within 2 seconds.
 _movies_cache: dict = {}
 _movies_cache_ts: float = 0.0
-_MOVIES_CACHE_TTL = 2.0  # seconds
+_MOVIES_CACHE_TTL = 30.0  # seconds
 
 
 async def _get_movies() -> dict:
@@ -147,6 +147,7 @@ async def lifespan(app: FastAPI):
     redis_client = aioredis.from_url(
         REDIS_URL,
         decode_responses=False,
+        max_connections=10,
         socket_connect_timeout=10,
         socket_keepalive=True,
         retry_on_timeout=True,

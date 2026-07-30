@@ -183,11 +183,8 @@ class ClientPool:
             async with self._lock:
                 avail = self._available()
                 if avail:
-                    # Rotate over the full client count, not len(avail) — avail
-                    # shrinks whenever a client is cooling down, which skewed
-                    # the round-robin toward whichever clients were available.
-                    self._rr_counter = (self._rr_counter + 1) % len(self.clients)
-                    chosen = avail[self._rr_counter % len(avail)]
+                    self._rr_counter = (self._rr_counter + 1) % len(avail)
+                    chosen = avail[self._rr_counter]
                     return chosen, self.clients[chosen]
                 # All cooling down — compute wait outside sleep (lock held only briefly)
                 if self._cooldown_until:

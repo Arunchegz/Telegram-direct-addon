@@ -31,6 +31,7 @@ from clients import pool as client_pool
 # ── Constants ───────────────────────────────────────────────────────────[...]
 # Import chunk sizes from streamer module to ensure consistency
 from streamer import TG_CHUNK, PREFETCH_CHUNK, TG_MAX_LIMIT
+from metrics import metrics
 
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
@@ -247,6 +248,7 @@ class DownloadTask:
         self._alerted_stuck = False      # avoid repeat alerts for the same stuck streak
         self._seek_event = asyncio.Event()       # fires on large seek, aborts current batch
         self._pinned_client_idx: Optional[int] = None  # client slot held via acquire_download_slot
+        self._last_persist_ts: float = 0.0
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
     # Jump threshold: if player seeks > 30MB ahead of current batch, abort and re-anchor
@@ -314,11 +316,7 @@ class DownloadTask:
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
               f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
         completed = False
-        try:
-            from metrics import metrics
-            await metrics.record_download_start()
-        except Exception:
-            pass
+        await metrics.record_download_start()
 
         try:
             current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
@@ -413,11 +411,7 @@ class DownloadTask:
                     self._consecutive_errors = 0
                     self._alerted_stuck = False
 
-                    try:
-                        from metrics import metrics
-                        await metrics.record_download_chunk(len(data))
-                    except Exception:
-                        pass
+                    await metrics.record_download_chunk(len(data))
 
                     await asyncio.sleep(DL_THROTTLE_S)
 
@@ -462,14 +456,12 @@ class DownloadTask:
 
             # EOF
             self._done = True
+            self._last_persist_ts = 0  # force final persist
+            await self._persist_map()
             await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             completed = True
-            try:
-                from metrics import metrics
-                await metrics.record_download_complete()
-            except Exception:
-                pass
+            await metrics.record_download_complete()
         finally:
             self._finished_at = time.time()
             # Release the per-client load slot acquired at task start
@@ -477,11 +469,7 @@ class DownloadTask:
                 self.streamer.client.release_download_slot(self._pinned_client_idx)
                 self._pinned_client_idx = None
             if not completed:
-                try:
-                    from metrics import metrics
-                    await metrics.record_download_stop()
-                except Exception:
-                    pass
+                await metrics.record_download_stop()
 
 
     def _find_next_gap(self, from_offset: int) -> int:
@@ -498,7 +486,11 @@ class DownloadTask:
         return candidate
 
     async def _persist_map(self):
-        """Save interval map to Redis for crash recovery."""
+        """Save interval map to Redis for crash recovery (debounced to max once per 10s)."""
+        now = time.time()
+        if now - self._last_persist_ts < 10:
+            return
+        self._last_persist_ts = now
         await self.redis.set(
             R_DL_MAP.format(self.movie_id),
             self.dl_map.to_json(),

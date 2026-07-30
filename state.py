@@ -167,8 +167,8 @@ async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
 
 # ── String helpers ────────────────────────────────────────────────────────────
 def movie_id(filename: str) -> str:
-    slug = re.sub(r"[^a-z0-9_]", "_", filename.lower())[:50]  # cap slug — MD5 suffix guarantees uniqueness
-    suffix = hashlib.md5(filename.encode()).hexdigest()[:8]
+    slug = re.sub(r"[^a-z0-9_]", "_", filename.lower())[:50]
+    suffix = hashlib.md5(filename.encode()).hexdigest()[:16]
     return f"{slug}_{suffix}"
 
 

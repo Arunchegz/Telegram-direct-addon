@@ -3,6 +3,8 @@ import re
 import httpx
 from rapidfuzz import fuzz
 
+from state import parse_title_year as _state_parse_title_year
+
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 TMDB_URL = "https://api.themoviedb.org/3"
@@ -27,26 +29,9 @@ def _get_http_client() -> httpx.AsyncClient:
 # --------------------------------------------------
 
 def parse_title_year(filename: str):
-    """Thin wrapper that reuses state.parse_title_year for consistency."""
-    try:
-        from state import parse_title_year as _st_parse
-        title, year_str = _st_parse(filename)
-        year = int(year_str) if year_str and year_str.isdigit() else None
-        return title, year
-    except Exception:
-        pass
-    # Fallback (state not importable): local implementation
-    name = os.path.splitext(filename)[0]
-    name = name.replace(".", " ").replace("_", " ")
-    year = None
-    m = re.search(r"(19|20)\d{2}", name)
-    if m:
-        year = int(m.group())
-        name = name[:m.start()]
-    for word in ["1080p","720p","2160p","hdrip","webrip","webdl","bluray",
-                 "x264","x265","hevc","10bit","aac","dd5","esub","proper","hq","hdr","dv"]:
-        name = re.sub(rf"\b{word}\b", "", name, flags=re.I)
-    return re.sub(r"\s+", " ", name).strip(), year
+    title, year_str = _state_parse_title_year(filename)
+    year = int(year_str) if year_str and year_str.isdigit() else None
+    return title, year
 
 
 # --------------------------------------------------
