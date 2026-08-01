@@ -11,9 +11,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # HuggingFace Spaces Docker SDK runs containers as uid 1000
+# Cache dir must be OFF the /data bucket mount: the mount snapshots files at
+# creation and never persists pwrite data (reads serve stale zeros), so
+# downloads live in container-local /app/cache and are API-uploaded to the
+# bucket after completion instead.
 RUN useradd -m -u 1000 -s /bin/bash appuser && \
-    mkdir -p /data/tgstream && \
-    chown -R appuser:appuser /app /data
+    mkdir -p /app/cache && \
+    chown -R appuser:appuser /app
 
 USER appuser
 EXPOSE 7860
