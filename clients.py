@@ -20,7 +20,7 @@ from typing import Dict, List, Tuple
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.errors import AuthKeyDuplicated, FloodWait
 
 
 class ClientPool:
@@ -105,19 +105,7 @@ class ClientPool:
                         session_string=sess, no_updates=no_updates, workers=16,
                         sleep_threshold=0, in_memory=True, parse_mode=ParseMode.DISABLED,
                     )
-                await c.start()
-                if channel_username:
-                    try:
-                        await c.get_chat(channel_username)
-                        print(f"[clients] client {i} successfully resolved channel {channel_username}")
-                    except Exception as e:
-                        print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
-                else:
-                    try:
-                        async for _ in c.get_dialogs(limit=100):
-                            pass
-                    except Exception as e:
-                        print(f"[clients] peer-cache warmup failed for client {i}: {e}")
+                await self._start_with_auth_retry(c, i, channel_username)
                 self.clients.append(c)
                 print(f"[clients] client {i} started")
             except FloodWait as fw:
@@ -150,6 +138,39 @@ class ClientPool:
         if healthy_count == 0:
             raise RuntimeError("All clients in the pool failed to start. Cannot proceed.")
         print(f"[clients] pool ready with {healthy_count} healthy client(s)")
+
+    async def _start_with_auth_retry(self, c: Client, i: int, channel_username):
+        """Start a client, retrying on AUTH_KEY_DUPLICATED with backoff.
+
+        During a Space redeploy/restart the previous container may still hold
+        the session's auth key for a few seconds; the new container's client
+        then fails with AuthKeyDuplicated and would be marked broken forever.
+        Retrying shortly after lets it win the key once the old container is
+        gone, so deployments self-heal."""
+        delay = (10, 30, 60)
+        for attempt in range(1, 4):
+            try:
+                await c.start()
+                break
+            except AuthKeyDuplicated as e:
+                if attempt >= 3:
+                    raise
+                wait = delay[attempt - 1]
+                print(f"[clients] client {i} AuthKeyDuplicated (attempt {attempt}/3)"
+                      f" — previous holder still using the session; retrying in {wait}s")
+                await asyncio.sleep(wait)
+        if channel_username:
+            try:
+                await c.get_chat(channel_username)
+                print(f"[clients] client {i} successfully resolved channel {channel_username}")
+            except Exception as e:
+                print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
+        else:
+            try:
+                async for _ in c.get_dialogs(limit=100):
+                    pass
+            except Exception as e:
+                print(f"[clients] peer-cache warmup failed for client {i}: {e}")
 
     async def stop(self):
         for c in self.clients:
