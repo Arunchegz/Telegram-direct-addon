@@ -205,6 +205,25 @@ class SparseFile:
         fd = await self._get_fd()
         return await asyncio.to_thread(os.pread, fd, length, offset)
 
+    async def close_and_sync(self) -> None:
+        """fsync + close the fd, releasing the file to the filesystem.
+
+        On the Xet bucket mount (/data) writes are only persisted when the
+        file is closed — open fds with pwrite leave the blob as the all-zero
+        creation snapshot forever. Closing triggers the mount sync, so the
+        bucket blob becomes real data and later preads (reopen) see it."""
+        async with self._lock:
+            if self._fd is not None and self._fd >= 0:
+                try:
+                    os.fsync(self._fd)
+                except OSError:
+                    pass
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+
     def exists(self) -> bool:
         return self.path.exists()
 
@@ -496,6 +515,9 @@ class DownloadTask:
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             completed = True
             await metrics.record_download_complete()
+            # Close the file so the Xet mount syncs real data to the bucket
+            # (open fds never sync — blobs would stay all-zero).
+            await self.sparse.close_and_sync()
             # Mirror to the HuggingFace public bucket for persistent streaming
             if self.uploader is not None:
                 self.uploader.ensure_upload(
