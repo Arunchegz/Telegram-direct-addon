@@ -10,9 +10,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-RUN useradd -m -u 1001 appuser && \
-    mkdir -p /tmp/tgstream && \
-    chown -R appuser /app /tmp/tgstream
+# HuggingFace Spaces Docker SDK runs containers as uid 1000
+RUN useradd -m -u 1000 -s /bin/bash appuser && \
+    mkdir -p /data/tgstream && \
+    chown -R appuser:appuser /app /data
 
 USER appuser
 EXPOSE 7860

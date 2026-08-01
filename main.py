@@ -1,6 +1,6 @@
 """
 main.py — TGStream Hybrid Predictive Streamer
-Railway deployment.
+HuggingFace Space deployment (Docker SDK, port 7860).
 
 Proxy logic (the core of this rewrite):
   1. On first stream request -> start DownloadTask (background sequential fetch)
@@ -30,13 +30,14 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated
 from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
-from pyrogram.raw.types import UpdateDeleteChannelMessages
+from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji
+from pyrogram.raw.functions.messages import SendReaction
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from starlette.status import HTTP_401_UNAUTHORIZED
 
@@ -46,6 +47,7 @@ from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
+from hf_bucket import HfUploader, hf_uploader
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
 def get_peer_type_patched(peer_id: int) -> str:
@@ -85,6 +87,10 @@ STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))  # Match TG_CHUNK for consistency
 SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 1024)))  # 2MB grace window for Path B
 DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
+# HF bucket streaming: when a prefetched file is fully cached AND mirrored to the
+# HuggingFace public bucket, proxy requests 302-redirect to the HF CDN resolve URL
+# (persistent streaming that survives restarts / local disk wipes).
+HF_REDIRECT_DONE   = os.getenv("HF_REDIRECT_DONE", "true").strip().lower() == "true"
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
 source_chat_id: int | None = None
@@ -229,6 +235,8 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         _invalidate_movies_cache()
+                        # React ⏳ on the channel post to signal prefetch queued/pending
+                        _schedule(_send_channel_reaction(message.id, "⏳"))
                         # Catalog-only — no auto-prefetch (matches sync handler policy).
                         # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
@@ -260,7 +268,15 @@ async def lifespan(app: FastAPI):
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
     download_manager.on_alert = _notify_send
-    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)  # #2
+    download_manager.on_evict = lambda mid: (deferred_notifications.pop(mid, None), _upload_msg.pop(mid, None))  # #2
+    # HF bucket: persistent mirror of completed prefetch files
+    if hf_uploader.enabled:
+        download_manager.uploader = hf_uploader
+        download_manager.on_uploaded = _on_hf_uploaded
+        print(f"[hf] HF bucket streaming enabled → repo: {os.getenv('HF_REPO_ID', '')} "
+              f"(redirect completed streams: {HF_REDIRECT_DONE})")
+    else:
+        print("[hf] HF bucket disabled — set HF_TOKEN + HF_REPO_ID to enable persistent streaming")
     client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
@@ -420,6 +436,31 @@ def _resolve_chat_id(raw: str) -> int | str:
     except ValueError:
         pass
     return raw
+
+
+async def _send_channel_reaction(message_id: int, emoji: str) -> None:
+    """Send/replace a reaction on a channel message using the user MTProto client.
+
+    Uses the first available pooled user client (not the bot) because bots
+    cannot send reactions on channel posts they don't own.
+    Falls back silently on any error so reactions never break the main flow.
+    """
+    if not source_chat_id or not message_id:
+        return
+    try:
+        tg = get_tg()
+        await tg.invoke(
+            SendReaction(
+                peer=await tg.resolve_peer(source_chat_id),
+                msg_id=message_id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            )
+        )
+        print(f"[reaction] set {emoji} on msg {message_id}")
+    except FloodWait as fw:
+        print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
+    except Exception as e:
+        print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
 
 
 async def _notify_send(text: str) -> int | None:
@@ -902,6 +943,24 @@ async def _bot_channel_listener():
 
 deferred_notifications = {}
 
+# msg_id of the final "✅ Prefetched" notify message per movie — the HF upload
+# completion hook edits it to append the persistent bucket link.
+_upload_msg: dict[str, int] = {}
+
+
+def _on_hf_uploaded(movie_id: str, url: str):
+    """Fired by the downloader once the completed file is live on the HF bucket."""
+    msg_id = _upload_msg.pop(movie_id, None)
+    if not msg_id:
+        return
+    async def _edit():
+        try:
+            await _notify_edit(msg_id, f"📦 Persistent link (HF bucket):\n{url}")
+        except Exception as e:
+            print(f"[hf] notify edit failed: {e}")
+    _schedule(_edit())
+
+
 async def _prefetch_worker(worker_id: int = 0):
     """Pulls one movie_id at a time, downloads it fully in background.
     Skipped/paused automatically whenever a real Stremio stream is live
@@ -939,6 +998,7 @@ async def _prefetch_worker(worker_id: int = 0):
                 byte_streamer=byte_streamer,
                 fetch_msg_fn=_fetch_msg,
                 priority=False,
+                file_name=fn,
             )
 
             # Send notification afterwards (if task successfully started)
@@ -963,7 +1023,13 @@ async def _prefetch_worker(worker_id: int = 0):
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
                 if done_val == b"1":
-                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                    if hf_uploader.enabled:
+                        msg_id = await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}\n⏳ Uploading to HF bucket…")
+                        _upload_msg[movie_id] = msg_id
+                    else:
+                        await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                    # Replace ⏳ with ⚡ on the channel post to signal download complete
+                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 elif stopped == b"1":
                     print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
@@ -981,6 +1047,8 @@ async def _prefetch_worker(worker_id: int = 0):
                         await _notify_edit(msg_id, ready_text)
                     else:
                         await _notify_send(ready_text)
+                    # Already cached — fire ⚡ reaction (covers restart-recovery path)
+                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
@@ -1409,7 +1477,7 @@ async def stream(type: str, id: str):
             try:
                 fs = m.get("file_size") or 0
                 if fs:
-                    _schedule(_ensure_download(mid, fs, m["message_id"]))
+                    _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
             except Exception as e:
                 print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
@@ -1440,7 +1508,7 @@ async def stream(type: str, id: str):
                 try:
                     fs = m.get("file_size") or 0
                     if fs:
-                        _schedule(_ensure_download(mid, fs, m["message_id"]))
+                        _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
                 except Exception as e:
                     print(f"[stream] warn: {e}")
                 
@@ -1466,7 +1534,7 @@ async def stream(type: str, id: str):
             _invalidate_movies_cache()
             return JSONResponse({"streams": []})
         fs = movie.get("file_size") or media.file_size
-        _schedule(_ensure_download(clean, fs, movie["message_id"]))
+        _schedule(_ensure_download(clean, fs, movie["message_id"], movie.get("file_name")))
     except Exception as e:
         print(f"[stream] warn: {e}")
     fn  = movie.get("file_name","Unknown")
@@ -1539,11 +1607,11 @@ async def subtitles(type: str, id: str):
     return JSONResponse({"subtitles": []})
 
 
-async def _ensure_download(movie_id: str, file_size: int, message_id: int):
+async def _ensure_download(movie_id: str, file_size: int, message_id: int, file_name: str = None):
     await download_manager.get_or_create(
         movie_id=movie_id, file_size=file_size, message_id=message_id,
         redis=redis_client, byte_streamer=byte_streamer, fetch_msg_fn=_fetch_msg,
-        priority=True,
+        priority=True, file_name=file_name,
     )
     await download_manager.evict_lru_if_needed(redis_client)
 
@@ -1570,14 +1638,14 @@ async def _yield_local_file(dl_file, start: int, length: int, request: Request):
 
 
 
-async def _hydrate_if_cached(movie_id: str, file_size: int) -> bool:
+async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = None) -> bool:
     """
     Returns True if the file is fully downloaded locally and ready to serve.
     Side-effect: ensures download_manager._maps/_files are populated for this movie_id
     so proxy Path A can pread immediately.
     Never touches Telegram.
     """
-    return await download_manager.hydrate_cached(movie_id, file_size, redis_client)
+    return await download_manager.hydrate_cached(movie_id, file_size, redis_client, file_name)
 
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
@@ -1616,9 +1684,22 @@ async def proxy(movie_id: str, request: Request):
         })
 
     # ── Skip Telegram entirely if file already fully cached ─────────────────
-    _cached = await _hydrate_if_cached(movie_id, file_size)
+    _cached = await _hydrate_if_cached(movie_id, file_size, filename)
+
+    # ── Persistent HF bucket streaming ───────────────────────────────────────
+    # Completed files are mirrored to the HuggingFace public bucket. Stream them
+    # from the HF CDN (survives restarts / disk wipes, zero Telegram cost):
+    #   - always redirect when the local copy is gone but HF has it
+    #   - redirect completed files by default (HF_REDIRECT_DONE=false to prefer local)
+    if hf_uploader.enabled:
+        hf_url = await hf_uploader.get_uploaded_url(movie_id, redis_client)
+        if hf_url and (not _cached or HF_REDIRECT_DONE):
+            await metrics.record_stream_path("hf")
+            await metrics.record_cache_hit(file_size)
+            return RedirectResponse(hf_url, status_code=302, headers={"X-Source": "hf"})
+
     if not _cached:
-        _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
+        _schedule(_ensure_download(movie_id, file_size, movie["message_id"], filename))
 
     # Parse Range
     start, end = 0, file_size - 1
@@ -1794,7 +1875,7 @@ async def start_download_media(movie_id: str):
             raise HTTPException(status_code=502, detail="Telegram unavailable")
             
     await redis_client.delete(f"tgstream:dl:stopped:{movie_id}")
-    _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
+    _schedule(_ensure_download(movie_id, file_size, movie["message_id"], movie.get("file_name")))
     return {"status": "ok"}
 
 
