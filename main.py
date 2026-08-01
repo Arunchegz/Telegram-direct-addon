@@ -47,7 +47,7 @@ from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
-from hf_bucket import HfUploader, hf_uploader
+from hf_bucket import HfUploader, R_HF_DONE, hf_uploader
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
 def get_peer_type_patched(peer_id: int) -> str:
