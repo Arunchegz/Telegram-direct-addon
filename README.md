@@ -11,20 +11,20 @@ pinned: false
 
 Telegram streaming addon for Stremio. Runs as a **HuggingFace Space** (Docker SDK, port 7860) — see [DEPLOY.md](DEPLOY.md) for the full Space setup guide.
 
-## Persistent storage via HuggingFace bucket
+## Persistent streaming via HuggingFace bucket
 
-When a prefetch completes, the file is mirrored to a **public HuggingFace dataset repo** and streams are then served (302-redirected) straight from the HF CDN — persistent, survives restarts, zero Telegram cost.
+The Space mounts a public **bucket** at `/data` (read-write), so every completed prefetch file under `STORAGE_DIR` lands in the bucket automatically. Completed files are then streamed (302-redirected) straight from the bucket's CDN — persistent, survives restarts, zero Telegram cost.
 
-1. Create a public dataset repo: https://huggingface.co/new-dataset (any name, e.g. `tgstream-cache`)
-2. Set env vars:
+1. Create a public bucket: https://huggingface.co/new-bucket (e.g. `Telegram_stremio-storage`)
+2. Mount it in the Space at `/data` (Settings → Storage), then set:
 
 ```
-HF_TOKEN      = (write token from https://huggingface.co/settings/tokens)
-HF_REPO_ID    = yourusername/tgstream-cache
-HF_REDIRECT_DONE = true   # redirect completed-file streams to the HF CDN (default)
-STORAGE_DIR   = (optional; Space: set to /data/tgstream with persistent storage enabled)
+HF_BUCKET_ID      = yourusername/Telegram_stremio-storage
+HF_BUCKET_PREFIX  = tgstream     # key prefix of STORAGE_DIR inside the mount
+HF_REDIRECT_DONE  = true         # redirect completed-file streams to the bucket CDN (default)
+STORAGE_DIR       = /data/tgstream
 ```
 
-Uploads run in the background (deduped via Redis), retry with backoff, and are verified with a HEAD request before the file is considered streamable. Files deleted/evicted locally are removed from the bucket index too.
+No token needed — the bucket resolve URLs are public and Range-capable. Registration is verified with a HEAD request (retried, mount sync can lag a few seconds) before a file is considered streamable. Files deleted/evicted locally are dropped from the streaming index too.
 
 Uploads run in the background (deduped via Redis), retry with backoff, and are verified with a HEAD request before the file is considered streamable. Files deleted/evicted locally are removed from the bucket index too.

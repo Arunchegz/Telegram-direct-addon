@@ -10,17 +10,13 @@
 6. **Space storage**: tick **Persistent storage** — it mounts a persistent disk at `/data`
 7. Create the Space, then push this repo to it (or paste files in the Space UI editor)
 
-## 2 — Enable Persistent Storage
+## 2 — Create + mount the bucket (persistent storage)
 
-HF Spaces storage is **ephemeral** by default — the disk is wiped on every restart.
-Enable it in **Settings → Persistent Storage** (Beta), then set:
+1. Create a **public bucket**: https://huggingface.co/new-bucket → e.g. `Telegram_stremio-storage`
+2. Space → **Settings → Storage** → attach the bucket, mount path **`/data`** (read-write)
 
-```
-STORAGE_DIR = /data/tgstream
-```
-
-Prefetched files now survive restarts. Completed files are additionally mirrored
-to your public dataset bucket (see `HF_REPO_ID` below) — the truly persistent layer.
+The bucket is your persistent disk: prefetched files written to `/data` sync to it
+automatically, and completed files stream straight from the bucket CDN.
 
 ## 3 — Add Redis
 
@@ -44,8 +40,8 @@ SYNC_INTERVAL       = 300
 FULL_RECONCILE_S    = 300
 STREAM_CONCURRENCY  = 5
 STORAGE_DIR         = /data/tgstream
-HF_TOKEN            = (write token from https://huggingface.co/settings/tokens)
-HF_REPO_ID          = <your-username>/tgstream-cache   (public dataset repo)
+HF_BUCKET_ID        = <your-username>/Telegram_stremio-storage
+HF_BUCKET_PREFIX    = tgstream
 HF_REDIRECT_DONE    = true
 ```
 
@@ -99,9 +95,9 @@ Dashboard: `https://<your-username>-tgstream.hf.space/dashboard`
 ## Notes
 
 - Free Spaces **sleep** after ~48h idle — streaming users wake it (cold start).
-  For 24/7 streaming use a paid hardware tier or **watchdog** cron hitting `/` every 5 min.
-- `/data` persistent storage is charged per GB — keep `MAX_LOCAL_GB` reasonable
+  For 24/7 streaming use a paid hardware tier or a **watchdog** cron hitting `/` every 5 min.
+- `/data` bucket storage is charged per GB — keep `MAX_LOCAL_GB` reasonable
   (default 10, tune it in your secrets).
-- The HF dataset bucket (`HF_REPO_ID`) is the durable copy: even if Space storage
-  is lost, completed files stream straight from the HF CDN via 302 redirect.
+- The bucket is the durable copy: completed files stream from its CDN even if
+  Space storage is lost.
 - Logs: **Settings → Logs** in the Space dashboard.

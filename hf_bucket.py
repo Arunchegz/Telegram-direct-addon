@@ -1,16 +1,20 @@
 """
-hf_bucket.py — Persistent storage via a public HuggingFace dataset bucket.
+hf_bucket.py — Persistent streaming via a public HuggingFace bucket.
 
-When a prefetch completes, the file is uploaded to a public HF dataset repo
-(HF_REPO_ID, e.g. "username/tgstream-cache"). Completed files are then
-streamed straight from the HF CDN resolve URL, which survives restarts and
-local disk wipes — that is the persistent layer on top of STORAGE_DIR.
+The Space mounts the bucket at /data (read-write), so every completed prefetch
+file stored under STORAGE_DIR automatically lands in the bucket — no upload
+code needed. This module verifies the file is publicly reachable and registers
+its resolve URL in Redis; the proxy then 302-redirects completed-file streams
+to the bucket CDN.
+
+Bucket resolve URLs support anonymous Range requests (206), so players stream
+directly from HF — zero Telegram cost, survives restarts and local wipes.
 
 Env config:
-  HF_TOKEN            — write token (required to upload)
-  HF_REPO_ID          — dataset repo id, e.g. "username/tgstream-cache"
-  HF_STREAM_ENABLED   — master switch (default true)
-  HF_UPLOAD_CONCURRENCY — parallel uploads (default 2)
+  HF_BUCKET_ID      — bucket id, e.g. "arunchegz1/Telegram_stremio-storage"
+  HF_BUCKET_PREFIX  — key prefix of STORAGE_DIR inside the mount (default: tgstream)
+  HF_STREAM_ENABLED — master switch (default true)
+  HF_URL_TTL        — Redis URL TTL in seconds (default 30 days)
 
 Redis state:
   tgstream:hf:url:{movie_id} -> resolve URL (TTL 30 days, refreshed on hit)
@@ -19,48 +23,40 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from pathlib import Path
 
 import httpx
 
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-HF_REPO_ID = os.getenv("HF_REPO_ID", "").strip().strip("/")
+HF_BUCKET_ID = os.getenv("HF_BUCKET_ID", "").strip().strip("/")
+HF_BUCKET_PREFIX = os.getenv("HF_BUCKET_PREFIX", "tgstream").strip().strip("/")
 HF_STREAM_ENABLED = os.getenv("HF_STREAM_ENABLED", "true").strip().lower() == "true"
-HF_UPLOAD_CONCURRENCY = int(os.getenv("HF_UPLOAD_CONCURRENCY", "2"))
 HF_URL_TTL = int(os.getenv("HF_URL_TTL", str(30 * 86400)))
 
 R_HF_URL = "tgstream:hf:url:{}"
-_HF_CDN_BASE = "https://huggingface.co/datasets"
-_MAX_UPLOAD_ATTEMPTS = 5
-
-
-def sanitize_filename(fn: str) -> str:
-    fn = fn.replace("\\", "_").replace("/", "_")
-    fn = "".join(ch for ch in fn if ch.isprintable() and ch not in ':"<>|?*').strip()
-    return fn or "video.bin"
+_HF_BUCKETS_BASE = "https://huggingface.co/buckets"
+_MAX_REGISTER_ATTEMPTS = 5
+_VERIFY_ACCEPTED = (200, 302)  # 302 = redirect to signed CDN URL = object exists
 
 
 class HfUploader:
-    """Fire-and-forget uploader with in-process + Redis dedupe."""
+    """Verifies completed files are live on the bucket and registers their URLs."""
 
     def __init__(self):
-        self._sem = asyncio.Semaphore(HF_UPLOAD_CONCURRENCY)
         self._urls: dict[str, str] = {}      # movie_id -> resolve URL (in-memory cache)
-        self._started: set[str] = set()      # movie_ids with an in-flight/queued upload
-        self._api = None                     # lazy huggingface_hub.HfApi
+        self._started: set[str] = set()      # movie_ids with an in-flight registration
 
     # ── Config ───────────────────────────────────────────────────────────────
     @property
     def enabled(self) -> bool:
-        return HF_STREAM_ENABLED and bool(HF_REPO_ID) and bool(HF_TOKEN)
+        return HF_STREAM_ENABLED and bool(HF_BUCKET_ID)
 
-    def resolve_url(self, movie_id: str, file_name: str) -> str:
-        return f"{_HF_CDN_BASE}/{HF_REPO_ID}/resolve/main/{movie_id}/{sanitize_filename(file_name)}"
+    def resolve_url(self, movie_id: str, file_name: str = "") -> str:
+        # Bucket key mirrors STORAGE_DIR inside the /data mount: {prefix}/{movie_id}.bin
+        return f"{_HF_BUCKETS_BASE}/{HF_BUCKET_ID}/resolve/{HF_BUCKET_PREFIX}/{movie_id}.bin"
 
     # ── State ────────────────────────────────────────────────────────────────
     async def get_uploaded_url(self, movie_id: str, redis) -> str | None:
-        """Resolve URL if the file was uploaded — memory first, then Redis."""
+        """Resolve URL if the file is live on the bucket — memory first, then Redis."""
         url = self._urls.get(movie_id)
         if url:
             return url
@@ -71,23 +67,24 @@ class HfUploader:
         return url
 
     async def forget(self, movie_id: str, redis):
-        """Drop all HF state for a movie (called on evict/delete)."""
+        """Drop all bucket state for a movie (called on evict/delete)."""
         self._urls.pop(movie_id, None)
         self._started.discard(movie_id)
         await redis.delete(R_HF_URL.format(movie_id))
 
-    # ── Upload ───────────────────────────────────────────────────────────────
+    # ── Registration ─────────────────────────────────────────────────────────
     def ensure_upload(self, movie_id: str, local_path: Path, file_name: str,
                       redis, on_done=None):
-        """Schedule an upload if not already uploaded/queued. Never blocks."""
+        """Verify the completed file is publicly visible in the bucket and
+        register its URL. Never blocks. No-op if already registered."""
         if not self.enabled or not local_path.exists():
             return
         if movie_id in self._urls or movie_id in self._started:
             return
         self._started.add(movie_id)
         task = asyncio.create_task(
-            self._upload(movie_id, local_path, file_name, redis, on_done),
-            name=f"hf-upload:{movie_id}",
+            self._register(movie_id, redis, on_done),
+            name=f"hf-register:{movie_id}",
         )
         task.add_done_callback(self._log)
 
@@ -98,13 +95,12 @@ class HfUploader:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[hf] upload task failed: {type(e).__name__}: {e}")
+            print(f"[hf] register task failed: {type(e).__name__}: {e}")
 
-    async def _upload(self, movie_id: str, local_path: Path, file_name: str,
-                      redis, on_done=None):
-        url = self.resolve_url(movie_id, file_name)
+    async def _register(self, movie_id: str, redis, on_done=None):
+        url = self.resolve_url(movie_id)
         try:
-            # Already uploaded on a previous run? Redis survives restarts.
+            # Already registered on a previous run? Redis survives restarts.
             raw = await redis.get(R_HF_URL.format(movie_id))
             if raw:
                 self._urls[movie_id] = raw.decode()
@@ -114,54 +110,27 @@ class HfUploader:
         except Exception as e:
             print(f"[hf] redis check failed for {movie_id}: {e}")
 
-        async with self._sem:
-            for attempt in range(1, _MAX_UPLOAD_ATTEMPTS + 1):
-                try:
-                    await asyncio.to_thread(self._upload_sync, movie_id, local_path, file_name)
-                    if not await self._verify(url):
-                        raise RuntimeError("HEAD verification failed")
-                    await redis.set(R_HF_URL.format(movie_id), url, ex=HF_URL_TTL)
-                    self._urls[movie_id] = url
-                    print(f"[hf] uploaded {movie_id} -> {url}")
-                    if on_done:
-                        await self._call(on_done, movie_id, url)
-                    return
-                except Exception as e:
-                    wait = min(5 * attempt, 120)
-                    print(f"[hf] upload {movie_id} attempt {attempt}/{_MAX_UPLOAD_ATTEMPTS} failed: "
-                          f"{type(e).__name__}: {e} — retrying in {wait}s")
-                    await asyncio.sleep(wait)
+        for attempt in range(1, _MAX_REGISTER_ATTEMPTS + 1):
+            if await self._verify(url):
+                await redis.set(R_HF_URL.format(movie_id), url, ex=HF_URL_TTL)
+                self._urls[movie_id] = url
+                print(f"[hf] registered {movie_id} -> {url}")
+                if on_done:
+                    await self._call(on_done, movie_id, url)
+                return
+            wait = min(5 * attempt, 120)
+            print(f"[hf] {movie_id} not visible in bucket yet (attempt {attempt}/{_MAX_REGISTER_ATTEMPTS})"
+                  f" — mount sync may lag; retrying in {wait}s")
+            await asyncio.sleep(wait)
         # Give up for now — allow a later trigger (next proxy/prefetch pass) to retry.
         self._started.discard(movie_id)
 
-    def _upload_sync(self, movie_id: str, local_path: Path, file_name: str):
-        from huggingface_hub import HfApi
-        if self._api is None:
-            self._api = HfApi(token=HF_TOKEN)
-        path_in_repo = f"{movie_id}/{sanitize_filename(file_name)}"
-        try:
-            self._api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=path_in_repo,
-                repo_id=HF_REPO_ID,
-                repo_type="dataset",
-            )
-        except Exception as e:
-            # "File already exists" is raised under several names depending on the
-            # huggingface_hub version (UploadSkippedError / EntryAlreadyExistsError…).
-            # Treat it as success — the HEAD verify below confirms availability.
-            name = type(e).__name__.lower()
-            msg = str(e).lower()
-            if "skip" in name or "already" in msg or "exists" in name:
-                return
-            raise
-
     async def _verify(self, url: str) -> bool:
-        """HEAD the CDN resolve URL to confirm the file is really public."""
+        """HEAD the bucket resolve URL — 200/302 means the object is public."""
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.head(url)
-                return r.status_code == 200
+                return r.status_code in _VERIFY_ACCEPTED
         except Exception as e:
             print(f"[hf] verify failed for {url}: {e}")
             return False
