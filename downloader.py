@@ -730,8 +730,13 @@ class DownloadManager:
             on_done=self.on_uploaded,
         )
 
-    async def evict(self, movie_id: str, redis: aioredis.Redis):
-        """Cancel task, delete local file, clear Redis download state."""
+    async def evict(self, movie_id: str, redis: aioredis.Redis,
+                    delete_bucket: bool = False, file_name: str = None):
+        """Cancel task, delete local file, clear Redis download state.
+
+        delete_bucket=True also removes the movie's blob(s) from the HF bucket
+        (irreversible). Only pass it for intentional deletes — LRU eviction
+        must keep the bucket copy so streaming keeps working."""
         # Pop state inside lock, then do I/O (cancel + file delete) outside
         # so the lock isn't held across blocking operations — avoids stalling
         # concurrent get_or_create / hydrate_cached callers.
@@ -751,6 +756,8 @@ class DownloadManager:
         )
         if self.uploader is not None:
             await self.uploader.forget(movie_id, redis)
+            if delete_bucket:
+                self.uploader.delete_remote(movie_id, file_name, redis)
         print(f"[dm] evicted {movie_id}")
         if self.on_evict:
             try:

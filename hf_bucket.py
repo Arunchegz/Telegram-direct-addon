@@ -31,6 +31,8 @@ HF_BUCKET_ID = os.getenv("HF_BUCKET_ID", "").strip().strip("/")
 HF_BUCKET_PREFIX = os.getenv("HF_BUCKET_PREFIX", "tgstream").strip().strip("/")
 HF_STREAM_ENABLED = os.getenv("HF_STREAM_ENABLED", "true").strip().lower() == "true"
 HF_URL_TTL = int(os.getenv("HF_URL_TTL", str(30 * 86400)))
+# Only needed for deletion of bucket files (write access). Streaming needs none.
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 R_HF_URL = "tgstream:hf:url:{}"
 _HF_BUCKETS_BASE = "https://huggingface.co/buckets"
@@ -76,6 +78,33 @@ class HfUploader:
         self._urls.pop(movie_id, None)
         self._started.discard(movie_id)
         await redis.delete(R_HF_URL.format(movie_id))
+
+    # ── Deletion ─────────────────────────────────────────────────────────────
+    def delete_remote(self, movie_id: str, file_name: str, redis):
+        """Delete the movie's blob(s) from the bucket (fire-and-forget).
+        Requires HF_TOKEN with write access. Both the canonical extension and
+        legacy .bin keys are removed — buckets are unversioned, so this is
+        permanent. Only called on intentional deletes, never on LRU eviction."""
+        if not HF_TOKEN:
+            print(f"[hf] cannot delete {movie_id} from bucket — HF_TOKEN not set")
+            return
+        if movie_id in self._started:
+            return  # registration in flight — skip to avoid racing
+        paths = {f"{HF_BUCKET_PREFIX}/{movie_id}.bin"}
+        if file_name:
+            suffix = Path(file_name).suffix.lower().lstrip(".")
+            if suffix and len(suffix) <= 8:
+                paths.add(f"{HF_BUCKET_PREFIX}/{movie_id}.{suffix}")
+        task = asyncio.create_task(self._delete_remote(movie_id, list(paths)), name=f"hf-delete:{movie_id}")
+        task.add_done_callback(self._log)
+
+    async def _delete_remote(self, movie_id: str, paths: list[str]):
+        try:
+            from huggingface_hub import batch_bucket_files
+            await asyncio.to_thread(batch_bucket_files, HF_BUCKET_ID, delete=paths, token=HF_TOKEN)
+            print(f"[hf] deleted from bucket: {', '.join(paths)}")
+        except Exception as e:
+            print(f"[hf] bucket delete failed for {movie_id} ({paths}): {type(e).__name__}: {e}")
 
     # ── Registration ─────────────────────────────────────────────────────────
     def ensure_upload(self, movie_id: str, local_path: Path, file_name: str,

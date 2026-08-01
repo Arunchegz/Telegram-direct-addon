@@ -337,7 +337,7 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
     for mid, file_name in removed:
         print(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
         await st.del_movie(redis_client, mid)
-        await download_manager.evict(mid, redis_client)
+        await download_manager.evict(mid, redis_client, delete_bucket=True, file_name=file_name)
         deferred_notifications.pop(mid, None)
     if removed:
         _invalidate_movies_cache()
@@ -765,7 +765,7 @@ async def _handle_admin_callback(cq: dict):
             await _bot_edit_keyboard(chat_id, message_id, text, kb)
             return
         fn = movies[target].get("file_name", target)
-        await download_manager.evict(target, redis_client)
+        await download_manager.evict(target, redis_client, delete_bucket=True, file_name=fn)
         await st.del_movie(redis_client, target)
         _invalidate_movies_cache()
         await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
@@ -816,7 +816,7 @@ async def _handle_admin_command(chat_id, text: str):
         if arg not in movies:
             await _bot_reply(chat_id, f"Not found: {arg}")
             return
-        await download_manager.evict(arg, redis_client)
+        await download_manager.evict(arg, redis_client, delete_bucket=True, file_name=movies[arg].get("file_name"))
         await _bot_reply(chat_id, f"🗑 Evicted: {arg}")
 
     elif cmd == "/find":
@@ -1160,7 +1160,8 @@ async def _sync_channel(force: bool = False) -> int:
                 for mid in removed_ids:
                     print(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(redis_client, mid)
-                    await download_manager.evict(mid, redis_client)
+                    await download_manager.evict(mid, redis_client, delete_bucket=True,
+                                                 file_name=existing_movies.get(mid, {}).get("file_name"))
                 if removed_ids:
                     _invalidate_movies_cache()
                 await redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
@@ -1892,7 +1893,9 @@ async def pause_download_media(movie_id: str):
 @app.post("/api/media/{movie_id}/evict")
 async def evict_cache_media(movie_id: str):
     await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
-    await download_manager.evict(movie_id, redis_client)
+    movies = await _get_movies()
+    await download_manager.evict(movie_id, redis_client, delete_bucket=True,
+                                 file_name=movies.get(movie_id, {}).get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on API eviction
     return {"status": "ok"}
 
@@ -1905,7 +1908,8 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
         raise HTTPException(status_code=404, detail="Movie not found in index")
     
     # 1. Evict cache from downloader
-    await download_manager.evict(movie_id, redis_client)
+    await download_manager.evict(movie_id, redis_client, delete_bucket=True,
+                                 file_name=movie.get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on delete
     
     # 2. Optionally delete from Telegram
