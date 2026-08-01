@@ -52,6 +52,30 @@ R_DL_PATH = "tgstream:dl:path:{}"   # local file path string
 R_DL_TS   = "tgstream:dl:ts:{}"     # last access timestamp (for LRU eviction)
 
 
+def cache_path(movie_id: str, file_name: str | None = None) -> Path:
+    """Canonical sparse-file path, keeping the real file extension (e.g. .mkv)
+    so the HF bucket keys carry a proper video extension. Falls back to .bin
+    when no extension is known."""
+    ext = "bin"
+    if file_name:
+        suffix = Path(file_name).suffix.lower().lstrip(".")
+        if suffix and len(suffix) <= 8:
+            ext = suffix
+    return STORAGE_DIR / f"{movie_id}.{ext}"
+
+
+def find_cache_path(movie_id: str, file_name: str | None = None) -> Path:
+    """cache_path, but also accepts pre-existing legacy .bin files (created by
+    older builds) so cached data keeps working without a re-download."""
+    p = cache_path(movie_id, file_name)
+    if p.exists():
+        return p
+    legacy = STORAGE_DIR / f"{movie_id}.bin"
+    if legacy.exists():
+        return legacy
+    return p
+
+
 # ────────────────────────────────────────────────────────────────────────[...]
 # DownloadMap: sorted merged interval list
 # ────────────────────────────────────────────────────────────────────────[...]
@@ -594,7 +618,7 @@ class DownloadManager:
                 return task  # Already downloading this movie
 
             # ── Fast-path: file fully cached — skip Telegram entirely ─────────
-            sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+            sparse_path = find_cache_path(movie_id, file_name)
             if sparse_path.exists():
                 done_val = await redis.get(R_DL_DONE.format(movie_id))
                 if done_val == b"1":
@@ -646,7 +670,7 @@ class DownloadManager:
             dl_map = await self._load_map(movie_id, redis)
 
             # Check if local file still valid (may have been wiped on restart)
-            sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+            sparse_path = find_cache_path(movie_id, file_name)
             if not sparse_path.exists():
                 # Disk wiped — reset map
                 dl_map = DownloadMap()
@@ -843,7 +867,7 @@ class DownloadManager:
         Lock strategy: check in-memory state under lock (cheap), release before
         any Redis I/O, then re-acquire to write back hydrated state.
         """
-        sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+        sparse_path = find_cache_path(movie_id, file_name)
         if not sparse_path.exists():
             return False
 

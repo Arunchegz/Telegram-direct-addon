@@ -44,7 +44,7 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 import pyrogram.utils
 import state as st
 from clients import pool as client_pool
-from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB
+from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
 from hf_bucket import HfUploader, hf_uploader
@@ -1235,7 +1235,7 @@ async def debug_movies(request: Request):
         if not dl_map:
             dl_map = await download_manager._load_map(mid, redis_client)
             
-        file_path = STORAGE_DIR / f"{mid}.bin"
+        file_path = find_cache_path(mid, m.get("file_name"))
         exists = file_path.exists()
         
         cached_bytes = dl_map.total_bytes() if exists else 0
@@ -1481,7 +1481,7 @@ async def stream(type: str, id: str):
             except Exception as e:
                 print(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
-            cached = await _is_cached(mid)
+            cached = await _is_cached(mid, m.get("file_name"))
             label = "TGStream ⚡" if cached else "TGStream"
             streams.append({"name":label,"title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{mid}"})
         return JSONResponse({"streams": streams})
@@ -1515,7 +1515,7 @@ async def stream(type: str, id: str):
                 q   = m.get("quality","Unknown")
                 sz  = m.get("file_size_text","Unknown")
                 src = m.get("source","")
-                cached = await _is_cached(mid)
+                cached = await _is_cached(mid, m.get("file_name"))
                 label = "TGStream ⚡" if cached else "TGStream"
                 streams.append({
                     "name": label,
@@ -1541,7 +1541,7 @@ async def stream(type: str, id: str):
     q   = movie.get("quality","Unknown")
     sz  = movie.get("file_size_text","Unknown")
     src = movie.get("source","")
-    cached = await _is_cached(clean)
+    cached = await _is_cached(clean, movie.get("file_name"))
     label = "TGStream ⚡" if cached else "TGStream"
     return JSONResponse({"streams": [{"name":label,
         "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}"}]})
@@ -1616,11 +1616,11 @@ async def _ensure_download(movie_id: str, file_size: int, message_id: int, file_
     await download_manager.evict_lru_if_needed(redis_client)
 
 
-async def _is_cached(movie_id: str) -> bool:
+async def _is_cached(movie_id: str, file_name: str = None) -> bool:
     done = await redis_client.get(f"tgstream:dl:done:{movie_id}")
     if done != b"1":
         return False
-    sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+    sparse_path = find_cache_path(movie_id, file_name)
     return sparse_path.exists()
 
 

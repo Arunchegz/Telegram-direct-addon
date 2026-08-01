@@ -51,8 +51,13 @@ class HfUploader:
         return HF_STREAM_ENABLED and bool(HF_BUCKET_ID)
 
     def resolve_url(self, movie_id: str, file_name: str = "") -> str:
-        # Bucket key mirrors STORAGE_DIR inside the /data mount: {prefix}/{movie_id}.bin
-        return f"{_HF_BUCKETS_BASE}/{HF_BUCKET_ID}/resolve/{HF_BUCKET_PREFIX}/{movie_id}.bin"
+        # Bucket key mirrors STORAGE_DIR inside the /data mount: {prefix}/{movie_id}.{ext}
+        ext = "bin"
+        if file_name:
+            suffix = Path(file_name).suffix.lower().lstrip(".")
+            if suffix and len(suffix) <= 8:
+                ext = suffix
+        return f"{_HF_BUCKETS_BASE}/{HF_BUCKET_ID}/resolve/{HF_BUCKET_PREFIX}/{movie_id}.{ext}"
 
     # ── State ────────────────────────────────────────────────────────────────
     async def get_uploaded_url(self, movie_id: str, redis) -> str | None:
@@ -83,7 +88,7 @@ class HfUploader:
             return
         self._started.add(movie_id)
         task = asyncio.create_task(
-            self._register(movie_id, redis, on_done),
+            self._register(movie_id, file_name, redis, on_done),
             name=f"hf-register:{movie_id}",
         )
         task.add_done_callback(self._log)
@@ -97,27 +102,33 @@ class HfUploader:
         except Exception as e:
             print(f"[hf] register task failed: {type(e).__name__}: {e}")
 
-    async def _register(self, movie_id: str, redis, on_done=None):
-        url = self.resolve_url(movie_id)
+    async def _register(self, movie_id: str, file_name: str, redis, on_done=None):
+        # Try the canonical (extension-aware) URL first, then legacy .bin —
+        # pre-extension builds stored files as {movie_id}.bin in the bucket.
+        urls = [self.resolve_url(movie_id, file_name)]
+        legacy = self.resolve_url(movie_id, "")
+        if legacy not in urls:
+            urls.append(legacy)
         try:
             # Already registered on a previous run? Redis survives restarts.
             raw = await redis.get(R_HF_URL.format(movie_id))
             if raw:
                 self._urls[movie_id] = raw.decode()
                 if on_done:
-                    await self._call(on_done, movie_id, url)
+                    await self._call(on_done, movie_id, raw.decode())
                 return
         except Exception as e:
             print(f"[hf] redis check failed for {movie_id}: {e}")
 
         for attempt in range(1, _MAX_REGISTER_ATTEMPTS + 1):
-            if await self._verify(url):
-                await redis.set(R_HF_URL.format(movie_id), url, ex=HF_URL_TTL)
-                self._urls[movie_id] = url
-                print(f"[hf] registered {movie_id} -> {url}")
-                if on_done:
-                    await self._call(on_done, movie_id, url)
-                return
+            for url in urls:
+                if await self._verify(url):
+                    await redis.set(R_HF_URL.format(movie_id), url, ex=HF_URL_TTL)
+                    self._urls[movie_id] = url
+                    print(f"[hf] registered {movie_id} -> {url}")
+                    if on_done:
+                        await self._call(on_done, movie_id, url)
+                    return
             wait = min(5 * attempt, 120)
             print(f"[hf] {movie_id} not visible in bucket yet (attempt {attempt}/{_MAX_REGISTER_ATTEMPTS})"
                   f" — mount sync may lag; retrying in {wait}s")
