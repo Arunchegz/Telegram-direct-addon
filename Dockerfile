@@ -11,9 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # HuggingFace Spaces Docker SDK runs containers as uid 1000
-# Files are written to /data/tgstream (the bucket mount): pwrite while the
-# fd is open, then close_and_sync() on completion makes the mount sync the
-# real data to the bucket (open fds never sync — blobs stay all-zero).
+# Files are written to /data/tgstream (persistent volume).
 RUN useradd -m -u 1000 -s /bin/bash appuser && \
     mkdir -p /data/tgstream && \
     chown -R appuser:appuser /app /data

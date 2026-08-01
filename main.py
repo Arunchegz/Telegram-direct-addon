@@ -47,7 +47,6 @@ from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
-from hf_bucket import HfUploader, R_HF_DONE, hf_uploader
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
 def get_peer_type_patched(peer_id: int) -> str:
@@ -87,10 +86,6 @@ STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))  # Match TG_CHUNK for consistency
 SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 1024)))  # 2MB grace window for Path B
 DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
-# HF bucket streaming: when a prefetched file is fully cached AND mirrored to the
-# HuggingFace public bucket, proxy requests 302-redirect to the HF CDN resolve URL
-# (persistent streaming that survives restarts / local disk wipes).
-HF_REDIRECT_DONE   = os.getenv("HF_REDIRECT_DONE", "true").strip().lower() == "true"
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
 source_chat_id: int | None = None
@@ -268,15 +263,7 @@ async def lifespan(app: FastAPI):
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
     download_manager.on_alert = _notify_send
-    download_manager.on_evict = lambda mid: (deferred_notifications.pop(mid, None), _upload_msg.pop(mid, None))  # #2
-    # HF bucket: persistent mirror of completed prefetch files
-    if hf_uploader.enabled:
-        download_manager.uploader = hf_uploader
-        download_manager.on_uploaded = _on_hf_uploaded
-        print(f"[hf] HF bucket streaming enabled → bucket: {os.getenv('HF_BUCKET_ID', '')} "
-              f"(redirect completed streams: {HF_REDIRECT_DONE})")
-    else:
-        print("[hf] HF bucket disabled — set HF_BUCKET_ID to enable persistent streaming")
+    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)
     client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
@@ -337,7 +324,7 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
     for mid, file_name in removed:
         print(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
         await st.del_movie(redis_client, mid)
-        await download_manager.evict(mid, redis_client, delete_bucket=True, file_name=file_name)
+        await download_manager.evict(mid, redis_client, file_name=file_name)
         deferred_notifications.pop(mid, None)
     if removed:
         _invalidate_movies_cache()
@@ -766,7 +753,7 @@ async def _handle_admin_callback(cq: dict):
             await _bot_edit_keyboard(chat_id, message_id, text, kb)
             return
         fn = movies[target].get("file_name", target)
-        await download_manager.evict(target, redis_client, delete_bucket=True, file_name=fn)
+        await download_manager.evict(target, redis_client, file_name=fn)
         await st.del_movie(redis_client, target)
         _invalidate_movies_cache()
         await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
@@ -817,7 +804,7 @@ async def _handle_admin_command(chat_id, text: str):
         if arg not in movies:
             await _bot_reply(chat_id, f"Not found: {arg}")
             return
-        await download_manager.evict(arg, redis_client, delete_bucket=True, file_name=movies[arg].get("file_name"))
+        await download_manager.evict(arg, redis_client, file_name=movies[arg].get("file_name"))
         await _bot_reply(chat_id, f"🗑 Evicted: {arg}")
 
     elif cmd == "/find":
@@ -944,23 +931,6 @@ async def _bot_channel_listener():
 
 deferred_notifications = {}
 
-# msg_id of the final "✅ Prefetched" notify message per movie — the HF upload
-# completion hook edits it to append the persistent bucket link.
-_upload_msg: dict[str, int] = {}
-
-
-def _on_hf_uploaded(movie_id: str, url: str):
-    """Fired by the downloader once the completed file is live on the HF bucket."""
-    msg_id = _upload_msg.pop(movie_id, None)
-    if not msg_id:
-        return
-    async def _edit():
-        try:
-            await _notify_edit(msg_id, f"📦 Persistent link (HF bucket):\n{url}")
-        except Exception as e:
-            print(f"[hf] notify edit failed: {e}")
-    _schedule(_edit())
-
 
 async def _prefetch_worker(worker_id: int = 0):
     """Pulls one movie_id at a time, downloads it fully in background.
@@ -1024,11 +994,7 @@ async def _prefetch_worker(worker_id: int = 0):
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
                 if done_val == b"1":
-                    if hf_uploader.enabled:
-                        msg_id = await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}\n⏳ Uploading to HF bucket…")
-                        _upload_msg[movie_id] = msg_id
-                    else:
-                        await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                    await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
                     # Replace ⏳ with ⚡ on the channel post to signal download complete
                     _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 elif stopped == b"1":
@@ -1164,7 +1130,7 @@ async def _sync_channel(force: bool = False) -> int:
                 for mid in removed_ids:
                     print(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(redis_client, mid)
-                    await download_manager.evict(mid, redis_client, delete_bucket=True,
+                    await download_manager.evict(mid, redis_client,
                                                  file_name=existing_movies.get(mid, {}).get("file_name"))
                 if removed_ids:
                     _invalidate_movies_cache()
@@ -1691,25 +1657,6 @@ async def proxy(movie_id: str, request: Request):
     # ── Skip Telegram entirely if file already fully cached ─────────────────
     _cached = await _hydrate_if_cached(movie_id, file_size, filename)
 
-    # ── Persistent HF bucket streaming ───────────────────────────────────────
-    # Completed files are mirrored to the HuggingFace public bucket. Stream them
-    # from the HF CDN (survives restarts / disk wipes, zero Telegram cost):
-    #   - always redirect when the local copy is gone but HF has it
-    #   - redirect completed files by default (HF_REDIRECT_DONE=false to prefer local)
-    if hf_uploader.enabled:
-        hf_url = await hf_uploader.get_uploaded_url(movie_id, redis_client)
-        if hf_url and (not _cached or HF_REDIRECT_DONE):
-            # Only trust URLs backed by a real upload (R_HF_DONE flag). A URL
-            # without it points at the mount's all-zero snapshot (see
-            # hf_bucket.py) — serve local instead; the flag gets set once the
-            # background upload finishes, after which requests redirect.
-            if await redis_client.get(R_HF_DONE.format(movie_id)):
-                await metrics.record_stream_path("hf")
-                await metrics.record_cache_hit(file_size)
-                return RedirectResponse(hf_url, status_code=302, headers={"X-Source": "hf"})
-            print(f"[hf] {movie_id}: registered but not uploaded (zero blob?) — serving local, re-upload pending")
-            hf_url = None
-
     if not _cached:
         _schedule(_ensure_download(movie_id, file_size, movie["message_id"], filename))
 
@@ -1905,7 +1852,7 @@ async def pause_download_media(movie_id: str):
 async def evict_cache_media(movie_id: str):
     await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
     movies = await _get_movies()
-    await download_manager.evict(movie_id, redis_client, delete_bucket=True,
+    await download_manager.evict(movie_id, redis_client,
                                  file_name=movies.get(movie_id, {}).get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on API eviction
     return {"status": "ok"}
@@ -1919,7 +1866,7 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
         raise HTTPException(status_code=404, detail="Movie not found in index")
     
     # 1. Evict cache from downloader
-    await download_manager.evict(movie_id, redis_client, delete_bucket=True,
+    await download_manager.evict(movie_id, redis_client,
                                  file_name=movie.get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on delete
     

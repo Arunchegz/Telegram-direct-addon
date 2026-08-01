@@ -35,9 +35,7 @@ from metrics import metrics
 
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 # Persistent storage: default to a dir under the user home (survives restarts,
-# unlike /tmp). Set STORAGE_DIR explicitly to override. Completed files are
-# additionally mirrored to the HuggingFace bucket (hf_bucket.py) as the
-# truly persistent layer.
+# unlike /tmp). Set STORAGE_DIR explicitly to override.
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", str(Path.home() / "tgstream_storage")))
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
@@ -54,7 +52,7 @@ R_DL_TS   = "tgstream:dl:ts:{}"     # last access timestamp (for LRU eviction)
 
 def cache_path(movie_id: str, file_name: str | None = None) -> Path:
     """Canonical sparse-file path, keeping the real file extension (e.g. .mkv)
-    so the HF bucket keys carry a proper video extension. Falls back to .bin
+    so the cached file carries a proper video extension. Falls back to .bin
     when no extension is known."""
     ext = "bin"
     if file_name:
@@ -205,25 +203,6 @@ class SparseFile:
         fd = await self._get_fd()
         return await asyncio.to_thread(os.pread, fd, length, offset)
 
-    async def close_and_sync(self) -> None:
-        """fsync + close the fd, releasing the file to the filesystem.
-
-        On the Xet bucket mount (/data) writes are only persisted when the
-        file is closed — open fds with pwrite leave the blob as the all-zero
-        creation snapshot forever. Closing triggers the mount sync, so the
-        bucket blob becomes real data and later preads (reopen) see it."""
-        async with self._lock:
-            if self._fd is not None and self._fd >= 0:
-                try:
-                    os.fsync(self._fd)
-                except OSError:
-                    pass
-                try:
-                    os.close(self._fd)
-                except OSError:
-                    pass
-                self._fd = None
-
     def exists(self) -> bool:
         return self.path.exists()
 
@@ -272,9 +251,7 @@ class DownloadTask:
         message_id: int,
         dl_semaphore: asyncio.Semaphore,
         alert_fn=None,   # optional async fn(text) — fired after repeated consecutive failures
-        file_name: str = None,  # original filename — used for the HF bucket path
-        uploader=None,          # optional hf_bucket.HfUploader
-        on_uploaded=None,       # optional async fn(movie_id, url) — fired after HF upload
+        file_name: str = None,  # original filename — used for the local cache path
     ):
         self.movie_id    = movie_id
         self.file_size   = file_size
@@ -285,8 +262,6 @@ class DownloadTask:
         self.fetch_msg   = fetch_msg_fn
         self.message_id  = message_id
         self.file_name   = file_name
-        self.uploader    = uploader
-        self._on_uploaded = on_uploaded
         self._semaphore  = dl_semaphore
         self._alert_fn   = alert_fn
 
@@ -515,16 +490,6 @@ class DownloadTask:
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             completed = True
             await metrics.record_download_complete()
-            # Close the file so the Xet mount syncs real data to the bucket
-            # (open fds never sync — blobs would stay all-zero).
-            await self.sparse.close_and_sync()
-            # Mirror to the HuggingFace public bucket for persistent streaming
-            if self.uploader is not None:
-                self.uploader.ensure_upload(
-                    self.movie_id, self.sparse.path,
-                    self.file_name or self.movie_id, self.redis,
-                    on_done=self._upload_done,
-                )
         finally:
             self._finished_at = time.time()
             # Release the per-client load slot acquired at task start
@@ -565,16 +530,6 @@ class DownloadTask:
             ex=86400,
         )
 
-    async def _upload_done(self, movie_id: str, url: str):
-        """Fired once the file is live on the HF bucket."""
-        if self._on_uploaded:
-            try:
-                res = self._on_uploaded(movie_id, url)
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception as e:
-                print(f"[dl:{self.movie_id}] on_uploaded hook failed: {e}")
-
 
 # ────────────────────────────────────────────────────────────────────────[...]
 # DownloadManager: registry of active DownloadTasks
@@ -605,8 +560,6 @@ class DownloadManager:
         self.paused = False    # set via /pause admin command — blocks new prefetch starts
         self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
         self.on_evict = None   # optional fn(movie_id) called on every eviction (sync, for cleanup hooks)
-        self.uploader = None   # optional hf_bucket.HfUploader — mirrors completed files to HF bucket
-        self.on_uploaded = None  # optional async fn(movie_id, url) — fired after HF upload completes
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -651,7 +604,6 @@ class DownloadManager:
                     if movie_id not in self._files:
                         self._files[movie_id] = SparseFile(sparse_path)
                     print(f"[dl:{movie_id}] fully cached — skipping downloader")
-                    self._ensure_upload(movie_id, sparse_path, file_name, redis)
                     return None
                 # Fallback: interval coverage check (Redis flag may be missing after crash)
                 dl_map = await self._load_map(movie_id, redis)
@@ -661,7 +613,6 @@ class DownloadManager:
                         self._files[movie_id] = SparseFile(sparse_path)
                     await redis.set(R_DL_DONE.format(movie_id), b"1")
                     print(f"[dl:{movie_id}] fully cached (map verify) — skipping downloader")
-                    self._ensure_upload(movie_id, sparse_path, file_name, redis)
                     return None
             # ─────────────────────────────────────────────────────────────────
 
@@ -717,8 +668,6 @@ class DownloadManager:
                 dl_semaphore=self._dl_semaphore,
                 alert_fn=self._fire_alert,
                 file_name=file_name,
-                uploader=self.uploader,
-                on_uploaded=self.on_uploaded,
             )
             dt.start()
             self._tasks[movie_id] = dt
@@ -745,22 +694,9 @@ class DownloadManager:
     def get_file(self, movie_id: str) -> Optional[SparseFile]:
         return self._files.get(movie_id)
 
-    def _ensure_upload(self, movie_id: str, sparse_path: Path, file_name: str | None, redis):
-        """Schedule an HF bucket upload for a completed file (deduped internally)."""
-        if self.uploader is None:
-            return
-        self.uploader.ensure_upload(
-            movie_id, sparse_path, file_name or movie_id, redis,
-            on_done=self.on_uploaded,
-        )
-
     async def evict(self, movie_id: str, redis: aioredis.Redis,
-                    delete_bucket: bool = False, file_name: str = None):
-        """Cancel task, delete local file, clear Redis download state.
-
-        delete_bucket=True also removes the movie's blob(s) from the HF bucket
-        (irreversible). Only pass it for intentional deletes — LRU eviction
-        must keep the bucket copy so streaming keeps working."""
+                    file_name: str = None):
+        """Cancel task, delete local file, clear Redis download state."""
         # Pop state inside lock, then do I/O (cancel + file delete) outside
         # so the lock isn't held across blocking operations — avoids stalling
         # concurrent get_or_create / hydrate_cached callers.
@@ -778,10 +714,6 @@ class DownloadManager:
             R_DL_PATH.format(movie_id),
             R_DL_TS.format(movie_id),
         )
-        if self.uploader is not None:
-            await self.uploader.forget(movie_id, redis)
-            if delete_bucket:
-                self.uploader.delete_remote(movie_id, file_name, redis)
         print(f"[dm] evicted {movie_id}")
         if self.on_evict:
             try:
@@ -891,8 +823,7 @@ class DownloadManager:
         """
         Returns True if the file is fully downloaded locally and ready to serve.
         Side-effect: ensures self._maps/_files are populated for this movie_id
-        so proxy Path A can pread immediately. Also re-triggers the HF bucket
-        upload when the file completed but was never mirrored (crash recovery).
+        so proxy Path A can pread immediately.
         Never touches Telegram.
 
         Lock strategy: check in-memory state under lock (cheap), release before
@@ -906,7 +837,6 @@ class DownloadManager:
         async with self._lock:
             dl_map = self.get_map(movie_id)
             if dl_map and dl_map.has_range(0, file_size - 1):
-                self._ensure_upload(movie_id, sparse_path, file_name, redis)
                 return True
             need_hydrate = self.get_map(movie_id) is None or self.get_file(movie_id) is None
 
@@ -930,7 +860,6 @@ class DownloadManager:
                 self._maps[movie_id] = dl_map
             if self.get_file(movie_id) is None:
                 self._files[movie_id] = SparseFile(sparse_path)
-            self._ensure_upload(movie_id, sparse_path, file_name, redis)
 
         return True
 
