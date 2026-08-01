@@ -569,7 +569,9 @@ class DownloadTask:
         """Fired once the file is live on the HF bucket."""
         if self._on_uploaded:
             try:
-                await self._on_uploaded(movie_id, url)
+                res = self._on_uploaded(movie_id, url)
+                if asyncio.iscoroutine(res):
+                    await res
             except Exception as e:
                 print(f"[dl:{self.movie_id}] on_uploaded hook failed: {e}")
 
