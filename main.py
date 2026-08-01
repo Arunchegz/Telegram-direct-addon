@@ -1695,9 +1695,16 @@ async def proxy(movie_id: str, request: Request):
     if hf_uploader.enabled:
         hf_url = await hf_uploader.get_uploaded_url(movie_id, redis_client)
         if hf_url and (not _cached or HF_REDIRECT_DONE):
-            await metrics.record_stream_path("hf")
-            await metrics.record_cache_hit(file_size)
-            return RedirectResponse(hf_url, status_code=302, headers={"X-Source": "hf"})
+            # Only trust URLs backed by a real upload (R_HF_DONE flag). A URL
+            # without it points at the mount's all-zero snapshot (see
+            # hf_bucket.py) — serve local instead; the flag gets set once the
+            # background upload finishes, after which requests redirect.
+            if await redis_client.get(R_HF_DONE.format(movie_id)):
+                await metrics.record_stream_path("hf")
+                await metrics.record_cache_hit(file_size)
+                return RedirectResponse(hf_url, status_code=302, headers={"X-Source": "hf"})
+            print(f"[hf] {movie_id}: registered but not uploaded (zero blob?) — serving local, re-upload pending")
+            hf_url = None
 
     if not _cached:
         _schedule(_ensure_download(movie_id, file_size, movie["message_id"], filename))
