@@ -36,7 +36,8 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated
 from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
-from pyrogram.raw.types import UpdateDeleteChannelMessages
+from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji
+from pyrogram.raw.functions.messages import SendReaction
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from starlette.status import HTTP_401_UNAUTHORIZED
 
@@ -229,6 +230,8 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         _invalidate_movies_cache()
+                        # React ⏳ on the channel post to signal prefetch queued/pending
+                        _schedule(_send_channel_reaction(message.id, "⏳"))
                         # Catalog-only — no auto-prefetch (matches sync handler policy).
                         # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
@@ -420,6 +423,31 @@ def _resolve_chat_id(raw: str) -> int | str:
     except ValueError:
         pass
     return raw
+
+
+async def _send_channel_reaction(message_id: int, emoji: str) -> None:
+    """Send/replace a reaction on a channel message using the user MTProto client.
+
+    Uses the first available pooled user client (not the bot) because bots
+    cannot send reactions on channel posts they don't own.
+    Falls back silently on any error so reactions never break the main flow.
+    """
+    if not source_chat_id or not message_id:
+        return
+    try:
+        tg = get_tg()
+        await tg.invoke(
+            SendReaction(
+                peer=await tg.resolve_peer(source_chat_id),
+                msg_id=message_id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            )
+        )
+        print(f"[reaction] set {emoji} on msg {message_id}")
+    except FloodWait as fw:
+        print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
+    except Exception as e:
+        print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
 
 
 async def _notify_send(text: str) -> int | None:
@@ -964,6 +992,8 @@ async def _prefetch_worker(worker_id: int = 0):
                 stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
                 if done_val == b"1":
                     await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
+                    # Replace ⏳ with ⚡ on the channel post to signal download complete
+                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 elif stopped == b"1":
                     print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
@@ -981,6 +1011,8 @@ async def _prefetch_worker(worker_id: int = 0):
                         await _notify_edit(msg_id, ready_text)
                     else:
                         await _notify_send(ready_text)
+                    # Already cached — fire ⚡ reaction (covers restart-recovery path)
+                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
