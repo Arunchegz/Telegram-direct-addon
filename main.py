@@ -312,8 +312,8 @@ async def _fetch_msg(msg_id: int, client: Client = None):
     try:
         return await c.get_messages(CHANNEL_USERNAME, msg_id)
     except AuthKeyDuplicated as ae:
-        print(f"[_fetch_msg] AuthKeyDuplicated on client. Marking client broken: {ae}")
-        client_pool.mark_broken_by_client(c)
+        print(f"[_fetch_msg] AuthKeyDuplicated on client. Suspending client: {ae}")
+        client_pool.suspend_auth(c)
         alt_c = get_tg()
         if alt_c != c:
             return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
@@ -1137,8 +1137,8 @@ async def _sync_channel(force: bool = False) -> int:
                         max_id_seen = max(max_id_seen, msg.id)
                     except Exception: continue
             except AuthKeyDuplicated as ae:
-                print(f"[sync] AuthKeyDuplicated on client. Marking client broken: {ae}")
-                client_pool.mark_broken_by_client(active_tg)
+                print(f"[sync] AuthKeyDuplicated on client. Suspending client: {ae}")
+                client_pool.suspend_auth(active_tg)
                 raise ae
 
             new_ids = found_ids - existing_ids
@@ -1925,8 +1925,8 @@ async def delete_media(movie_id: str, delete_tg: bool = False):
         try:
             await active_tg.delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
         except AuthKeyDuplicated as ae:
-            print(f"[delete_media] AuthKeyDuplicated on client. Marking client broken: {ae}")
-            client_pool.mark_broken_by_client(active_tg)
+            print(f"[delete_media] AuthKeyDuplicated on client. Suspending client: {ae}")
+            client_pool.suspend_auth(active_tg)
             await get_tg().delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
         except Exception as e:
             print(f"[delete_media] failed to delete from Telegram: {e}")

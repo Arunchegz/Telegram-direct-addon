@@ -246,6 +246,51 @@ class ClientPool:
                 self.mark_broken(i)
                 break
 
+    def suspend_auth(self, client: Client, cooldown_s: int = 90):
+        """AuthKeyDuplicated mid-operation = another holder (usually the
+        previous container during a redeploy) still has the session — a
+        transient condition. Suspend the client briefly and reconnect later
+        instead of permanently breaking it; the duplicate disappears once the
+        other holder is gone, and this client is the only non-bot session."""
+        idx = next((i for i, c in enumerate(self.clients) if c == client), None)
+        if idx is None:
+            return
+        self._broken[idx] = True
+        self._cooldown_until[idx] = time.time() + cooldown_s
+        print(f"[clients] client {idx} suspended {cooldown_s}s on AuthKeyDuplicated (transient) — will auto-recover")
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._recover_auth(idx, cooldown_s))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except RuntimeError:
+            pass
+
+    async def _recover_auth(self, idx: int, cooldown_s: int):
+        await asyncio.sleep(cooldown_s)
+        c = self.clients[idx]
+        try:
+            if c.is_connected:
+                await c.stop()
+        except Exception:
+            pass
+        try:
+            await c.start()
+            self._broken[idx] = False
+            self._cooldown_until.pop(idx, None)
+            print(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension")
+        except AuthKeyDuplicated:
+            print(f"[clients] client {idx} still suspended — session still in use elsewhere, retrying later")
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self._recover_auth(idx, cooldown_s))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            except RuntimeError:
+                pass
+        except Exception as e:
+            print(f"[clients] client {idx} reconnect failed: {e}")
+
     async def acquire_download_slot(self) -> Tuple[int, Client]:
         """Pick the client with the fewest active background DownloadTasks
         pinned to it (not cooling down), instead of blind round-robin.
