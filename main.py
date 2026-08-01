@@ -273,10 +273,10 @@ async def lifespan(app: FastAPI):
     if hf_uploader.enabled:
         download_manager.uploader = hf_uploader
         download_manager.on_uploaded = _on_hf_uploaded
-        print(f"[hf] HF bucket streaming enabled → repo: {os.getenv('HF_REPO_ID', '')} "
+        print(f"[hf] HF bucket streaming enabled → bucket: {os.getenv('HF_BUCKET_ID', '')} "
               f"(redirect completed streams: {HF_REDIRECT_DONE})")
     else:
-        print("[hf] HF bucket disabled — set HF_TOKEN + HF_REPO_ID to enable persistent streaming")
+        print("[hf] HF bucket disabled — set HF_BUCKET_ID to enable persistent streaming")
     client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
