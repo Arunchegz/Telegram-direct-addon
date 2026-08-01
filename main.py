@@ -315,7 +315,7 @@ async def _fetch_msg(msg_id: int, client: Client = None):
         print(f"[_fetch_msg] AuthKeyDuplicated on client. Suspending client: {ae}")
         client_pool.suspend_auth(c)
         alt_c = get_tg()
-        if alt_c != c:
+        if alt_c != c and alt_c is not None and not client_pool.is_bot(alt_c):
             return await alt_c.get_messages(CHANNEL_USERNAME, msg_id)
         raise ae
 
@@ -373,7 +373,8 @@ async def _sync_loop():
         except AuthKeyDuplicated:
             print("[sync_loop] AuthKeyDuplicated, retrying instantly with healthy client")
             try:
-                await _sync_channel(force=False)
+                if get_tg() is not None and not client_pool.is_bot(get_tg()):
+                    await _sync_channel(force=False)
             except Exception as e:
                 print(f"[sync_loop] retry failed: {e}")
         except Exception as e:
@@ -1109,6 +1110,9 @@ async def _sync_channel(force: bool = False) -> int:
             found_ids = set(existing_ids) if not do_full else set()
             max_id_seen = min_id
             active_tg = get_tg()
+            if active_tg is None or client_pool.is_bot(active_tg):
+                print("[sync] no user client available (all suspended/broken) — skipping sync pass")
+                return 0
             try:
                 # Pyrogram 2.x get_chat_history has no min_id filter — it
                 # walks newest -> oldest via offset_id. For an incremental

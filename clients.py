@@ -222,6 +222,12 @@ class ClientPool:
             # Lock released — sleep without blocking other callers
             await asyncio.sleep(wait)
 
+    def is_bot(self, client: Client) -> bool:
+        for i, c in enumerate(self.clients):
+            if c == client:
+                return self._is_bot.get(i, False)
+        return False
+
     def primary(self) -> Client:
         """Client used for cheap metadata calls (get_messages, get_chat_history,
         sync). Skips broken AND bot sessions — bots can't use get_chat_history
