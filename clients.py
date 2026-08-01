@@ -121,6 +121,25 @@ class ClientPool:
                 self.clients.append(c)
                 self.mark_broken(i)
                 self.mark_cooldown(i, fw.value)
+            except AuthKeyDuplicated as ae:
+                print(f"[clients] client {i} AuthKeyDuplicated — suspending, will auto-retry in background")
+                c = Client(
+                    f"streamer_{i}", api_id=api_id, api_hash=api_hash,
+                    bot_token=sess if ":" in sess else None,
+                    session_string=None if ":" in sess else sess,
+                    no_updates=no_updates, workers=1, in_memory=True,
+                    parse_mode=ParseMode.DISABLED,
+                )
+                self.clients.append(c)
+                self._broken[i] = True
+                self._cooldown_until[i] = time.time() + 60
+                try:
+                    loop = asyncio.get_running_loop()
+                    task = loop.create_task(self._recover_auth(i, 90))
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
+                except RuntimeError:
+                    pass
             except Exception as e:
                 print(f"[clients] client {i} failed to start due to error: {e}")
                 c = Client(
