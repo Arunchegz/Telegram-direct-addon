@@ -136,7 +136,6 @@ class HfUploader:
 
     def _upload_sync(self, movie_id: str, local_path: Path, file_name: str):
         from huggingface_hub import HfApi
-        from huggingface_hub.errors import UploadSkippedError
         if self._api is None:
             self._api = HfApi(token=HF_TOKEN)
         path_in_repo = f"{movie_id}/{sanitize_filename(file_name)}"
@@ -147,8 +146,15 @@ class HfUploader:
                 repo_id=HF_REPO_ID,
                 repo_type="dataset",
             )
-        except UploadSkippedError:
-            pass  # identical file already in repo — treat as success
+        except Exception as e:
+            # "File already exists" is raised under several names depending on the
+            # huggingface_hub version (UploadSkippedError / EntryAlreadyExistsError…).
+            # Treat it as success — the HEAD verify below confirms availability.
+            name = type(e).__name__.lower()
+            msg = str(e).lower()
+            if "skip" in name or "already" in msg or "exists" in name:
+                return
+            raise
 
     async def _verify(self, url: str) -> bool:
         """HEAD the CDN resolve URL to confirm the file is really public."""
