@@ -30,6 +30,7 @@ class ClientPool:
         self._cooldown_until: Dict[int, float] = {}
         self._download_load: Dict[int, int] = {}   # idx -> # active DownloadTasks pinned to it
         self._broken: Dict[int, bool] = {}         # idx -> True if client connection is broken
+        self._is_bot: Dict[int, bool] = {}         # idx -> True if session is a bot token
         self._lock = asyncio.Lock()
         self.on_health_event = None   # optional async fn(text), set by main.py for alerts
         self._last_alert_ts: Dict[str, float] = {}
@@ -89,6 +90,7 @@ class ClientPool:
             )
         for i, sess in enumerate(sessions):
             self._broken[i] = False
+            self._is_bot[i] = ":" in sess
             no_updates = False if i == 0 else True
             try:
                 if ":" in sess:
@@ -200,8 +202,13 @@ class ClientPool:
             await asyncio.sleep(wait)
 
     def primary(self) -> Client:
-        """Client used for cheap metadata calls (get_messages etc) that
-        rarely trip FloodWait — no need to rotate these."""
+        """Client used for cheap metadata calls (get_messages, get_chat_history,
+        sync). Skips broken AND bot sessions — bots can't use get_chat_history
+        (BOT_METHOD_INVALID) or fetch channel history."""
+        for i in range(len(self.clients)):
+            if not self._broken.get(i, False) and not self._is_bot.get(i, False):
+                return self.clients[i]
+        # Fall back to the first non-broken client even if it's a bot
         for i in range(len(self.clients)):
             if not self._broken.get(i, False):
                 return self.clients[i]
