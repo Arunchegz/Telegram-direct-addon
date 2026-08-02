@@ -230,8 +230,8 @@ async def lifespan(app: FastAPI):
                             "synced_at": int(time.time()),
                         })
                         _invalidate_movies_cache()
-                        # React ⏳ on the channel post to signal prefetch queued/pending
-                        _schedule(_send_channel_reaction(message.id, "⏳"))
+                        # React 👨‍💻 on the channel post to signal prefetch queued/pending
+                        _schedule(_send_channel_reaction(message.id, "👨‍💻"))
                         # Catalog-only — no auto-prefetch (matches sync handler policy).
                         # Download starts on demand (Stremio stream request or dashboard).
             # Sync in background to reconcile index and clean up deletions
@@ -427,7 +427,7 @@ def _resolve_chat_id(raw: str) -> int | str:
     return raw
 
 
-REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the primary emoji (e.g. ⏳) is not in the channel's allowed reactions
+REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the primary emoji is not in the channel's allowed reactions
 
 
 async def _send_channel_reaction(message_id: int, emoji: str) -> None:
@@ -552,8 +552,8 @@ async def _rescan_missing_files(movies: dict) -> int:
 async def _reconcile_reactions() -> None:
     """On startup: for every known movie
       - if file is fully cached locally  -> ensure ⚡ reaction
-      - if we have ⚡ but file is NOT cached -> clear the reaction (or set ⏳ if queued/downloading)
-      - if file is cached but we have ⏳   -> upgrade to ⚡
+      - if we have ⚡ but file is NOT cached -> clear the reaction (or set 👨‍💻 if queued/downloading)
+      - if file is cached but we have 👨‍💻   -> upgrade to ⚡
     Rate-limited: 0.5s between each API call to avoid FloodWait.
     """
     await asyncio.sleep(15)  # wait for pool + first sync to settle
@@ -585,13 +585,13 @@ async def _reconcile_reactions() -> None:
                 if current_reaction == "⚡":
                     # File gone (evicted/deleted/disk-wiped) but reaction still
                     # shows ⚡ -- wrong. If queued or actively downloading,
-                    # downgrade to ⏳ instead of clearing entirely.
+                    # downgrade to 👨‍💻 instead of clearing entirely.
                     q = prefetch_queue
                     queued = any(q._queue[i] == mid for i in range(q.qsize()))
                     dl_task = download_manager.get(mid)
                     downloading = bool(dl_task and dl_task._task and not dl_task._task.done())
                     if queued or downloading:
-                        await _send_channel_reaction(msg_id, "⏳")
+                        await _send_channel_reaction(msg_id, "👨‍💻")
                     else:
                         await _clear_channel_reaction(msg_id)
                     await asyncio.sleep(0.5)
@@ -1148,7 +1148,7 @@ async def _prefetch_worker(worker_id: int = 0):
                 stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
                 if done_val == b"1":
                     await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
-                    # Replace ⏳ with ⚡ on the channel post to signal download complete
+                    # Replace 👨💻 with ⚡ on the channel post to signal download complete
                     _schedule(_send_channel_reaction(m["message_id"], "⚡"))
                 elif stopped == b"1":
                     print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
@@ -1227,7 +1227,7 @@ async def _sync_channel(force: bool = False) -> int:
 
             count = 0
             found_ids = set(existing_ids) if not do_full else set()
-            found_msg_ids: dict = {}  # mid -> message_id, for ⏳ reaction on new movies
+            found_msg_ids: dict = {}  # mid -> message_id, for 👨‍💻 reaction on new movies
             max_id_seen = min_id
             active_tg = get_tg()
             if active_tg is None or client_pool.is_bot(active_tg):
@@ -1273,9 +1273,9 @@ async def _sync_channel(force: bool = False) -> int:
                 if stopped != b"1":
                     try:
                         prefetch_queue.put_nowait(mid)
-                        # React ⏳ on the channel post to signal prefetch queued
+                        # React 👨‍💻 on the channel post to signal prefetch queued
                         if mid in found_msg_ids:
-                            _schedule(_send_channel_reaction(found_msg_ids[mid], "⏳"))
+                            _schedule(_send_channel_reaction(found_msg_ids[mid], "👨‍💻"))
                     except asyncio.QueueFull:
                         print(f"Sync: prefetch_queue full, skipping {mid}")
 
