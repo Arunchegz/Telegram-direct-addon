@@ -272,6 +272,7 @@ async def lifespan(app: FastAPI):
         _schedule(_prefetch_worker(worker_id=i))
     _schedule(_bot_channel_listener())
     _schedule(_sweep_loop())
+    _schedule(_reconcile_reactions())
 
 
     yield
@@ -449,6 +450,95 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
         print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
     except Exception as e:
         print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
+
+
+async def _get_our_reaction(message_id: int) -> str | None:
+    """Return the emoji we have reacted with on a channel message, or None."""
+    if not source_chat_id or not message_id:
+        return None
+    try:
+        from pyrogram.raw.functions.messages import GetMessagesReactions
+        from pyrogram.raw.types import ReactionEmoji as _RE, UpdateMessageReactions
+        tg = get_tg()
+        peer = await tg.resolve_peer(source_chat_id)
+        updates = await tg.invoke(GetMessagesReactions(peer=peer, id=[message_id]))
+        for upd in getattr(updates, "updates", []):
+            if isinstance(upd, UpdateMessageReactions) and upd.msg_id == message_id:
+                for rc in upd.reactions.results:
+                    if rc.chosen_order is not None and isinstance(rc.reaction, _RE):
+                        return rc.reaction.emoticon
+    except Exception as e:
+        print(f"[reaction] get_our_reaction failed for msg {message_id}: {type(e).__name__}: {e!r}")
+    return None
+
+
+async def _clear_channel_reaction(message_id: int) -> None:
+    """Remove our reaction from a channel message (send empty reaction list)."""
+    if not source_chat_id or not message_id:
+        return
+    try:
+        tg = get_tg()
+        await tg.invoke(
+            SendReaction(
+                peer=await tg.resolve_peer(source_chat_id),
+                msg_id=message_id,
+                reaction=[],
+            )
+        )
+        print(f"[reaction] cleared reaction on msg {message_id}")
+    except FloodWait as fw:
+        print(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
+    except Exception as e:
+        print(f"[reaction] clear failed for msg {message_id}: {type(e).__name__}: {e!r}")
+
+
+async def _reconcile_reactions() -> None:
+    """On startup: for every known movie
+      - if file is fully cached locally  -> ensure ⚡ reaction
+      - if we have ⚡ but file is NOT cached -> clear the reaction (or set ⏳ if queued)
+      - if file is cached but we have ⏳   -> upgrade to ⚡
+    Rate-limited: 0.5s between each API call to avoid FloodWait.
+    """
+    await asyncio.sleep(15)  # wait for pool + first sync to settle
+    print("[reaction] starting startup reconciliation scan...")
+    try:
+        movies = await st.load_movies(redis_client)
+    except Exception as e:
+        print(f"[reaction] reconcile aborted, could not load movies: {e}")
+        return
+
+    checked = fixed = cleared = 0
+    for mid, m in movies.items():
+        msg_id = m.get("message_id")
+        if not msg_id:
+            continue
+        try:
+            cached = await _is_cached(mid, m.get("file_name"))
+            current_reaction = await _get_our_reaction(msg_id)
+            await asyncio.sleep(0.5)  # rate-limit
+
+            if cached:
+                if current_reaction != "⚡":
+                    await _send_channel_reaction(msg_id, "⚡")
+                    await asyncio.sleep(0.5)
+                    fixed += 1
+            else:
+                if current_reaction == "⚡":
+                    # File gone (evicted/deleted) but reaction still shows ⚡ -- wrong
+                    q = prefetch_queue
+                    queued = any(q._queue[i] == mid for i in range(q.qsize()))
+                    if queued:
+                        await _send_channel_reaction(msg_id, "⏳")
+                    else:
+                        await _clear_channel_reaction(msg_id)
+                    await asyncio.sleep(0.5)
+                    cleared += 1
+            checked += 1
+        except Exception as e:
+            print(f"[reaction] reconcile error for {mid}: {type(e).__name__}: {e!r}")
+            continue
+
+    print(f"[reaction] reconcile done: {checked} checked, {fixed} set ⚡, {cleared} corrected")
 
 
 async def _notify_send(text: str) -> int | None:
