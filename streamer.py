@@ -347,13 +347,11 @@ class ByteStreamer:
                     await s.stop()
                     raise AuthBytesInvalid
             else:
-                s = Session(
-                    c, dc,
-                    await c.storage.auth_key(),
-                    await c.storage.test_mode(),
-                    is_media=True,
-                )
-                await s.start()
+                # Same DC as client's home — reuse the client's own session
+                # rather than opening a new Session with the same auth_key.
+                # Opening a second Session with the same key causes
+                # AuthKeyDuplicated on Telegram's side.
+                s = c.session
 
             c.media_sessions[dc] = s
             return s

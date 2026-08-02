@@ -194,6 +194,11 @@ class ClientPool:
     async def stop(self):
         for c in self.clients:
             for s in list(getattr(c, "media_sessions", {}).values()):
+                # Skip sessions that are the client's own session (same-DC alias
+                # set in streamer._session); stopping them here would kill the
+                # main connection before c.stop() and cause errors.
+                if s is getattr(c, "session", None):
+                    continue
                 try:
                     await s.stop()
                 except Exception:
