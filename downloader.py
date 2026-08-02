@@ -251,6 +251,7 @@ class DownloadTask:
         message_id: int,
         dl_semaphore: asyncio.Semaphore,
         alert_fn=None,   # optional async fn(text) — fired after repeated consecutive failures
+        complete_fn=None,  # optional async fn(movie_id, message_id) — fired when download fully completes
         file_name: str = None,  # original filename — used for the local cache path
     ):
         self.movie_id    = movie_id
@@ -264,6 +265,7 @@ class DownloadTask:
         self.file_name   = file_name
         self._semaphore  = dl_semaphore
         self._alert_fn   = alert_fn
+        self._complete_fn = complete_fn
 
         self._task: Optional[asyncio.Task] = None
         self._hint: int = 0              # play-head hint from proxy
@@ -490,6 +492,11 @@ class DownloadTask:
             print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             completed = True
             await metrics.record_download_complete()
+            if self._complete_fn:
+                try:
+                    await self._complete_fn(self.movie_id, self.message_id)
+                except Exception as ce:
+                    print(f"[dl:{self.movie_id}] complete hook failed: {ce}")
         finally:
             self._finished_at = time.time()
             # Release the per-client load slot acquired at task start
@@ -560,6 +567,7 @@ class DownloadManager:
         self.paused = False    # set via /pause admin command — blocks new prefetch starts
         self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
         self.on_evict = None   # optional fn(movie_id) called on every eviction (sync, for cleanup hooks)
+        self.on_complete = None  # optional async fn(movie_id, message_id) — fired when a download fully completes
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -667,6 +675,7 @@ class DownloadManager:
                 message_id=message_id,
                 dl_semaphore=self._dl_semaphore,
                 alert_fn=self._fire_alert,
+                complete_fn=self.on_complete,
                 file_name=file_name,
             )
             dt.start()

@@ -269,6 +269,21 @@ async def lifespan(app: FastAPI):
     download_manager.init_pool_size()
     download_manager.on_alert = _notify_send
     download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)
+
+    async def _on_download_complete(movie_id: str, message_id: int) -> None:
+        """Fired by the downloader whenever a movie finishes caching —
+        covers both prefetch and on-demand (play-triggered) downloads.
+        Ensures the 👨‍💻 'downloading' reaction is replaced with ⚡."""
+        try:
+            movies = await _get_movies()
+            m = movies.get(movie_id)
+            msg_id = (m or {}).get("message_id") or message_id
+            if msg_id:
+                _schedule(_send_channel_reaction(msg_id, "⚡"))
+        except Exception as e:
+            print(f"[reaction] on_complete hook failed for {movie_id}: {type(e).__name__}: {e!r}")
+
+    download_manager.on_complete = _on_download_complete
     client_pool.on_health_event = _notify_send
     print(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
