@@ -1074,6 +1074,7 @@ async def _sync_channel(force: bool = False) -> int:
 
             count = 0
             found_ids = set(existing_ids) if not do_full else set()
+            found_msg_ids: dict = {}  # mid -> message_id, for ⏳ reaction on new movies
             max_id_seen = min_id
             active_tg = get_tg()
             if active_tg is None or client_pool.is_bot(active_tg):
@@ -1102,6 +1103,7 @@ async def _sync_channel(force: bool = False) -> int:
                             "synced_at": int(time.time()),
                         })
                         found_ids.add(mid)
+                        found_msg_ids[mid] = msg.id
                         count += 1
                         _invalidate_movies_cache()
                         max_id_seen = max(max_id_seen, msg.id)
@@ -1118,6 +1120,9 @@ async def _sync_channel(force: bool = False) -> int:
                 if stopped != b"1":
                     try:
                         prefetch_queue.put_nowait(mid)
+                        # React ⏳ on the channel post to signal prefetch queued
+                        if mid in found_msg_ids:
+                            _schedule(_send_channel_reaction(found_msg_ids[mid], "⏳"))
                     except asyncio.QueueFull:
                         print(f"Sync: prefetch_queue full, skipping {mid}")
 
