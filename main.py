@@ -1454,7 +1454,7 @@ async def stream(type: str, id: str):
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid, m.get("file_name"))
             label = "TGStream ⚡" if cached else "TGStream"
-            streams.append({"name":label,"title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{mid}"})
+            streams.append({"name":label,"title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{mid}","behaviorHints":{"notWebReady":False}})
         return JSONResponse({"streams": streams})
 
     clean = id[len(prefix):] if id.startswith(prefix) else id
@@ -1491,7 +1491,8 @@ async def stream(type: str, id: str):
                 streams.append({
                     "name": label,
                     "title": f"{fn}\n{q}{' | '+src if src else ''} | {sz}",
-                    "url": f"{BASE_URL}/proxy/{mid}"
+                    "url": f"{BASE_URL}/proxy/{mid}",
+                    "behaviorHints": {"notWebReady": False}
                 })
         return JSONResponse({"streams": streams})
 
@@ -1515,7 +1516,8 @@ async def stream(type: str, id: str):
     cached = await _is_cached(clean, movie.get("file_name"))
     label = "TGStream ⚡" if cached else "TGStream"
     return JSONResponse({"streams": [{"name":label,
-        "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}"}]})
+        "title":f"{fn}\n{q}{' | '+src if src else ''} | {sz}","url":f"{BASE_URL}/proxy/{clean}",
+        "behaviorHints":{"notWebReady":False}}]})
 
 
 
