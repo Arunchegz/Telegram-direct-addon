@@ -492,10 +492,53 @@ async def _clear_channel_reaction(message_id: int) -> None:
         print(f"[reaction] clear failed for msg {message_id}: {type(e).__name__}: {e!r}")
 
 
+async def _rescan_missing_files(movies: dict) -> int:
+    """HF Spaces wipe the local disk on restart, but Redis state persists.
+    Find movies Redis still marks as fully downloaded whose local sparse
+    file is gone, reset their download state and re-enqueue a prefetch so
+    they get re-cached automatically (self-heal)."""
+    requeued = 0
+    for mid, m in movies.items():
+        try:
+            done = await redis_client.get(f"tgstream:dl:done:{mid}")
+            if done != b"1":
+                continue
+            if find_cache_path(mid, m.get("file_name")).exists():
+                continue
+            stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+            await redis_client.delete(
+                f"tgstream:dl:map:{mid}",
+                f"tgstream:dl:done:{mid}",
+                f"tgstream:dl:path:{mid}",
+                f"tgstream:dl:ts:{mid}",
+            )
+            if stopped == b"1":
+                print(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                      f"state reset, user-stopped, not requeueing")
+                continue
+            try:
+                prefetch_queue.put_nowait(mid)
+            except asyncio.QueueFull:
+                print(f"[rescan] prefetch_queue full, dropping {mid}")
+            print(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                  f"reset, requeued prefetch")
+            requeued += 1
+        except Exception as e:
+            print(f"[rescan] error for {mid}: {type(e).__name__}: {e!r}")
+            continue
+    if requeued:
+        print(f"[rescan] done: {requeued} file(s) missing, re-enqueued for prefetch")
+        _schedule(_notify_send(f"♻️ Local cache was wiped by a restart — "
+                               f"re-prefetching {requeued} movie(s)"))
+    else:
+        print("[rescan] done: no missing files")
+    return requeued
+
+
 async def _reconcile_reactions() -> None:
     """On startup: for every known movie
       - if file is fully cached locally  -> ensure ⚡ reaction
-      - if we have ⚡ but file is NOT cached -> clear the reaction (or set ⏳ if queued)
+      - if we have ⚡ but file is NOT cached -> clear the reaction (or set ⏳ if queued/downloading)
       - if file is cached but we have ⏳   -> upgrade to ⚡
     Rate-limited: 0.5s between each API call to avoid FloodWait.
     """
@@ -506,6 +549,8 @@ async def _reconcile_reactions() -> None:
     except Exception as e:
         print(f"[reaction] reconcile aborted, could not load movies: {e}")
         return
+
+    await _rescan_missing_files(movies)
 
     checked = fixed = cleared = 0
     for mid, m in movies.items():
@@ -524,10 +569,14 @@ async def _reconcile_reactions() -> None:
                     fixed += 1
             else:
                 if current_reaction == "⚡":
-                    # File gone (evicted/deleted) but reaction still shows ⚡ -- wrong
+                    # File gone (evicted/deleted/disk-wiped) but reaction still
+                    # shows ⚡ -- wrong. If queued or actively downloading,
+                    # downgrade to ⏳ instead of clearing entirely.
                     q = prefetch_queue
                     queued = any(q._queue[i] == mid for i in range(q.qsize()))
-                    if queued:
+                    dl_task = download_manager.get(mid)
+                    downloading = bool(dl_task and dl_task._task and not dl_task._task.done())
+                    if queued or downloading:
                         await _send_channel_reaction(msg_id, "⏳")
                     else:
                         await _clear_channel_reaction(msg_id)
@@ -1233,6 +1282,11 @@ async def _sync_channel(force: bool = False) -> int:
 
             if new_ids or removed_ids:
                 await _notify_send(f"🔄 Synced: {len(new_ids)} new, {len(removed_ids)} removed")
+
+            if do_full:
+                # Self-heal: re-prefetch anything Redis marks done whose local
+                # file vanished (e.g. HF Space disk wiped while this was down).
+                await _rescan_missing_files(existing_movies)
 
             if max_id_seen > min_id:
                 await redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
