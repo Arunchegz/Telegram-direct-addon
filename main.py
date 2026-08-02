@@ -34,7 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait, AuthKeyDuplicated
+from pyrogram.errors import FloodWait, AuthKeyDuplicated, ReactionInvalid
 from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
 from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji
 from pyrogram.raw.functions.messages import SendReaction
@@ -427,6 +427,9 @@ def _resolve_chat_id(raw: str) -> int | str:
     return raw
 
 
+REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the primary emoji (e.g. ⏳) is not in the channel's allowed reactions
+
+
 async def _send_channel_reaction(message_id: int, emoji: str) -> None:
     """Send/replace a reaction on a channel message using the user MTProto client.
 
@@ -436,20 +439,31 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
     """
     if not source_chat_id or not message_id:
         return
-    try:
-        tg = get_tg()
-        await tg.invoke(
-            SendReaction(
-                peer=await tg.resolve_peer(source_chat_id),
-                msg_id=message_id,
-                reaction=[ReactionEmoji(emoticon=emoji)],
+    for attempt, candidate in enumerate((emoji, REACTION_FALLBACK)):
+        try:
+            tg = get_tg()
+            await tg.invoke(
+                SendReaction(
+                    peer=await tg.resolve_peer(source_chat_id),
+                    msg_id=message_id,
+                    reaction=[ReactionEmoji(emoticon=candidate)],
+                )
             )
-        )
-        print(f"[reaction] set {emoji} on msg {message_id}")
-    except FloodWait as fw:
-        print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
-    except Exception as e:
-        print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
+            print(f"[reaction] set {candidate} on msg {message_id}")
+            return
+        except FloodWait as fw:
+            print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
+            return
+        except ReactionInvalid:
+            if attempt == 0 and candidate != REACTION_FALLBACK:
+                print(f"[reaction] {candidate} rejected on msg {message_id} "
+                      f"(channel reaction restrictions) — falling back to {REACTION_FALLBACK}")
+                continue
+            print(f"[reaction] failed for msg {message_id}: {candidate} invalid on this channel")
+            return
+        except Exception as e:
+            print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
+            return
 
 
 async def _get_our_reaction(message_id: int) -> str | None:
