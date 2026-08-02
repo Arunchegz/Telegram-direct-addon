@@ -232,8 +232,13 @@ async def lifespan(app: FastAPI):
                         _invalidate_movies_cache()
                         # React 👨‍💻 on the channel post to signal prefetch queued/pending
                         _schedule(_send_channel_reaction(message.id, "👨‍💻"))
-                        # Catalog-only — no auto-prefetch (matches sync handler policy).
-                        # Download starts on demand (Stremio stream request or dashboard).
+                        # Auto-prefetch new posts immediately (matches sync handler policy)
+                        stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+                        if stopped != b"1":
+                            try:
+                                prefetch_queue.put_nowait(mid)
+                            except asyncio.QueueFull:
+                                print(f"[listener] prefetch_queue full, skipping {mid}")
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=False))
         except Exception as se:
