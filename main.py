@@ -28,7 +28,7 @@ from typing import AsyncGenerator, Optional
 
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -89,16 +89,26 @@ SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 
 DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
 
+# Bot / notification config (defined here so lifespan and all helpers can reference without forward refs)
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
+NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bot must be admin
+TG_API_BASE    = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
+_TG_API        = f"{TG_API_BASE}/bot{BOT_TOKEN}"
+DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower() == "true"
+ADMIN_USER_ID  = os.getenv("ADMIN_USER_ID", "").strip()  # Telegram user id allowed to issue /commands via DM
+_START_TIME    = time.time()
+
 source_chat_id: int | None = None
 
 # ── In-process movie catalog cache ───────────────────────────────────────────
 # load_movies() does HGETALL on every call. Proxy, stream, catalog, and meta
 # endpoints all call it — that's one Redis round-trip per chunk request.
-# A 2-second TTL snapshot eliminates the redundant round-trips while keeping
-# catalog updates (sync, instant post, delete) visible within 2 seconds.
+# A 30-second TTL snapshot eliminates the redundant round-trips while keeping
+# catalog updates (sync, instant post, delete) visible within 30 seconds.
 _movies_cache: dict = {}
 _movies_cache_ts: float = 0.0
 _MOVIES_CACHE_TTL = 30.0  # seconds
+_movies_cache_lock = asyncio.Lock()
 
 
 async def _get_movies() -> dict:
@@ -106,8 +116,12 @@ async def _get_movies() -> dict:
     now = time.time()
     if now - _movies_cache_ts < _MOVIES_CACHE_TTL:
         return _movies_cache
-    _movies_cache = await st.load_movies(redis_client)
-    _movies_cache_ts = now
+    async with _movies_cache_lock:
+        # Re-check inside lock — another coroutine may have refreshed while we waited
+        if time.time() - _movies_cache_ts < _MOVIES_CACHE_TTL:
+            return _movies_cache
+        _movies_cache = await st.load_movies(redis_client)
+        _movies_cache_ts = time.time()
     return _movies_cache
 
 
@@ -390,15 +404,6 @@ async def _sync_loop():
         except Exception as e:
             print(f"[sync_loop] {e}")
         await asyncio.sleep(SYNC_POLL_S)
-
-
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
-NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "").strip()   # channel/chat id, bot must be admin
-TG_API_BASE    = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
-_TG_API        = f"{TG_API_BASE}/bot{BOT_TOKEN}"
-DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower() == "true"
-ADMIN_USER_ID  = os.getenv("ADMIN_USER_ID", "").strip()  # Telegram user id allowed to issue /commands via DM
-_START_TIME    = time.time()
 
 
 async def _register_bot_commands():
@@ -826,9 +831,11 @@ async def _render_list_page(page: int = 0):
 
     lines = [f"🎬 Catalog ({total}) — page {page+1}/{pages}", ""]
     keyboard = []
-    for mid, m in chunk:
-        cached = await redis_client.get(f"tgstream:dl:done:{mid}")
-        symbol = "✅" if cached == b"1" else "⬜"
+    # Batch all done-flag lookups in one mget round-trip instead of N GETs
+    done_keys = [f"tgstream:dl:done:{mid}" for mid, _ in chunk]
+    done_vals = await redis_client.mget(*done_keys) if done_keys else []
+    for (mid, m), done_val in zip(chunk, done_vals):
+        symbol = "✅" if done_val == b"1" else "⬜"
         fn = m.get("file_name", mid)
         lines.append(f"{symbol} {fn}")
         keyboard.append([{
@@ -1249,7 +1256,7 @@ async def _sync_channel(force: bool = False) -> int:
         if not acquired:
             return 0
         try:
-            existing_movies = await st.load_movies(redis_client)
+            existing_movies = await _get_movies()
             existing_ids = set(existing_movies.keys())
 
             # Full history walk only on forced syncs (manual /sync, instant
@@ -1535,9 +1542,9 @@ async def meta(type: str, id: str):
             for m in movies.values():
                 fn = m.get("file_name", "")
                 # Parse SE from file for the video object
-                info = st.parse_series(fn)
-                s = info["season"] if info else 1
-                ep = info["episode"] if info else 1
+                s, ep = st.parse_season_episode(fn)
+                s = s if s is not None else 1
+                ep = ep if ep is not None else 1
                 
                 # Calculate score
                 score = st.VideoMatcher.calculate_match_score(fn, title, year, s, ep)
@@ -1600,9 +1607,9 @@ async def meta(type: str, id: str):
         seen_episodes = set()
         for m in matching_files:
             m_fn = m.get("file_name", "")
-            info = st.parse_series(m_fn)
-            s = info["season"] if info else 1
-            ep = info["episode"] if info else 1
+            s, ep = st.parse_season_episode(m_fn)
+            s = s if s is not None else 1
+            ep = ep if ep is not None else 1
             key = (s, ep)
             if key in seen_episodes: continue
             seen_episodes.add(key)
@@ -1674,9 +1681,9 @@ async def stream(type: str, id: str):
         for mid, m in movies.items():
             fn = m.get("file_name", "")
             if st.show_id(fn) != sid: continue
-            info = st.parse_series(fn)
-            s = info["season"] if info else 1
-            ep = info["episode"] if info else 1
+            s, ep = st.parse_season_episode(fn)
+            s = s if s is not None else 1
+            ep = ep if ep is not None else 1
             if s == season and ep == episode:
                 try:
                     fs = m.get("file_size") or 0
@@ -1751,8 +1758,8 @@ async def subtitles(type: str, id: str):
                 pass
             for m in movies.values():
                 if st.show_id(m.get("file_name", "")) == sid:
-                    info = st.parse_series(m.get("file_name", ""))
-                    if info and info["season"] == season and info["episode"] == episode:
+                    s, ep = st.parse_season_episode(m.get("file_name", ""))
+                    if s == season and ep == episode:
                         filename = m.get("file_name", "")
                         break
 
@@ -2022,13 +2029,22 @@ async def proxy(movie_id: str, request: Request):
 
 
 # ── Media Control API Endpoints ───────────────────────────────────────────────
+
+def _check_api_auth(x_api_key: str | None):
+    """Raise 401 if DEBUG_PASSWORD is set and the X-Api-Key header doesn't match.
+    When DEBUG_PASSWORD is unset the endpoints are open (backwards-compatible)."""
+    if DEBUG_PASSWORD and x_api_key != DEBUG_PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.post("/api/media/{movie_id}/download")
-async def start_download_media(movie_id: str):
+async def start_download_media(movie_id: str, x_api_key: str | None = Header(default=None)):
+    _check_api_auth(x_api_key)
     movies = await _get_movies()
     movie = movies.get(movie_id)
     if not movie:
         raise HTTPException(status_code=404, detail="Movie not found in index")
-    
+
     file_size = movie.get("file_size")
     if not file_size:
         try:
@@ -2036,14 +2052,15 @@ async def start_download_media(movie_id: str):
             file_size = (msg.video or msg.document).file_size
         except Exception:
             raise HTTPException(status_code=502, detail="Telegram unavailable")
-            
+
     await redis_client.delete(f"tgstream:dl:stopped:{movie_id}")
     _schedule(_ensure_download(movie_id, file_size, movie["message_id"], movie.get("file_name")))
     return {"status": "ok"}
 
 
 @app.post("/api/media/{movie_id}/pause")
-async def pause_download_media(movie_id: str):
+async def pause_download_media(movie_id: str, x_api_key: str | None = Header(default=None)):
+    _check_api_auth(x_api_key)
     task = download_manager.get(movie_id)
     if task:
         await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
@@ -2053,7 +2070,8 @@ async def pause_download_media(movie_id: str):
 
 
 @app.post("/api/media/{movie_id}/evict")
-async def evict_cache_media(movie_id: str):
+async def evict_cache_media(movie_id: str, x_api_key: str | None = Header(default=None)):
+    _check_api_auth(x_api_key)
     await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
     movies = await _get_movies()
     await download_manager.evict(movie_id, redis_client,
@@ -2063,7 +2081,8 @@ async def evict_cache_media(movie_id: str):
 
 
 @app.delete("/api/media/{movie_id}")
-async def delete_media(movie_id: str, delete_tg: bool = False):
+async def delete_media(movie_id: str, delete_tg: bool = False, x_api_key: str | None = Header(default=None)):
+    _check_api_auth(x_api_key)
     movies = await _get_movies()
     movie = movies.get(movie_id)
     if not movie:

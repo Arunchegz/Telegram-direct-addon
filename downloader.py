@@ -480,7 +480,15 @@ class DownloadTask:
                         next_gap = self._find_next_gap(0)
                         if next_gap < self.file_size and next_gap < current_offset:
                             # Only wrap if gap is genuinely behind us — guards against
-                            # corrupted map returning the same offset and looping forever
+                            # corrupted map returning the same offset and looping forever.
+                            # Secondary guard: track seen gap offsets; if we visit the
+                            # same gap twice without progress, bail to prevent infinite spin.
+                            if not hasattr(self, "_seen_gaps"):
+                                self._seen_gaps: set = set()
+                            if next_gap in self._seen_gaps:
+                                print(f"[dl:{self.movie_id}] gap at {next_gap/1024/1024:.1f}MB seen twice without progress — aborting gap-fill to avoid infinite loop")
+                                break
+                            self._seen_gaps.add(next_gap)
                             current_offset = next_gap
                             print(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
 
@@ -756,12 +764,13 @@ class DownloadManager:
             f"🗄 Disk pressure: {total/1024**3:.1f}GB used (limit {MAX_LOCAL_GB:.0f}GB) — evicting LRU entries"
         )
 
-        # Build LRU order from Redis timestamps
-        order = []
-        for mid in list(self._files.keys()):
-            ts = await redis.get(R_DL_TS.format(mid))
-            order.append((float(ts) if ts else 0.0, mid))
-        order.sort()
+        # Build LRU order from Redis timestamps — single mget round-trip
+        mids = list(self._files.keys())
+        ts_vals = await redis.mget(*[R_DL_TS.format(m) for m in mids]) if mids else []
+        order = sorted(
+            (float(ts) if ts else 0.0, mid)
+            for mid, ts in zip(mids, ts_vals)
+        )
 
         for _, mid in order:
             if total <= limit:

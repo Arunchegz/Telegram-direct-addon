@@ -249,6 +249,8 @@ IS_SERIES_RE = re.compile(
 )
 
 def parse_series(filename: str) -> Optional[dict]:
+    """Deprecated: use parse_season_episode() which returns (season, episode) via PTN.
+    Kept for backwards compatibility; no longer called by main.py."""
     # SxxExx / S1E5
     m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
     if m:
@@ -347,14 +349,14 @@ def normalize_title(title: str) -> str:
     nfkd = unicodedata.normalize('NFD', title)
     title = ''.join(c for c in nfkd if unicodedata.category(c) != 'Mn')
     
-    # Convert Roman Numerals II to X to numbers
-    # Simple replacement for common ones
-    roman_map = {
-        'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6',
-        'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10', 'I': '1'
-    }
-    for roman, num in roman_map.items():
-        # Use word boundaries to avoid replacing parts of other words
+    # Convert Roman Numerals I–X to Arabic numbers.
+    # Order: longest tokens first so VIII is matched before VI/I, IX before I, etc.
+    roman_map = [
+        ('VIII', '8'), ('VII', '7'), ('VI', '6'),
+        ('IV', '4'), ('IX', '9'), ('III', '3'), ('II', '2'),
+        ('X', '10'), ('V', '5'), ('I', '1'),
+    ]
+    for roman, num in roman_map:
         title = re.sub(r'\b' + roman + r'\b', num, title, flags=re.IGNORECASE)
         
     return title.lower().strip()

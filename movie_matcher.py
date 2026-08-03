@@ -164,13 +164,7 @@ def best_similarity_match(title, year, metas):
 async def resolve_movie(filename):
     title, year = parse_title_year(filename)
 
-    print("Title :", title)
-    print("Year  :", year)
-
-    # --------------------------------------
-    # Step 1
-    # TMDB
-    # --------------------------------------
+    # Step 1: TMDB (if API key configured)
     if TMDB_API_KEY:
         tmdb = await tmdb_search(title, year)
         if tmdb:
@@ -178,25 +172,15 @@ async def resolve_movie(filename):
             if imdb:
                 meta = await cinemeta_from_imdb(imdb)
                 if meta:
-                    print("Matched via TMDB")
                     return meta
 
-    # --------------------------------------
-    # Step 2
-    # Fallback to Cinemeta
-    # --------------------------------------
+    # Step 2: Fallback to Cinemeta search
     metas = await cinemeta_search(title)
     if not metas:
         return None
 
-    best = best_similarity_match(
-        title,
-        year,
-        metas,
-    )
-
+    best = best_similarity_match(title, year, metas)
     if best:
-        print("Matched via Cinemeta")
         return best
 
     return None
