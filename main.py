@@ -37,7 +37,8 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated, ReactionInvalid
 from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
 from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji
-from pyrogram.raw.functions.messages import SendReaction
+from pyrogram.raw.functions.messages import SendReaction, SetChatAvailableReactions
+from pyrogram.raw.types import ChatReactionsAll
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from starlette.status import HTTP_401_UNAUTHORIZED
 
@@ -292,6 +293,7 @@ async def lifespan(app: FastAPI):
         _schedule(_prefetch_worker(worker_id=i))
     _schedule(_bot_channel_listener())
     _schedule(_sweep_loop())
+    _schedule(_ensure_channel_reactions_enabled())
     _schedule(_reconcile_reactions())
 
 
@@ -448,6 +450,23 @@ def _resolve_chat_id(raw: str) -> int | str:
 
 
 REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the primary emoji is not in the channel's allowed reactions
+
+
+async def _ensure_channel_reactions_enabled() -> None:
+    """Enable all reactions on the source channel so 👨‍💻 and ⚡ always work.
+    Requires the user client to be a channel admin. Fails silently if not."""
+    if not source_chat_id:
+        return
+    try:
+        tg = get_tg()
+        peer = await tg.resolve_peer(source_chat_id)
+        await tg.invoke(SetChatAvailableReactions(
+            peer=peer,
+            available_reactions=ChatReactionsAll(),
+        ))
+        print("[reaction] channel reactions set to ALL ✓")
+    except Exception as e:
+        print(f"[reaction] could not enable all reactions (not admin?): {type(e).__name__}: {e!r}")
 
 
 async def _send_channel_reaction(message_id: int, emoji: str) -> None:
