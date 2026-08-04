@@ -45,7 +45,7 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 import pyrogram.utils
 import state as st
 from clients import pool as client_pool
-from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path
+from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path, R_DL_STOPPED
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
 
@@ -248,7 +248,7 @@ async def lifespan(app: FastAPI):
                         # React 👨‍💻 on the channel post to signal prefetch queued/pending
                         _schedule(_send_channel_reaction(message.id, "👨‍💻"))
                         # Auto-prefetch new posts immediately (matches sync handler policy)
-                        stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+                        stopped = await redis_client.get(R_DL_STOPPED.format(mid))
                         if stopped != b"1":
                             try:
                                 prefetch_queue.put_nowait(mid)
@@ -563,7 +563,7 @@ async def _rescan_missing_files(movies: dict) -> int:
                 continue
             if find_cache_path(mid, m.get("file_name")).exists():
                 continue
-            stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+            stopped = await redis_client.get(R_DL_STOPPED.format(mid))
             await redis_client.delete(
                 f"tgstream:dl:map:{mid}",
                 f"tgstream:dl:done:{mid}",
@@ -631,7 +631,7 @@ async def _reconcile_reactions() -> None:
                     # shows ⚡ -- wrong. If queued or actively downloading,
                     # downgrade to 👨‍💻 instead of clearing entirely.
                     q = prefetch_queue
-                    queued = any(q._queue[i] == mid for i in range(q.qsize()))
+                    queued = mid in list(q._queue)  # snapshot to avoid mutation during iteration
                     dl_task = download_manager.get(mid)
                     downloading = bool(dl_task and dl_task._task and not dl_task._task.done())
                     if queued or downloading:
@@ -1157,13 +1157,18 @@ async def _prefetch_worker(worker_id: int = 0):
             if not m:
                 continue
             fn = m.get("file_name", movie_id)
+            file_size = m.get("file_size") or 0
+            message_id = m.get("message_id")
+            if not file_size or not message_id:
+                print(f"[prefetch:{worker_id}] skipping {movie_id}: missing file_size or message_id in index")
+                continue
             print(f"[prefetch:{worker_id}] starting {movie_id} ({fn})")
 
             # Start download task first so it starts instantly
             task = await download_manager.get_or_create(
                 movie_id=movie_id,
-                file_size=m["file_size"],
-                message_id=m["message_id"],
+                file_size=file_size,
+                message_id=message_id,
                 redis=redis_client,
                 byte_streamer=byte_streamer,
                 fetch_msg_fn=_fetch_msg,
@@ -1180,7 +1185,7 @@ async def _prefetch_worker(worker_id: int = 0):
                     msg_id = await _notify_send(f"⬇️ Prefetching: {fn}\n0/100")
                 
                 reporter = asyncio.create_task(
-                    _progress_reporter(movie_id, fn, m["file_size"], msg_id)
+                    _progress_reporter(movie_id, fn, file_size, msg_id)
                 )
                 try:
                     await task._task  # wait till done/cancelled/evicted before next queued item
@@ -1191,11 +1196,11 @@ async def _prefetch_worker(worker_id: int = 0):
                 # But if the user explicitly paused/evicted it from the
                 # dashboard, respect that instead of instantly restarting.
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
-                stopped = await redis_client.get(f"tgstream:dl:stopped:{movie_id}")
+                stopped = await redis_client.get(R_DL_STOPPED.format(movie_id))
                 if done_val == b"1":
                     await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
                     # Replace 👨💻 with ⚡ on the channel post to signal download complete
-                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
+                    _schedule(_send_channel_reaction(message_id, "⚡"))
                 elif stopped == b"1":
                     print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
@@ -1214,7 +1219,7 @@ async def _prefetch_worker(worker_id: int = 0):
                     else:
                         await _notify_send(ready_text)
                     # Already cached — fire ⚡ reaction (covers restart-recovery path)
-                    _schedule(_send_channel_reaction(m["message_id"], "⚡"))
+                    _schedule(_send_channel_reaction(message_id, "⚡"))
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
@@ -1276,8 +1281,8 @@ async def _sync_channel(force: bool = False) -> int:
             found_msg_ids: dict = {}  # mid -> message_id, for 👨‍💻 reaction on new movies
             max_id_seen = min_id
             active_tg = get_tg()
-            if active_tg is None or client_pool.is_bot(active_tg):
-                print("[sync] no user client available (all suspended/broken) — skipping sync pass")
+            if active_tg is None or client_pool.is_bot(active_tg) or not active_tg.is_connected:
+                print("[sync] no healthy user client available (all suspended/broken) — skipping sync pass")
                 return 0
             try:
                 # Pyrogram 2.x get_chat_history has no min_id filter — it
@@ -1304,7 +1309,6 @@ async def _sync_channel(force: bool = False) -> int:
                         found_ids.add(mid)
                         found_msg_ids[mid] = msg.id
                         count += 1
-                        _invalidate_movies_cache()
                         max_id_seen = max(max_id_seen, msg.id)
                     except Exception: continue
             except AuthKeyDuplicated as ae:
@@ -1312,10 +1316,14 @@ async def _sync_channel(force: bool = False) -> int:
                 client_pool.suspend_auth(active_tg)
                 raise ae
 
+            # Single invalidation after the full scan instead of per-message
+            if count:
+                _invalidate_movies_cache()
+
             new_ids = found_ids - existing_ids
             for mid in new_ids:
                 print(f"Sync: new movie detected, enqueueing for prefetch: {mid}")
-                stopped = await redis_client.get(f"tgstream:dl:stopped:{mid}")
+                stopped = await redis_client.get(R_DL_STOPPED.format(mid))
                 if stopped != b"1":
                     try:
                         prefetch_queue.put_nowait(mid)
@@ -1385,7 +1393,8 @@ async def manifest(): return JSONResponse(MANIFEST)
 
 
 @app.get("/sync")
-async def manual_sync():
+async def manual_sync(request: Request):
+    await _debug_auth(request)
     try:
         return {"synced": await _sync_channel(force=True)}
     except AuthKeyDuplicated:
@@ -1409,30 +1418,34 @@ async def _debug_auth(request: Request):
 async def debug_movies(request: Request):
     await _debug_auth(request)
     movies = await _get_movies()
+    result = {}
     for mid, m in movies.items():
+        # Shallow copy — never mutate the shared cache dict
+        entry = dict(m)
         task = download_manager.get(mid)
         dl_map = download_manager.get_map(mid)
         if not dl_map:
             dl_map = await download_manager._load_map(mid, redis_client)
-            
-        file_path = find_cache_path(mid, m.get("file_name"))
+
+        file_path = find_cache_path(mid, entry.get("file_name"))
         exists = file_path.exists()
-        
+
         cached_bytes = dl_map.total_bytes() if exists else 0
-        m["cached_bytes"] = cached_bytes
-        m["cached_text"] = st.fmt_size(cached_bytes)
-        
-        fs = m.get("file_size", 0)
-        m["pct"] = round(cached_bytes / fs * 100, 1) if fs and exists else 0
-        
+        entry["cached_bytes"] = cached_bytes
+        entry["cached_text"] = st.fmt_size(cached_bytes)
+
+        fs = entry.get("file_size", 0)
+        entry["pct"] = round(cached_bytes / fs * 100, 1) if fs and exists else 0
+
         is_done = False
         if exists:
             done_val = await redis_client.get(f"tgstream:dl:done:{mid}")
             is_done = done_val == b"1" or cached_bytes >= fs
-            
-        m["is_done"] = is_done
-        m["is_active"] = bool(task and task._task and not task._task.done())
-    return movies
+
+        entry["is_done"] = is_done
+        entry["is_active"] = bool(task and task._task and not task._task.done())
+        result[mid] = entry
+    return result
 
 
 @app.get("/debug/downloads")
@@ -2053,7 +2066,7 @@ async def start_download_media(movie_id: str, x_api_key: str | None = Header(def
         except Exception:
             raise HTTPException(status_code=502, detail="Telegram unavailable")
 
-    await redis_client.delete(f"tgstream:dl:stopped:{movie_id}")
+    await redis_client.delete(R_DL_STOPPED.format(movie_id))
     _schedule(_ensure_download(movie_id, file_size, movie["message_id"], movie.get("file_name")))
     return {"status": "ok"}
 
@@ -2063,7 +2076,7 @@ async def pause_download_media(movie_id: str, x_api_key: str | None = Header(def
     _check_api_auth(x_api_key)
     task = download_manager.get(movie_id)
     if task:
-        await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
+        await redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
         task.cancel()
         return {"status": "ok"}
     return {"status": "ignored"}
@@ -2072,7 +2085,7 @@ async def pause_download_media(movie_id: str, x_api_key: str | None = Header(def
 @app.post("/api/media/{movie_id}/evict")
 async def evict_cache_media(movie_id: str, x_api_key: str | None = Header(default=None)):
     _check_api_auth(x_api_key)
-    await redis_client.set(f"tgstream:dl:stopped:{movie_id}", "1", ex=86400)
+    await redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
     movies = await _get_movies()
     await download_manager.evict(movie_id, redis_client,
                                  file_name=movies.get(movie_id, {}).get("file_name"))

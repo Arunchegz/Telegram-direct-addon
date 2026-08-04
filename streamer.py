@@ -133,6 +133,8 @@ class ByteStreamer:
             del self._msg_cache[k]
         return len(stale)
 
+    MAX_YIELD_RETRIES = 5  # hard cap on retry attempts per yield_file call
+
     async def yield_file(
         self,
         msg,
@@ -141,97 +143,94 @@ class ByteStreamer:
         last_cut: int,
         parts: int,
         chunk: int = TG_CHUNK,
-        _retry: bool = True,
+        _retry: bool = True,  # kept for call-site compat; retries are now iterative
         c: Client = None,
         c_idx: int = None,
     ) -> AsyncGenerator[bytes, None]:
-        # Pick client at entry if not provided — but do NOT reuse it across
-        # the entire multi-chunk loop below. Instead, re-pick per chunk to
-        # ensure round-robin distribution even within a single stream request.
-        # This prevents one session from absorbing all rate limits while the
-        # other sits idle.
-        initial_c_idx, initial_c = c_idx, c
-        if initial_c is None:
+        """Stream file bytes from Telegram MTProto, iterating across chunks.
+
+        Retry logic is now fully iterative (no recursion) to avoid stack
+        overflow on repeated FloodWait/FileReferenceExpired mid-stream.
+        MAX_YIELD_RETRIES caps total retries across all error types.
+        """
+        # Pick client at entry if not provided — re-picked per chunk below
+        # for round-robin load distribution across pool sessions.
+        cur_c_idx, cur_c = c_idx, c
+        if cur_c is None:
             if hasattr(self.client, "pick"):
-                initial_c_idx, initial_c = await self.client.pick()
+                cur_c_idx, cur_c = await self.client.pick()
             else:
-                initial_c_idx, initial_c = None, self.client
+                cur_c_idx, cur_c = None, self.client
 
         # Ensure msg is bound to the chosen client's session
-        if hasattr(msg, "_client") and msg._client != initial_c:
+        if hasattr(msg, "_client") and msg._client != cur_c:
             try:
-                msg = await self._get_fresh_msg(msg.chat.id, msg.id, initial_c, initial_c_idx)
+                msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
             except Exception:
                 pass
 
         fid     = _extract_fid(msg)
-        session = await self._session(initial_c, fid)
+        session = await self._session(cur_c, fid)
         loc     = _location(fid)
         part    = 1
         off     = offset
         dc_id   = fid.dc_id
+        retries = 0
 
         # Check if DC is in backoff for the chosen client; if so, wait
-        backoff_key = (initial_c_idx, dc_id)
+        backoff_key = (cur_c_idx, dc_id)
         if backoff_key in self._backoff_until:
             until = self._backoff_until[backoff_key]
             if time.time() < until:
                 remaining = until - time.time()
-                print(f"[streamer] Waiting for Client {initial_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
+                print(f"[streamer] Waiting for Client {cur_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
                 await asyncio.sleep(remaining)
             del self._backoff_until[backoff_key]
 
-        try:
-            async with self._concurrent_semaphore:
-                await self._throttle(initial_c_idx)  # Apply inter-request throttle
-                try:
+        # ── First chunk ───────────────────────────────────────────────────────
+        while True:
+            try:
+                async with self._concurrent_semaphore:
+                    await self._throttle(cur_c_idx)
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
-                    # NOTE: semaphore only wraps the first GetFile call.
-                    # Subsequent chunks in the loop below invoke without it —
-                    # intentional: per-chunk throttling + per-client round-robin
-                    # provide sufficient rate-limit protection without serialising
-                    # an entire multi-chunk stream through a single semaphore slot.
-                except (FloodWait, Timeout, RpcConnectFailed) as e:
-                    wait_s = e.value if hasattr(e, 'value') else 5
-                    if initial_c_idx is not None and hasattr(self.client, "mark_cooldown"):
-                        self.client.mark_cooldown(initial_c_idx, wait_s)
-                    await self._wait_backoff(dc_id, wait_s, initial_c_idx)
-                    # Retry after backoff — re-pick client to distribute load
-                    if _retry:
-                        # Re-pick a fresh client (don't reuse the rate-limited one)
-                        if hasattr(self.client, "pick"):
-                            c_idx, c = await self.client.pick()
-                        async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, c, c_idx):
-                            yield b
-                        return
-                    else:
-                        raise
-        except FileReferenceExpired:
-            if not _retry:
-                raise
-            # Invalidate cache
-            self._invalidate_msg_cache(msg.chat.id, msg.id, initial_c, initial_c_idx)
-            # Refresh message to get new file reference using a valid client
-            refresh_client = initial_c
-            refresh_c_idx = initial_c_idx
-            if refresh_client is None:
-                refresh_c_idx, refresh_client = await self.client.pick()
-            try:
-                msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
-            except Exception:
-                # If refresh fails, try picking another client
-                refresh_c_idx, refresh_client = await self.client.pick()
-                msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
-            # Restart from beginning with fresh client selection
-            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, refresh_client, refresh_c_idx):
-                yield b
-            return
+                break  # success
+            except (FloodWait, Timeout, RpcConnectFailed) as e:
+                if not _retry or retries >= self.MAX_YIELD_RETRIES:
+                    raise
+                retries += 1
+                wait_s = e.value if hasattr(e, "value") else 5
+                if cur_c_idx is not None and hasattr(self.client, "mark_cooldown"):
+                    self.client.mark_cooldown(cur_c_idx, wait_s)
+                await self._wait_backoff(dc_id, wait_s, cur_c_idx)
+                # Re-pick fresh client after rate-limit backoff
+                if hasattr(self.client, "pick"):
+                    cur_c_idx, cur_c = await self.client.pick()
+                fid = _extract_fid(msg)
+                session = await self._session(cur_c, fid)
+                loc = _location(fid)
+            except FileReferenceExpired:
+                if not _retry or retries >= self.MAX_YIELD_RETRIES:
+                    raise
+                retries += 1
+                self._invalidate_msg_cache(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                if hasattr(self.client, "pick"):
+                    cur_c_idx, cur_c = await self.client.pick()
+                try:
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                except Exception:
+                    if hasattr(self.client, "pick"):
+                        cur_c_idx, cur_c = await self.client.pick()
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                fid = _extract_fid(msg)
+                session = await self._session(cur_c, fid)
+                loc = _location(fid)
 
         if not isinstance(r, raw.types.upload.File):
             return
 
+        # ── Yield loop across all parts ───────────────────────────────────────
         while True:
             data = r.bytes
             if not data:
@@ -250,66 +249,57 @@ class ByteStreamer:
             if part > parts:
                 break
 
-            # Re-pick client for each subsequent chunk to distribute load
-            # evenly across all sessions instead of sticking with one client
-            # for the entire stream (which causes imbalanced rate limiting).
-            current_c_idx, current_c = initial_c_idx, initial_c
+            # Re-pick client for each subsequent chunk (round-robin load distribution)
             if hasattr(self.client, "pick"):
-                current_c_idx, current_c = await self.client.pick()
-            
-            # Ensure msg is bound to the chosen client's session
-            if hasattr(msg, "_client") and msg._client != current_c:
+                cur_c_idx, cur_c = await self.client.pick()
+
+            # Ensure msg is bound to the new client's session
+            if hasattr(msg, "_client") and msg._client != cur_c:
                 try:
-                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, current_c, current_c_idx)
+                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
                 except Exception:
                     pass
 
             fid = _extract_fid(msg)
             loc = _location(fid)
 
-            await self._throttle(current_c_idx)  # Throttle between chunks
-            try:
-                # Create new session for the newly picked client
-                current_session = await self._session(current_c, fid)
-                async with self._concurrent_semaphore:
-                    r = await current_session.invoke(
-                        raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
-                    )
-            except (FloodWait, Timeout, RpcConnectFailed) as e:
-                wait_s = e.value if hasattr(e, 'value') else 5
-                if current_c_idx is not None and hasattr(self.client, "mark_cooldown"):
-                    self.client.mark_cooldown(current_c_idx, wait_s)
-                await self._wait_backoff(dc_id, wait_s, current_c_idx)
-                # Retry after backoff — re-pick client to distribute load
-                if _retry:
-                    # Re-pick a fresh client (don't reuse the rate-limited one)
-                    if hasattr(self.client, "pick"):
-                        c_idx, c = await self.client.pick()
-                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, c, c_idx):
-                        yield b
-                    return
-                else:
-                    raise
-            except FileReferenceExpired:
-                if not _retry:
-                    raise
-                # Invalidate cache
-                self._invalidate_msg_cache(msg.chat.id, msg.id, current_c, current_c_idx)
-                # Refresh message to get new file reference using a valid client
-                refresh_client = current_c
-                refresh_c_idx = current_c_idx
-                if refresh_client is None:
-                    refresh_c_idx, refresh_client = await self.client.pick()
+            await self._throttle(cur_c_idx)
+            while True:
                 try:
-                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
-                except Exception:
-                    # If refresh fails, try picking another client
-                    refresh_c_idx, refresh_client = await self.client.pick()
-                    msg = await self._get_fresh_msg(msg.chat.id, msg.id, refresh_client, refresh_c_idx)
-                # Continue from current offset with fresh client selection
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, True, refresh_client, refresh_c_idx):
-                    yield b
-                return
+                    current_session = await self._session(cur_c, fid)
+                    async with self._concurrent_semaphore:
+                        r = await current_session.invoke(
+                            raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
+                        )
+                    break  # success
+                except (FloodWait, Timeout, RpcConnectFailed) as e:
+                    if not _retry or retries >= self.MAX_YIELD_RETRIES:
+                        raise
+                    retries += 1
+                    wait_s = e.value if hasattr(e, "value") else 5
+                    if cur_c_idx is not None and hasattr(self.client, "mark_cooldown"):
+                        self.client.mark_cooldown(cur_c_idx, wait_s)
+                    await self._wait_backoff(dc_id, wait_s, cur_c_idx)
+                    if hasattr(self.client, "pick"):
+                        cur_c_idx, cur_c = await self.client.pick()
+                    fid = _extract_fid(msg)
+                    current_session = await self._session(cur_c, fid)
+                    loc = _location(fid)
+                except FileReferenceExpired:
+                    if not _retry or retries >= self.MAX_YIELD_RETRIES:
+                        raise
+                    retries += 1
+                    self._invalidate_msg_cache(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                    if hasattr(self.client, "pick"):
+                        cur_c_idx, cur_c = await self.client.pick()
+                    try:
+                        msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                    except Exception:
+                        if hasattr(self.client, "pick"):
+                            cur_c_idx, cur_c = await self.client.pick()
+                        msg = await self._get_fresh_msg(msg.chat.id, msg.id, cur_c, cur_c_idx)
+                    fid = _extract_fid(msg)
+                    loc = _location(fid)
 
     async def _session(self, c: Client, fid: FileId) -> Session:
         dc = fid.dc_id

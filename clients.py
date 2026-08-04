@@ -296,7 +296,12 @@ class ClientPool:
         except RuntimeError:
             pass
 
-    async def _recover_auth(self, idx: int, cooldown_s: int):
+    async def _recover_auth(self, idx: int, cooldown_s: int, attempt: int = 0):
+        MAX_RECOVERY_ATTEMPTS = 10
+        if attempt >= MAX_RECOVERY_ATTEMPTS:
+            print(f"[clients] client {idx} giving up recovery after {MAX_RECOVERY_ATTEMPTS} attempts — session may be permanently invalidated")
+            self._fire_alert(f"broken:{idx}:perm", f"🔴 Client {idx} failed to recover after {MAX_RECOVERY_ATTEMPTS} attempts — session may need manual renewal")
+            return
         await asyncio.sleep(cooldown_s)
         c = self.clients[idx]
         try:
@@ -306,14 +311,19 @@ class ClientPool:
             pass
         try:
             await c.start()
+            # Clear stale media sessions from before the reconnect — using them
+            # after a stop/start would cause AUTH_KEY_UNREGISTERED errors on GetFile.
+            if hasattr(c, "media_sessions"):
+                c.media_sessions.clear()
             self._broken[idx] = False
             self._cooldown_until.pop(idx, None)
-            print(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension")
+            print(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
         except AuthKeyDuplicated:
-            print(f"[clients] client {idx} still suspended — session still in use elsewhere, retrying later")
+            next_cooldown = min(cooldown_s * 2, 600)  # cap at 10min
+            print(f"[clients] client {idx} still suspended — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
             try:
                 loop = asyncio.get_running_loop()
-                task = loop.create_task(self._recover_auth(idx, cooldown_s))
+                task = loop.create_task(self._recover_auth(idx, next_cooldown, attempt + 1))
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
             except RuntimeError:

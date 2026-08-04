@@ -94,14 +94,18 @@ async def _fetch_poster(filename: str) -> tuple[str, str]:
         return _local_placeholder_poster(""), ""
     query = quote_plus(f"{title} {year}".strip())
     try:
+        from movie_matcher import best_similarity_match
         c = _get_http_client()
         r = await c.get(
             f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json",
         )
         metas = r.json().get("metas", [])
         if metas:
-            poster = metas[0].get("poster") or _local_placeholder_poster(title)
-            imdb_id = metas[0].get("id", "")
+            year_int = int(year) if year and year.isdigit() else None
+            best = best_similarity_match(title, year_int, metas)
+            meta = best if best else metas[0]
+            poster = meta.get("poster") or _local_placeholder_poster(title)
+            imdb_id = meta.get("id", "")
             if not imdb_id.startswith("tt"):
                 imdb_id = ""
             return poster, imdb_id
@@ -124,8 +128,7 @@ async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str
     poster_key = R_POSTER.format(cache_key)
     imdb_key = R_IMDB.format(cache_key)
     try:
-        cached_poster = await redis.get(poster_key)
-        cached_imdb = await redis.get(imdb_key)
+        cached_poster, cached_imdb = await redis.mget(poster_key, imdb_key)
         if cached_poster:
             return cached_poster.decode(), (cached_imdb.decode() if cached_imdb else "")
     except Exception as e:
@@ -244,7 +247,9 @@ def parse_title_year(filename: str) -> tuple[str, str]:
 IS_SERIES_RE = re.compile(
     r"[Ss]\d{1,2}[Ee]\d{1,3}"          # S01E01 / S1E5
     r"|[Ss]eason[\s._-]*\d+"            # Season.2 / Season 2
-    r"|[Ee]pisode[\s._-]*\d+",          # Episode.3 / Episode 3
+    r"|[Ee]pisode[\s._-]*\d+"           # Episode.3 / Episode 3
+    r"|[Tt]emporada[\s._-]*\d+"         # Temporada.2 / Temporada 2 (Spanish/Portuguese)
+    r"|[Cc]apitulo[\s._-]*\d+",         # Capitulo.3 / Capitulo 3 (Spanish/Portuguese)
     re.IGNORECASE,
 )
 
@@ -387,26 +392,28 @@ def _clean_title_prefix(filename: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+_STOPWORDS = frozenset({'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'and', 'or'})
+
+
 def matches_title(filename: str, title: str) -> bool:
     """Checks if title is in prefix, or all major keywords are in prefix."""
     prefix = _clean_title_prefix(filename)
     norm_title = normalize_title(title)
     norm_prefix = normalize_title(prefix)
-    
+
     if not norm_title or not norm_prefix:
         return False
-        
+
     # Exact match of normalized strings
     if norm_title == norm_prefix:
         return True
-        
+
     # Title is contained in prefix
     if norm_title in norm_prefix:
         return True
-        
+
     # Check if all major keywords from title are in prefix
     # Strip stopwords so 'The Dark Knight' matches 'Dark.Knight.2008.mkv'
-    _STOPWORDS = {'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'and', 'or'}
     title_words = set(norm_title.split()) - _STOPWORDS
     prefix_words = set(norm_prefix.split()) - _STOPWORDS
 

@@ -44,10 +44,11 @@ DL_THROTTLE_S  = float(os.getenv("DL_THROTTLE_S", "0.15"))  # Sleep between succ
 LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
-R_DL_MAP  = "tgstream:dl:map:{}"    # JSON [[start,end],...]
-R_DL_DONE = "tgstream:dl:done:{}"   # "1" when fully downloaded
-R_DL_PATH = "tgstream:dl:path:{}"   # local file path string
-R_DL_TS   = "tgstream:dl:ts:{}"     # last access timestamp (for LRU eviction)
+R_DL_MAP     = "tgstream:dl:map:{}"     # JSON [[start,end],...]
+R_DL_DONE    = "tgstream:dl:done:{}"    # "1" when fully downloaded
+R_DL_PATH    = "tgstream:dl:path:{}"    # local file path string
+R_DL_TS      = "tgstream:dl:ts:{}"      # last access timestamp (for LRU eviction)
+R_DL_STOPPED = "tgstream:dl:stopped:{}" # "1" when user explicitly paused/evicted
 
 
 def cache_path(movie_id: str, file_name: str | None = None) -> Path:
@@ -279,6 +280,8 @@ class DownloadTask:
         self._seek_event = asyncio.Event()       # fires on large seek, aborts current batch
         self._pinned_client_idx: Optional[int] = None  # client slot held via acquire_download_slot
         self._last_persist_ts: float = 0.0
+        self._seen_gaps: set = set()     # gap offsets visited during EOF wrap-around fill
+        self._finished_at: float = 0.0  # set in finally block of _run()
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
     # Jump threshold: if player seeks > 30MB ahead of current batch, abort and re-anchor
@@ -483,8 +486,6 @@ class DownloadTask:
                             # corrupted map returning the same offset and looping forever.
                             # Secondary guard: track seen gap offsets; if we visit the
                             # same gap twice without progress, bail to prevent infinite spin.
-                            if not hasattr(self, "_seen_gaps"):
-                                self._seen_gaps: set = set()
                             if next_gap in self._seen_gaps:
                                 print(f"[dl:{self.movie_id}] gap at {next_gap/1024/1024:.1f}MB seen twice without progress — aborting gap-fill to avoid infinite loop")
                                 break
@@ -751,9 +752,11 @@ class DownloadManager:
 
     async def evict_lru_if_needed(self, redis: aioredis.Redis):
         """Evict oldest accessed movies if total local storage > MAX_LOCAL_GB."""
+        # Snapshot to avoid RuntimeError if _files mutates during iteration
+        files_snapshot = list(self._files.values())
         total = sum(
             self._disk_usage(f.path)
-            for f in self._files.values()
+            for f in files_snapshot
             if f.path.exists()
         )
         limit = MAX_LOCAL_GB * 1024 ** 3
@@ -787,14 +790,15 @@ class DownloadManager:
         task object forever, growing unbounded on a large catalog."""
         now = time.time()
         removed = 0
+        # Snapshot keys first — evict() or get_or_create() may mutate _tasks concurrently
         for mid in list(self._tasks.keys()):
             task = self._tasks.get(mid)
             if not task or not task._task or not task._task.done():
                 continue  # still running, leave alone
             if mid in self._active_task_mids:
                 continue
-            finished_at = getattr(task, "_finished_at", None)
-            if finished_at is None:
+            finished_at = task._finished_at
+            if not finished_at:
                 continue  # hasn't gone through _run's finally yet
             if (now - finished_at) > max_idle_s:
                 self._tasks.pop(mid, None)
