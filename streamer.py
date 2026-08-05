@@ -24,7 +24,8 @@ from pyrogram.session import Auth, Session
 TG_CHUNK = 1024 * 1024        # Live streaming chunk size (1MB) - balances startup speed and API calls
 PREFETCH_CHUNK = 2 * 1024 * 1024   # Background prefetch logical chunk size (2MB) - fewer GetFile requests, higher throughput
 TG_MAX_LIMIT = 1024 * 1024      # Telegram's maximum allowed limit per GetFile request (hard API limit)
-MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))  # Throttle between GetFile calls (100ms default); lower is faster
+MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))      # Live stream: inter-request delay per client (100ms → ~10 req/s cap)
+MIN_DL_THROTTLE_MS = int(os.getenv("MIN_DL_THROTTLE_MS", "600")) # Background dl: slower per client (600ms → ~1.6 req/s per client)
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
 MAX_MSG_CACHE_SIZE = 500   # Auto-prune message cache above this threshold
@@ -66,18 +67,32 @@ class ByteStreamer:
     async def _throttle(self, c_idx=None) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.
 
-        Keyed per client (c_idx) — each session gets its own 500ms budget
+        Keyed per client (c_idx) — each session gets its own budget
         instead of all sessions sharing one global timer. A pool of N
         clients can therefore sustain ~N req/s combined instead of being
         capped at ~1 req/s system-wide regardless of pool size.
         """
+        await self._throttle_with_ms(c_idx, MIN_THROTTLE_MS)
+
+    async def _dl_throttle(self, c_idx=None) -> None:
+        """Slower throttle for background downloads.
+
+        Background prefetch uses MIN_DL_THROTTLE_MS (default 600ms) per client
+        instead of the 100ms live-stream rate. With 3 clients and 2 concurrent
+        downloads this yields ~1.1 req/s per client — well within Telegram's
+        ~2 req/s limit — preventing the paired FloodWaits seen at 100ms spacing.
+        """
+        await self._throttle_with_ms(c_idx, MIN_DL_THROTTLE_MS)
+
+    async def _throttle_with_ms(self, c_idx, min_ms: int) -> None:
+        """Core throttle implementation, parameterized by minimum interval."""
         self._throttle_locks.setdefault(c_idx, asyncio.Lock())
         lock = self._throttle_locks[c_idx]
         async with lock:
             last = self._last_invoke_time.get(c_idx, 0.0)
             elapsed = (time.time() - last) * 1000
-            if elapsed < MIN_THROTTLE_MS:
-                await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
+            if elapsed < min_ms:
+                await asyncio.sleep((min_ms - elapsed) / 1000)
             self._last_invoke_time[c_idx] = time.time()
 
     async def _wait_backoff(self, dc_id: int, flood_wait_s: int, c_idx: int | None = None) -> None:
@@ -146,17 +161,22 @@ class ByteStreamer:
         last_cut: int,
         parts: int,
         chunk: int = TG_CHUNK,
-        _retry: bool = True,  # kept for call-site compat; retries are now iterative
+        _retry: bool = True,
         c: Client = None,
         c_idx: int = None,
+        is_background: bool = False,  # True for prefetch/download; uses slower dl_throttle
     ) -> AsyncGenerator[bytes, None]:
         """Stream file bytes from Telegram MTProto, iterating across chunks.
 
-        Retry logic is now fully iterative (no recursion) to avoid stack
+        Retry logic is fully iterative (no recursion) to avoid stack
         overflow on repeated FloodWait/FileReferenceExpired mid-stream.
         MAX_YIELD_RETRIES caps total retries across all error types.
+
+        is_background=True uses MIN_DL_THROTTLE_MS (600ms) instead of
+        MIN_THROTTLE_MS (100ms) to prevent background downloads from
+        flooding Telegram sessions and causing FloodWaits.
         """
-        # Pick client at entry if not provided — re-picked per chunk below
+        throttle = self._dl_throttle if is_background else self._throttle
         # for round-robin load distribution across pool sessions.
         cur_c_idx, cur_c = c_idx, c
         if cur_c is None:
@@ -194,7 +214,7 @@ class ByteStreamer:
         while True:
             try:
                 async with self._concurrent_semaphore:
-                    await self._throttle(cur_c_idx)
+                    await throttle(cur_c_idx)
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
@@ -266,7 +286,7 @@ class ByteStreamer:
             fid = _extract_fid(msg)
             loc = _location(fid)
 
-            await self._throttle(cur_c_idx)
+            await throttle(cur_c_idx)
             while True:
                 try:
                     current_session = await self._session(cur_c, fid)

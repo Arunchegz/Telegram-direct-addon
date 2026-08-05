@@ -410,10 +410,10 @@ class DownloadTask:
                         current_pos = current_offset
                         while bytes_remaining > 0:
                             request_chunk = min(TG_MAX_LIMIT, bytes_remaining)
-                            # Re-pick client for each sub-chunk within the prefetch batch
-                            # to ensure even distribution across sessions when downloading
-                            # large files that require multiple GetFile calls per chunk.
-                            if hasattr(self.streamer.client, "pick") and current_pos > current_offset:
+                            # Re-pick client for every sub-chunk (including the first)
+                            # so concurrent download tasks distribute across sessions
+                            # rather than both grabbing client 0 on their first call.
+                            if hasattr(self.streamer.client, "pick"):
                                 c_idx, c = await self.streamer.client.pick()
 
                             start_mb = current_pos / 1024 / 1024
@@ -430,6 +430,7 @@ class DownloadTask:
                                 chunk=TG_MAX_LIMIT,
                                 c=c,
                                 c_idx=c_idx,
+                                is_background=True,
                             ):
                                 data.extend(piece)
                             bytes_remaining -= request_chunk
