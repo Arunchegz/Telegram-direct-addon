@@ -14,6 +14,7 @@ Player never knows — proxy checks DownloadMap before each range,
 serves local file if available, falls back to live Telegram otherwise.
 """
 from __future__ import annotations
+import logging
 
 import asyncio
 import bisect
@@ -32,6 +33,8 @@ from clients import pool as client_pool
 # Import chunk sizes from streamer module to ensure consistency
 from streamer import TG_CHUNK, PREFETCH_CHUNK, TG_MAX_LIMIT
 from metrics import metrics
+
+log = logging.getLogger("tgstream.downloader")
 
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 # Persistent storage: default to a dir under the user home (survives restarts,
@@ -346,7 +349,7 @@ class DownloadTask:
         else:
             c_idx, c = None, self.streamer.client
 
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
+        log.info(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
               f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
         completed = False
         await metrics.record_download_start()
@@ -359,7 +362,7 @@ class DownloadTask:
                 if self._seek_event.is_set():
                     self._seek_event.clear()
                     current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
-                    print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
+                    log.info(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
                     # Grace delay: let the live proxy stream claim the MTProto session
                     # first after a seek, instead of both proxy and downloader hitting
                     # GetFile simultaneously and triggering FloodWait.
@@ -416,7 +419,7 @@ class DownloadTask:
                             start_mb = current_pos / 1024 / 1024
                             end_mb = (current_pos + request_chunk) / 1024 / 1024
                             c_num = c_idx if c_idx is not None else 0
-                            print(f"[dl:{self.movie_id}] client {c_num} downloading {start_mb:.1f}-{end_mb:.1f} MB")
+                            log.info(f"[dl:{self.movie_id}] client {c_num} downloading {start_mb:.1f}-{end_mb:.1f} MB")
 
                             async for piece in self.streamer.yield_file(
                                 msg,
@@ -449,12 +452,12 @@ class DownloadTask:
                     await asyncio.sleep(DL_THROTTLE_S)
 
                 except asyncio.CancelledError:
-                    print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
+                    log.info(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
                     return
                 except FloodWait as e:
                     # Telegram mandates we wait exactly e.value seconds — don't use our own backoff
                     wait_s = max(e.value, 1) + 1  # +1s safety buffer
-                    print(f"[dl:{self.movie_id}] FloodWait {e.value}s at {current_offset/1024/1024:.1f}MB, sleeping {wait_s}s")
+                    log.warning(f"[dl:{self.movie_id}] FloodWait {e.value}s at {current_offset/1024/1024:.1f}MB, sleeping {wait_s}s")
                     self._consecutive_errors += 1
                     self._msg = None
                     await asyncio.sleep(wait_s)
@@ -463,7 +466,7 @@ class DownloadTask:
                     backoff_s = DL_MIN_BACKOFF * self._error_backoff
                     self._error_backoff = min(self._error_backoff * 2, 8)
                     self._consecutive_errors += 1
-                    print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
+                    log.error(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
                     if self._consecutive_errors >= 5 and not self._alerted_stuck and self._alert_fn:
                         self._alerted_stuck = True
                         await self._alert_fn(
@@ -487,25 +490,25 @@ class DownloadTask:
                             # Secondary guard: track seen gap offsets; if we visit the
                             # same gap twice without progress, bail to prevent infinite spin.
                             if next_gap in self._seen_gaps:
-                                print(f"[dl:{self.movie_id}] gap at {next_gap/1024/1024:.1f}MB seen twice without progress — aborting gap-fill to avoid infinite loop")
+                                log.info(f"[dl:{self.movie_id}] gap at {next_gap/1024/1024:.1f}MB seen twice without progress — aborting gap-fill to avoid infinite loop")
                                 break
                             self._seen_gaps.add(next_gap)
                             current_offset = next_gap
-                            print(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
+                            log.info(f"[dl:{self.movie_id}] reached EOF with gaps; wrapping around to download from {current_offset/1024/1024:.1f}MB")
 
             # EOF
             self._done = True
             self._last_persist_ts = 0  # force final persist
             await self._persist_map()
             await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
-            print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
+            log.info(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             completed = True
             await metrics.record_download_complete()
             if self._complete_fn:
                 try:
                     await self._complete_fn(self.movie_id, self.message_id)
                 except Exception as ce:
-                    print(f"[dl:{self.movie_id}] complete hook failed: {ce}")
+                    log.error(f"[dl:{self.movie_id}] complete hook failed: {ce}")
         finally:
             self._finished_at = time.time()
             # Release the per-client load slot acquired at task start
@@ -585,7 +588,7 @@ class DownloadManager:
         self._dl_semaphore = asyncio.Semaphore(n)
         default_concurrent = min(2, n)
         self._max_concurrent_downloads = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", str(default_concurrent)))
-        print(f"[dm] download semaphore sized to {n} (matches client pool), "
+        log.info(f"[dm] download semaphore sized to {n} (matches client pool), "
               f"max concurrent background downloads = {self._max_concurrent_downloads}")
 
     async def _fire_alert(self, text: str):
@@ -593,7 +596,7 @@ class DownloadManager:
             try:
                 await self.on_alert(text)
             except Exception as e:
-                print(f"[dm] alert hook failed: {e}")
+                log.error(f"[dm] alert hook failed: {e}")
 
     async def get_or_create(
         self,
@@ -620,7 +623,7 @@ class DownloadManager:
                     self._maps[movie_id] = dl_map
                     if movie_id not in self._files:
                         self._files[movie_id] = SparseFile(sparse_path)
-                    print(f"[dl:{movie_id}] fully cached — skipping downloader")
+                    log.warning(f"[dl:{movie_id}] fully cached — skipping downloader")
                     return None
                 # Fallback: interval coverage check (Redis flag may be missing after crash)
                 dl_map = await self._load_map(movie_id, redis)
@@ -629,7 +632,7 @@ class DownloadManager:
                     if movie_id not in self._files:
                         self._files[movie_id] = SparseFile(sparse_path)
                     await redis.set(R_DL_DONE.format(movie_id), b"1")
-                    print(f"[dl:{movie_id}] fully cached (map verify) — skipping downloader")
+                    log.warning(f"[dl:{movie_id}] fully cached (map verify) — skipping downloader")
                     return None
             # ─────────────────────────────────────────────────────────────────
 
@@ -653,7 +656,7 @@ class DownloadManager:
                     victim = next((m for m in live_active if m not in self._priority_mids), None)
                     victim = victim or next(iter(live_active), None)
                     if victim:
-                        print(f"[dm] preempting {victim} for priority download {movie_id}")
+                        log.info(f"[dm] preempting {victim} for priority download {movie_id}")
                         self._tasks[victim].cancel()
                 else:
                     return None  # low-priority (prefetch) — wait your turn
@@ -732,12 +735,12 @@ class DownloadManager:
             R_DL_PATH.format(movie_id),
             R_DL_TS.format(movie_id),
         )
-        print(f"[dm] evicted {movie_id}")
+        log.info(f"[dm] evicted {movie_id}")
         if self.on_evict:
             try:
                 self.on_evict(movie_id)
             except Exception as e:
-                print(f"[dm] on_evict hook failed for {movie_id}: {e}")
+                log.error(f"[dm] on_evict hook failed for {movie_id}: {e}")
 
     @staticmethod
     def _disk_usage(path) -> int:
@@ -782,7 +785,7 @@ class DownloadManager:
             size = self._disk_usage(f.path) if f else 0
             await self.evict(mid, redis)
             total -= size
-            print(f"[dm] LRU evict {mid} freed {size/1024/1024:.0f}MB")
+            log.info(f"[dm] LRU evict {mid} freed {size/1024/1024:.0f}MB")
 
     async def prune_finished_tasks(self, max_idle_s: float = 3600):
         """Drop DownloadTask/Map/SparseFile entries for movies finished and
@@ -806,7 +809,7 @@ class DownloadManager:
                 self._files.pop(mid, None)
                 removed += 1
         if removed:
-            print(f"[dm] pruned {removed} stale finished task entr{'y' if removed == 1 else 'ies'}")
+            log.info(f"[dm] pruned {removed} stale finished task entr{'y' if removed == 1 else 'ies'}")
         return removed
 
     async def shutdown(self):

@@ -3,6 +3,7 @@ state.py — Redis helpers for movie index + poster cache.
 Download state lives in downloader.py (separate key namespace).
 """
 from __future__ import annotations
+import logging
 import base64
 import hashlib
 import json
@@ -16,6 +17,8 @@ from xml.sax.saxutils import escape as xml_escape
 import PTN
 import httpx
 import redis.asyncio as aioredis
+
+log = logging.getLogger("tgstream.state")
 
 # Shared connection-pooled client — a fresh httpx.AsyncClient per call
 # (the old behaviour) re-does a TLS handshake every poster/Cinemeta lookup.
@@ -55,7 +58,7 @@ async def load_movies(redis: aioredis.Redis) -> dict:
         try:
             movies[k.decode()] = json.loads(v)
         except (json.JSONDecodeError, Exception) as e:
-            print(f"[load_movies] skipping corrupted Redis key {k.decode()!r}: {e}")
+            log.warning(f"[load_movies] skipping corrupted Redis key {k.decode()!r}: {e}")
     return movies
 
 
@@ -68,6 +71,18 @@ async def del_movie(redis: aioredis.Redis, mid: str):
 
 
 # ── Poster cache ──────────────────────────────────────────────────────────────
+# Unified series-detection regex — used by is_series() checks everywhere.
+# Defined here so it is available before _fetch_poster which uses it.
+IS_SERIES_RE = re.compile(
+    r"[Ss]\d{1,2}[Ee]\d{1,3}"          # S01E01 / S1E5
+    r"|[Ss]eason[\s._-]*\d+"            # Season.2 / Season 2
+    r"|[Ee]pisode[\s._-]*\d+"           # Episode.3 / Episode 3
+    r"|[Tt]emporada[\s._-]*\d+"         # Temporada.2 / Temporada 2 (Spanish/Portuguese)
+    r"|[Cc]apitulo[\s._-]*\d+",         # Capitulo.3 / Capitulo 3 (Spanish/Portuguese)
+    re.IGNORECASE,
+)
+
+
 async def _fetch_poster(filename: str) -> tuple[str, str]:
     """Returns (poster_url, imdb_id). imdb_id is '' if not found."""
     is_series = bool(IS_SERIES_RE.search(filename))
@@ -85,7 +100,7 @@ async def _fetch_poster(filename: str) -> tuple[str, str]:
                 if imdb_id and imdb_id.startswith("tt"):
                     return poster, imdb_id
         except Exception as e:
-            print(f"[fetch_poster] resolve_movie failed for {filename}: {e}")
+            log.error(f"[fetch_poster] resolve_movie failed for {filename}: {e}")
 
         title, year = parse_title_year(filename)
         catalog_type = "movie"
@@ -132,14 +147,14 @@ async def get_poster_and_imdb(redis: aioredis.Redis, filename: str) -> tuple[str
         if cached_poster:
             return cached_poster.decode(), (cached_imdb.decode() if cached_imdb else "")
     except Exception as e:
-        print(f"[poster] Redis get failed for {filename}: {e}")
+        log.error(f"[poster] Redis get failed for {filename}: {e}")
     poster, imdb_id = await _fetch_poster(filename)
     try:
         await redis.setex(poster_key, 86400, poster)
         if imdb_id:
             await redis.setex(imdb_key, 86400, imdb_id)
     except Exception as e:
-        print(f"[poster] Redis set failed for {filename}: {e}")
+        log.error(f"[poster] Redis set failed for {filename}: {e}")
     return poster, imdb_id
 
 
@@ -242,33 +257,6 @@ def parse_title_year(filename: str) -> tuple[str, str]:
     )[0]
     return re.sub(r"\s+", " ", cut).strip().title(), year
 
-
-# Unified series-detection regex — used by is_series() checks everywhere
-IS_SERIES_RE = re.compile(
-    r"[Ss]\d{1,2}[Ee]\d{1,3}"          # S01E01 / S1E5
-    r"|[Ss]eason[\s._-]*\d+"            # Season.2 / Season 2
-    r"|[Ee]pisode[\s._-]*\d+"           # Episode.3 / Episode 3
-    r"|[Tt]emporada[\s._-]*\d+"         # Temporada.2 / Temporada 2 (Spanish/Portuguese)
-    r"|[Cc]apitulo[\s._-]*\d+",         # Capitulo.3 / Capitulo 3 (Spanish/Portuguese)
-    re.IGNORECASE,
-)
-
-def parse_series(filename: str) -> Optional[dict]:
-    """Deprecated: use parse_season_episode() which returns (season, episode) via PTN.
-    Kept for backwards compatibility; no longer called by main.py."""
-    # SxxExx / S1E5
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
-    if m:
-        return {"season": int(m.group(1)), "episode": int(m.group(2))}
-    # Season N ... Episode N (dots/spaces/dashes as separators)
-    m2 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m2:
-        return {"season": int(m2.group(1)), "episode": int(m2.group(2))}
-    # Season N only — no episode marker
-    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m3:
-        return {"season": int(m3.group(1)), "episode": 1}
-    return None
 
 
 def parse_show_title(filename: str) -> str:
@@ -432,8 +420,18 @@ def matches_title(filename: str, title: str) -> bool:
 class VideoMatcher:
     """
     Robust score-based matching logic for Stremio/Telegram integration.
+
+    Score breakdown (max 60):
+      +20  title match (required — returns 0 immediately if title fails)
+      +20  exact year match  (+5 off-by-1, -10 year mismatch)
+      +20  exact season+episode match (0 if SE requested but not found)
+
+    DEFAULT_THRESHOLD=40 requires at minimum: title match (20) + either exact
+    year (20) or partial year credit (5) + some SE signal. A title-only match
+    scores 20 which is correctly rejected. Raised from 35 which allowed
+    title-match + wrong-year (20-10=10) to slip through.
     """
-    DEFAULT_THRESHOLD = 35
+    DEFAULT_THRESHOLD = 40
 
     @staticmethod
     def calculate_match_score(filename: str, title: str, year: str, season: int, episode: int) -> int:

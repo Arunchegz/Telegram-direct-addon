@@ -12,6 +12,7 @@ Env vars:
                    numbered vars are set)
 """
 from __future__ import annotations
+import logging
 
 import asyncio
 import os
@@ -21,6 +22,8 @@ from typing import Dict, List, Tuple
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.errors import AuthKeyDuplicated, FloodWait
+
+log = logging.getLogger("tgstream.clients")
 
 
 class ClientPool:
@@ -58,7 +61,7 @@ class ClientPool:
         try:
             await self.on_health_event(text)
         except Exception as e:
-            print(f"[clients] alert task failed: {e}")
+            log.error(f"[clients] alert task failed: {e}")
 
     @staticmethod
     def _load_sessions() -> List[str]:
@@ -73,7 +76,7 @@ class ClientPool:
                 sessions.append(s)
                 seen.add(s)
             else:
-                print(f"[clients] WARNING: SESSION_STRING_{i} is a duplicate of a previously loaded session. Skipping to avoid AuthKeyDuplicated.")
+                log.error(f"[clients] WARNING: SESSION_STRING_{i} is a duplicate of a previously loaded session. Skipping to avoid AuthKeyDuplicated.")
             i += 1
         if not sessions:
             s = os.getenv("SESSION_STRING", "").strip()
@@ -107,9 +110,9 @@ class ClientPool:
                     )
                 await self._start_with_auth_retry(c, i, channel_username)
                 self.clients.append(c)
-                print(f"[clients] client {i} started")
+                log.info(f"[clients] client {i} started")
             except FloodWait as fw:
-                print(f"[clients] client {i} failed to start due to FloodWait (cooldown {fw.value}s)")
+                log.error(f"[clients] client {i} failed to start due to FloodWait (cooldown {fw.value}s)")
                 # Instantiate a dummy client object to maintain index symmetry in the pool
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
@@ -122,7 +125,7 @@ class ClientPool:
                 self.mark_broken(i)
                 self.mark_cooldown(i, fw.value)
             except AuthKeyDuplicated as ae:
-                print(f"[clients] client {i} AuthKeyDuplicated — suspending, will auto-retry in background")
+                log.error(f"[clients] client {i} AuthKeyDuplicated — suspending, will auto-retry in background")
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                     bot_token=sess if ":" in sess else None,
@@ -141,7 +144,7 @@ class ClientPool:
                 except RuntimeError:
                     pass
             except Exception as e:
-                print(f"[clients] client {i} failed to start due to error: {e}")
+                log.error(f"[clients] client {i} failed to start due to error: {e}")
                 c = Client(
                     f"streamer_{i}", api_id=api_id, api_hash=api_hash,
                     bot_token=sess if ":" in sess else None,
@@ -156,7 +159,7 @@ class ClientPool:
         healthy_count = sum(1 for idx in range(len(self.clients)) if not self._broken.get(idx, False))
         if healthy_count == 0:
             raise RuntimeError("All clients in the pool failed to start. Cannot proceed.")
-        print(f"[clients] pool ready with {healthy_count} healthy client(s)")
+        log.info(f"[clients] pool ready with {healthy_count} healthy client(s)")
 
     async def _start_with_auth_retry(self, c: Client, i: int, channel_username):
         """Start a client, retrying on AUTH_KEY_DUPLICATED with backoff.
@@ -175,21 +178,21 @@ class ClientPool:
                 if attempt >= 3:
                     raise
                 wait = delay[attempt - 1]
-                print(f"[clients] client {i} AuthKeyDuplicated (attempt {attempt}/3)"
+                log.error(f"[clients] client {i} AuthKeyDuplicated (attempt {attempt}/3)"
                       f" — previous holder still using the session; retrying in {wait}s")
                 await asyncio.sleep(wait)
         if channel_username:
             try:
                 await c.get_chat(channel_username)
-                print(f"[clients] client {i} successfully resolved channel {channel_username}")
+                log.info(f"[clients] client {i} successfully resolved channel {channel_username}")
             except Exception as e:
-                print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
+                log.error(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
         else:
             try:
                 async for _ in c.get_dialogs(limit=100):
                     pass
             except Exception as e:
-                print(f"[clients] peer-cache warmup failed for client {i}: {e}")
+                log.error(f"[clients] peer-cache warmup failed for client {i}: {e}")
 
     async def stop(self):
         for c in self.clients:
@@ -212,7 +215,7 @@ class ClientPool:
 
     def mark_cooldown(self, idx: int, seconds: float):
         self._cooldown_until[idx] = time.time() + seconds
-        print(f"[clients] client {idx} cooling down for {seconds:.1f}s")
+        log.info(f"[clients] client {idx} cooling down for {seconds:.1f}s")
 
     def _available(self) -> List[int]:
         now = time.time()
@@ -240,7 +243,7 @@ class ClientPool:
                 else:
                     wait = 5.0
                 n = len(self.clients)
-                print(f"[clients] all {n} client(s) unavailable, waiting {wait:.1f}s")
+                log.warning(f"[clients] all {n} client(s) unavailable, waiting {wait:.1f}s")
                 if wait > 30:
                     self._fire_alert("all_cooldown", f"🟡 All {n} Telegram client(s) cooling down, waiting {wait:.0f}s")
             # Lock released — sleep without blocking other callers
@@ -267,7 +270,7 @@ class ClientPool:
 
     def mark_broken(self, idx: int):
         self._broken[idx] = True
-        print(f"[clients] client {idx} marked as broken (auth key duplicated / invalidated)")
+        log.error(f"[clients] client {idx} marked as broken (auth key duplicated / invalidated)")
         self._fire_alert(f"broken:{idx}", f"🔴 Telegram client {idx} marked broken (auth key duplicated/invalidated)")
 
     def mark_broken_by_client(self, client: Client):
@@ -287,7 +290,7 @@ class ClientPool:
             return
         self._broken[idx] = True
         self._cooldown_until[idx] = time.time() + cooldown_s
-        print(f"[clients] client {idx} suspended {cooldown_s}s on AuthKeyDuplicated (transient) — will auto-recover")
+        log.error(f"[clients] client {idx} suspended {cooldown_s}s on AuthKeyDuplicated (transient) — will auto-recover")
         try:
             loop = asyncio.get_running_loop()
             task = loop.create_task(self._recover_auth(idx, cooldown_s))
@@ -299,7 +302,7 @@ class ClientPool:
     async def _recover_auth(self, idx: int, cooldown_s: int, attempt: int = 0):
         MAX_RECOVERY_ATTEMPTS = 10
         if attempt >= MAX_RECOVERY_ATTEMPTS:
-            print(f"[clients] client {idx} giving up recovery after {MAX_RECOVERY_ATTEMPTS} attempts — session may be permanently invalidated")
+            log.error(f"[clients] client {idx} giving up recovery after {MAX_RECOVERY_ATTEMPTS} attempts — session may be permanently invalidated")
             self._fire_alert(f"broken:{idx}:perm", f"🔴 Client {idx} failed to recover after {MAX_RECOVERY_ATTEMPTS} attempts — session may need manual renewal")
             return
         await asyncio.sleep(cooldown_s)
@@ -317,10 +320,10 @@ class ClientPool:
                 c.media_sessions.clear()
             self._broken[idx] = False
             self._cooldown_until.pop(idx, None)
-            print(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
+            log.error(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
         except AuthKeyDuplicated:
             next_cooldown = min(cooldown_s * 2, 600)  # cap at 10min
-            print(f"[clients] client {idx} still suspended — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
+            log.warning(f"[clients] client {idx} still suspended — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(self._recover_auth(idx, next_cooldown, attempt + 1))
@@ -329,7 +332,7 @@ class ClientPool:
             except RuntimeError:
                 pass
         except Exception as e:
-            print(f"[clients] client {idx} reconnect failed: {e}")
+            log.error(f"[clients] client {idx} reconnect failed: {e}")
 
     async def acquire_download_slot(self) -> Tuple[int, Client]:
         """Pick the client with the fewest active background DownloadTasks
@@ -356,7 +359,7 @@ class ClientPool:
                     wait = max(1.0, soonest - time.time())
                 else:
                     wait = 5.0
-                print(f"[clients] acquire_download_slot: all clients unavailable, waiting {wait:.1f}s")
+                log.warning(f"[clients] acquire_download_slot: all clients unavailable, waiting {wait:.1f}s")
             await asyncio.sleep(wait)
 
     def release_download_slot(self, idx: int) -> None:

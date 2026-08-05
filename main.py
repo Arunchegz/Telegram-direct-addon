@@ -12,6 +12,7 @@ Proxy logic (the core of this rewrite):
   3. Player never notices the switch.
 """
 from __future__ import annotations
+import logging
 
 import asyncio
 import hashlib
@@ -48,6 +49,14 @@ from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path, R_DL_STOPPED
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("tgstream.main")
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
 def get_peer_type_patched(peer_id: int) -> str:
@@ -152,7 +161,7 @@ def _log_task_exception(task: asyncio.Task):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[task] {type(e).__name__}: {e}")
+        log.info(f"[task] {type(e).__name__}: {e}")
 
 
 @asynccontextmanager
@@ -181,7 +190,7 @@ async def lifespan(app: FastAPI):
                 parse_mode=ParseMode.DISABLED,
             )
             await bot_client.start()
-            print("[notify] bot_client started (MTProto, used for reliable notify send/edit)")
+            log.info("[notify] bot_client started (MTProto, used for reliable notify send/edit)")
 
             if ADMIN_USER_ID:
                 async def _pyro_admin_command(client, message):
@@ -192,7 +201,7 @@ async def lifespan(app: FastAPI):
                         try:
                             await _handle_admin_command(message.chat.id, text)
                         except Exception as e:
-                            print(f"[bot] admin command failed: {type(e).__name__}: {e!r}")
+                            log.error(f"[bot] admin command failed: {type(e).__name__}: {e!r}")
 
                 async def _pyro_admin_callback(client, callback_query):
                     if not callback_query.from_user or str(callback_query.from_user.id) != ADMIN_USER_ID:
@@ -208,26 +217,26 @@ async def lifespan(app: FastAPI):
                     try:
                         await _handle_admin_callback(cq_dict)
                     except Exception as e:
-                        print(f"[bot] callback failed: {type(e).__name__}: {e!r}")
+                        log.error(f"[bot] callback failed: {type(e).__name__}: {e!r}")
 
                 bot_client.add_handler(MessageHandler(_pyro_admin_command, filters.private & filters.text))
                 bot_client.add_handler(CallbackQueryHandler(_pyro_admin_callback))
-                print(f"[bot] MTProto admin command/callback handlers registered for user {ADMIN_USER_ID}")
+                log.info(f"[bot] MTProto admin command/callback handlers registered for user {ADMIN_USER_ID}")
         except Exception as e:
-            print(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
+            log.error(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
             bot_client = None
         await _register_bot_commands()
     if CHANNEL_USERNAME:
         try:
             source_chat = await get_tg().get_chat(CHANNEL_USERNAME)
             source_chat_id = source_chat.id
-            print(f"[listener] Resolved source channel id: {source_chat_id}")
+            log.info(f"[listener] Resolved source channel id: {source_chat_id}")
         except Exception as e:
-            print(f"[listener] failed to resolve source channel id for delete listener: {e}")
+            log.error(f"[listener] failed to resolve source channel id for delete listener: {e}")
 
     # Register real-time Pyrogram update listener for instant prefetching on new channel posts
     async def _instant_sync_handler(client, message):
-        print(f"[listener] Pyrogram new post detected ({message.id}) — instant sync")
+        log.info(f"[listener] Pyrogram new post detected ({message.id}) — instant sync")
         try:
             media = message.video or message.document
             if media:
@@ -236,7 +245,7 @@ async def lifespan(app: FastAPI):
                     mid = st.movie_id(fn)
                     existing_movies = await st.load_movies(redis_client)
                     if mid not in existing_movies:
-                        print(f"[listener] instantly adding new movie to catalog: {mid}")
+                        log.info(f"[listener] instantly adding new movie to catalog: {mid}")
                         await st.save_movie(redis_client, mid, {
                             "message_id": message.id, "file_name": fn,
                             "file_size": media.file_size,
@@ -253,11 +262,11 @@ async def lifespan(app: FastAPI):
                             try:
                                 prefetch_queue.put_nowait(mid)
                             except asyncio.QueueFull:
-                                print(f"[listener] prefetch_queue full, skipping {mid}")
+                                log.warning(f"[listener] prefetch_queue full, skipping {mid}")
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=False))
         except Exception as se:
-            print(f"[listener] Pyrogram instant sync failed: {se}")
+            log.error(f"[listener] Pyrogram instant sync failed: {se}")
 
     async def _instant_delete_handler(client, update, users, chats):
         if not isinstance(update, UpdateDeleteChannelMessages):
@@ -271,14 +280,14 @@ async def lifespan(app: FastAPI):
             if removed:
                 await redis_client.set(st.R_SYNC_TS, str(time.time()))
         except Exception as se:
-            print(f"[listener] instant delete cleanup failed: {se}")
+            log.error(f"[listener] instant delete cleanup failed: {se}")
 
     if CHANNEL_USERNAME:
         chat_filter = filters.chat(CHANNEL_USERNAME)
         media_filter = filters.video | filters.document
         get_tg().add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))
         get_tg().add_handler(RawUpdateHandler(_instant_delete_handler))
-        print(f"[listener] Registered Pyrogram instant post/delete handlers for {CHANNEL_USERNAME}")
+        log.info(f"[listener] Registered Pyrogram instant post/delete handlers for {CHANNEL_USERNAME}")
 
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
@@ -296,11 +305,11 @@ async def lifespan(app: FastAPI):
             if msg_id:
                 _schedule(_send_channel_reaction(msg_id, "⚡"))
         except Exception as e:
-            print(f"[reaction] on_complete hook failed for {movie_id}: {type(e).__name__}: {e!r}")
+            log.error(f"[reaction] on_complete hook failed for {movie_id}: {type(e).__name__}: {e!r}")
 
     download_manager.on_complete = _on_download_complete
     client_pool.on_health_event = _notify_send
-    print(f"Pyrogram pool started ({len(client_pool)} client(s))")
+    log.info(f"Pyrogram pool started ({len(client_pool)} client(s))")
 
     _schedule(_sync_loop())
     for i in range(download_manager._max_concurrent_downloads):
@@ -336,7 +345,7 @@ async def _fetch_msg(msg_id: int, client: Client = None):
     try:
         return await c.get_messages(CHANNEL_USERNAME, msg_id)
     except AuthKeyDuplicated as ae:
-        print(f"[_fetch_msg] AuthKeyDuplicated on client. Suspending client: {ae}")
+        log.error(f"[_fetch_msg] AuthKeyDuplicated on client. Suspending client: {ae}")
         client_pool.suspend_auth(c)
         alt_c = get_tg()
         if alt_c != c and alt_c is not None and not client_pool.is_bot(alt_c):
@@ -359,7 +368,7 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
             removed.append((mid, movie.get("file_name", mid)))
 
     for mid, file_name in removed:
-        print(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
+        log.info(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
         await st.del_movie(redis_client, mid)
         await download_manager.evict(mid, redis_client, file_name=file_name)
         deferred_notifications.pop(mid, None)
@@ -383,9 +392,9 @@ async def _sweep_loop():
             n1 = byte_streamer.prune_msg_cache()
             n2 = await download_manager.prune_finished_tasks()
             if n1 or n2:
-                print(f"[sweep] pruned {n1} msg-cache entries, {n2} finished task entries")
+                log.info(f"[sweep] pruned {n1} msg-cache entries, {n2} finished task entries")
         except Exception as e:
-            print(f"[sweep] {e}")
+            log.info(f"[sweep] {e}")
 
 
 SYNC_POLL_S = int(os.getenv("SYNC_POLL_S", "120"))  # auto-detect new/removed movies
@@ -395,14 +404,14 @@ async def _sync_loop():
         try:
             await _sync_channel(force=False)
         except AuthKeyDuplicated:
-            print("[sync_loop] AuthKeyDuplicated, retrying instantly with healthy client")
+            log.error("[sync_loop] AuthKeyDuplicated, retrying instantly with healthy client")
             try:
                 if get_tg() is not None and not client_pool.is_bot(get_tg()):
                     await _sync_channel(force=False)
             except Exception as e:
-                print(f"[sync_loop] retry failed: {e}")
+                log.error(f"[sync_loop] retry failed: {e}")
         except Exception as e:
-            print(f"[sync_loop] {e}")
+            log.info(f"[sync_loop] {e}")
         await asyncio.sleep(SYNC_POLL_S)
 
 
@@ -422,10 +431,10 @@ async def _register_bot_commands():
     if bot_client and bot_client.is_connected:
         try:
             await bot_client.set_bot_commands([BotCommand(c, d) for c, d in commands])
-            print("[bot] command menu registered (via bot_client)")
+            log.info("[bot] command menu registered (via bot_client)")
             return
         except Exception as e:
-            print(f"[bot] set_bot_commands via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
+            log.error(f"[bot] set_bot_commands via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
@@ -434,11 +443,11 @@ async def _register_bot_commands():
                               json={"commands": [{"command": c, "description": d} for c, d in commands]})
             data = r.json()
             if data.get("ok"):
-                print("[bot] command menu registered")
+                log.info("[bot] command menu registered")
             else:
-                print(f"[bot] setMyCommands rejected: {data.get('description')}")
+                log.info(f"[bot] setMyCommands rejected: {data.get('description')}")
     except Exception as e:
-        print(f"[bot] setMyCommands failed: {type(e).__name__}: {e!r}")
+        log.error(f"[bot] setMyCommands failed: {type(e).__name__}: {e!r}")
 
 
 def _resolve_chat_id(raw: str) -> int | str:
@@ -469,9 +478,9 @@ async def _ensure_channel_reactions_enabled() -> None:
             peer=peer,
             available_reactions=ChatReactionsAll(),
         ))
-        print("[reaction] channel reactions set to ALL ✓")
+        log.info("[reaction] channel reactions set to ALL ✓")
     except Exception as e:
-        print(f"[reaction] could not enable all reactions (not admin?): {type(e).__name__}: {e!r}")
+        log.info(f"[reaction] could not enable all reactions (not admin?): {type(e).__name__}: {e!r}")
 
 
 async def _send_channel_reaction(message_id: int, emoji: str) -> None:
@@ -493,20 +502,20 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
                     reaction=[ReactionEmoji(emoticon=candidate)],
                 )
             )
-            print(f"[reaction] set {candidate} on msg {message_id}")
+            log.info(f"[reaction] set {candidate} on msg {message_id}")
             return
         except FloodWait as fw:
-            print(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
+            log.warning(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")
             return
         except ReactionInvalid:
             if attempt == 0 and candidate != REACTION_FALLBACK:
-                print(f"[reaction] {candidate} rejected on msg {message_id} "
+                log.info(f"[reaction] {candidate} rejected on msg {message_id} "
                       f"(channel reaction restrictions) — falling back to {REACTION_FALLBACK}")
                 continue
-            print(f"[reaction] failed for msg {message_id}: {candidate} invalid on this channel")
+            log.error(f"[reaction] failed for msg {message_id}: {candidate} invalid on this channel")
             return
         except Exception as e:
-            print(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
+            log.error(f"[reaction] failed for msg {message_id}: {type(e).__name__}: {e!r}")
             return
 
 
@@ -526,7 +535,7 @@ async def _get_our_reaction(message_id: int) -> str | None:
                     if rc.chosen_order is not None and isinstance(rc.reaction, _RE):
                         return rc.reaction.emoticon
     except Exception as e:
-        print(f"[reaction] get_our_reaction failed for msg {message_id}: {type(e).__name__}: {e!r}")
+        log.error(f"[reaction] get_our_reaction failed for msg {message_id}: {type(e).__name__}: {e!r}")
     return None
 
 
@@ -543,11 +552,11 @@ async def _clear_channel_reaction(message_id: int) -> None:
                 reaction=[],
             )
         )
-        print(f"[reaction] cleared reaction on msg {message_id}")
+        log.info(f"[reaction] cleared reaction on msg {message_id}")
     except FloodWait as fw:
-        print(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
+        log.info(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
     except Exception as e:
-        print(f"[reaction] clear failed for msg {message_id}: {type(e).__name__}: {e!r}")
+        log.error(f"[reaction] clear failed for msg {message_id}: {type(e).__name__}: {e!r}")
 
 
 async def _rescan_missing_files(movies: dict) -> int:
@@ -571,25 +580,25 @@ async def _rescan_missing_files(movies: dict) -> int:
                 f"tgstream:dl:ts:{mid}",
             )
             if stopped == b"1":
-                print(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
                       f"state reset, user-stopped, not requeueing")
                 continue
             try:
                 prefetch_queue.put_nowait(mid)
             except asyncio.QueueFull:
-                print(f"[rescan] prefetch_queue full, dropping {mid}")
-            print(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                log.info(f"[rescan] prefetch_queue full, dropping {mid}")
+            log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
                   f"reset, requeued prefetch")
             requeued += 1
         except Exception as e:
-            print(f"[rescan] error for {mid}: {type(e).__name__}: {e!r}")
+            log.error(f"[rescan] error for {mid}: {type(e).__name__}: {e!r}")
             continue
     if requeued:
-        print(f"[rescan] done: {requeued} file(s) missing, re-enqueued for prefetch")
+        log.info(f"[rescan] done: {requeued} file(s) missing, re-enqueued for prefetch")
         _schedule(_notify_send(f"♻️ Local cache was wiped by a restart — "
                                f"re-prefetching {requeued} movie(s)"))
     else:
-        print("[rescan] done: no missing files")
+        log.info("[rescan] done: no missing files")
     return requeued
 
 
@@ -601,11 +610,11 @@ async def _reconcile_reactions() -> None:
     Rate-limited: 0.5s between each API call to avoid FloodWait.
     """
     await asyncio.sleep(15)  # wait for pool + first sync to settle
-    print("[reaction] starting startup reconciliation scan...")
+    log.info("[reaction] starting startup reconciliation scan...")
     try:
         movies = await st.load_movies(redis_client)
     except Exception as e:
-        print(f"[reaction] reconcile aborted, could not load movies: {e}")
+        log.info(f"[reaction] reconcile aborted, could not load movies: {e}")
         return
 
     await _rescan_missing_files(movies)
@@ -642,10 +651,10 @@ async def _reconcile_reactions() -> None:
                     cleared += 1
             checked += 1
         except Exception as e:
-            print(f"[reaction] reconcile error for {mid}: {type(e).__name__}: {e!r}")
+            log.error(f"[reaction] reconcile error for {mid}: {type(e).__name__}: {e!r}")
             continue
 
-    print(f"[reaction] reconcile done: {checked} checked, {fixed} set ⚡, {cleared} corrected")
+    log.info(f"[reaction] reconcile done: {checked} checked, {fixed} set ⚡, {cleared} corrected")
 
 
 async def _notify_send(text: str) -> int | None:
@@ -661,7 +670,7 @@ async def _notify_send(text: str) -> int | None:
             msg = await bot_client.send_message(chat_id, text)
             return msg.id
         except Exception as pe:
-            print(f"[notify] bot_client send failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
+            log.error(f"[notify] bot_client send failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
 
     # Fallback: HTTP Bot API
     if not BOT_TOKEN:
@@ -672,7 +681,7 @@ async def _notify_send(text: str) -> int | None:
                               json={"chat_id": NOTIFY_CHAT_ID, "text": text})
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"[notify] HTTP send failed: {type(e).__name__}: {e!r}")
+        log.error(f"[notify] HTTP send failed: {type(e).__name__}: {e!r}")
         return None
 
 
@@ -689,13 +698,13 @@ async def _notify_edit(msg_id: int, text: str) -> float:
             await bot_client.edit_message_text(chat_id, msg_id, text)
             return 0
         except FloodWait as fw:
-            print(f"[notify] bot_client edit rate-limited, backing off {fw.value}s")
+            log.info(f"[notify] bot_client edit rate-limited, backing off {fw.value}s")
             return float(fw.value)
         except Exception as pe:
             desc = str(pe)
             if "MESSAGE_NOT_MODIFIED" in desc or "not modified" in desc.lower():
                 return 0
-            print(f"[notify] bot_client edit failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
+            log.error(f"[notify] bot_client edit failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
 
     # Fallback: HTTP Bot API
     if not BOT_TOKEN:
@@ -709,13 +718,13 @@ async def _notify_edit(msg_id: int, text: str) -> float:
                 desc = data.get("description", "")
                 if data.get("error_code") == 429:
                     wait = data.get("parameters", {}).get("retry_after", 3)
-                    print(f"[notify] HTTP rate-limited, backing off {wait}s")
+                    log.info(f"[notify] HTTP rate-limited, backing off {wait}s")
                     return float(wait)
                 if "not modified" not in desc:
-                    print(f"[notify] HTTP edit rejected: {desc}")
+                    log.info(f"[notify] HTTP edit rejected: {desc}")
             return 0
     except Exception as e:
-        print(f"[notify] HTTP edit failed: {type(e).__name__}: {e!r}")
+        log.error(f"[notify] HTTP edit failed: {type(e).__name__}: {e!r}")
         return 0
 
 
@@ -800,14 +809,14 @@ async def _bot_reply(chat_id, text: str):
             await bot_client.send_message(chat_id, text)
             return
         except Exception as e:
-            print(f"[bot] reply via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
+            log.error(f"[bot] reply via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(f"{_TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
     except Exception as e:
-        print(f"[bot] reply failed: {type(e).__name__}: {e!r}")
+        log.error(f"[bot] reply failed: {type(e).__name__}: {e!r}")
 
 
 LIST_PAGE_SIZE = 8
@@ -871,7 +880,7 @@ async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
             msg = await bot_client.send_message(chat_id, text, reply_markup=_to_pyro_markup(keyboard))
             return msg.id
         except Exception as e:
-            print(f"[bot] list send via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
+            log.error(f"[bot] list send via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return None
     try:
@@ -880,7 +889,7 @@ async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
                               json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"[bot] list send failed: {type(e).__name__}: {e!r}")
+        log.error(f"[bot] list send failed: {type(e).__name__}: {e!r}")
         return None
 
 
@@ -893,7 +902,7 @@ async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
             desc = str(e)
             if "MESSAGE_NOT_MODIFIED" in desc:
                 return
-            print(f"[bot] list edit via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
+            log.error(f"[bot] list edit via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
@@ -902,7 +911,7 @@ async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
                           json={"chat_id": chat_id, "message_id": message_id,
                                 "text": text, "reply_markup": keyboard})
     except Exception as e:
-        print(f"[bot] list edit failed: {type(e).__name__}: {e!r}")
+        log.error(f"[bot] list edit failed: {type(e).__name__}: {e!r}")
 
 
 async def _bot_answer_callback(callback_id: str, text: str | None = None):
@@ -911,7 +920,7 @@ async def _bot_answer_callback(callback_id: str, text: str | None = None):
             await bot_client.answer_callback_query(callback_id, text=text or "")
             return
         except Exception as e:
-            print(f"[bot] answerCallbackQuery via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
+            log.error(f"[bot] answerCallbackQuery via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
@@ -921,7 +930,7 @@ async def _bot_answer_callback(callback_id: str, text: str | None = None):
                 payload["text"] = text
             await c.post(f"{_TG_API}/answerCallbackQuery", json=payload)
     except Exception as e:
-        print(f"[bot] answerCallbackQuery failed: {type(e).__name__}: {e!r}")
+        log.error(f"[bot] answerCallbackQuery failed: {type(e).__name__}: {e!r}")
 
 
 async def _handle_admin_callback(cq: dict):
@@ -1048,18 +1057,18 @@ async def _bot_channel_listener():
     channel — no waiting for SYNC_POLL_S. Falls back to normal poll
     loop if BOT_TOKEN not set."""
     if DISABLE_BOT_LISTENER:
-        print("[listener] DISABLE_BOT_LISTENER is true, skipping instant-post listener")
+        log.warning("[listener] DISABLE_BOT_LISTENER is true, skipping instant-post listener")
         return
     if not BOT_TOKEN:
-        print("[listener] BOT_TOKEN not set, skipping instant-post listener")
+        log.warning("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
     if bot_client and bot_client.is_connected:
-        print("[listener] MTProto bot_client is active, skipping HTTP long-poll updates listener")
+        log.warning("[listener] MTProto bot_client is active, skipping HTTP long-poll updates listener")
         return
     if ADMIN_USER_ID:
-        print(f"[listener] admin commands enabled for user {ADMIN_USER_ID}")
+        log.info(f"[listener] admin commands enabled for user {ADMIN_USER_ID}")
     else:
-        print("[listener] ADMIN_USER_ID not set — /status /pause /resume /evict /find disabled")
+        log.info("[listener] ADMIN_USER_ID not set — /status /pause /resume /evict /find disabled")
     offset = 0
     async with httpx.AsyncClient(timeout=45) as poll_client:
         while True:
@@ -1069,21 +1078,21 @@ async def _bot_channel_listener():
                     "allowed_updates": '["channel_post","message","callback_query"]',
                 })
                 if r.status_code != 200:
-                    print(f"[listener] HTTP error {r.status_code}: {r.text[:200]}")
+                    log.error(f"[listener] HTTP error {r.status_code}: {r.text[:200]}")
                     await asyncio.sleep(15)
                     continue
 
                 try:
                     data = r.json()
                 except Exception as je:
-                    print(f"[listener] JSON decode failed: {je}. Response: {r.text[:200]}")
+                    log.error(f"[listener] JSON decode failed: {je}. Response: {r.text[:200]}")
                     await asyncio.sleep(15)
                     continue
 
                 if not data.get("ok"):
                     desc = data.get("description", "Unknown error")
                     err_code = data.get("error_code")
-                    print(f"[listener] Telegram error {err_code}: {desc}")
+                    log.error(f"[listener] Telegram error {err_code}: {desc}")
                     await asyncio.sleep(15)
                     continue
 
@@ -1091,7 +1100,7 @@ async def _bot_channel_listener():
                     offset = upd["update_id"] + 1
                     post = upd.get("channel_post")
                     if post and (post.get("video") or post.get("document")):
-                        print("[listener] new channel post detected — instant sync")
+                        log.info("[listener] new channel post detected — instant sync")
                         try:
                             # force=False: respect SYNC_INTERVAL cooldown.
                             # This path only active when bot_client is absent
@@ -1099,7 +1108,7 @@ async def _bot_channel_listener():
                             # catalog update when bot_client is present).
                             await _sync_channel(force=False)
                         except Exception as e:
-                            print(f"[listener] sync failed: {e}")
+                            log.error(f"[listener] sync failed: {e}")
                         continue
 
                     dm = upd.get("message")
@@ -1110,7 +1119,7 @@ async def _bot_channel_listener():
                             try:
                                 await _handle_admin_command(dm["chat"]["id"], text)
                             except Exception as e:
-                                print(f"[listener] admin command failed: {e}")
+                                log.error(f"[listener] admin command failed: {e}")
                         continue
 
                     cq = upd.get("callback_query")
@@ -1120,9 +1129,9 @@ async def _bot_channel_listener():
                             try:
                                 await _handle_admin_callback(cq)
                             except Exception as e:
-                                print(f"[listener] callback failed: {e}")
+                                log.error(f"[listener] callback failed: {e}")
             except Exception as e:
-                print(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
+                log.error(f"[listener] poll error ({type(e).__name__}): {repr(e)}")
                 if not isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
                     traceback.print_exc()
                 await asyncio.sleep(10)
@@ -1145,12 +1154,12 @@ async def _prefetch_worker(worker_id: int = 0):
         reporter = None  # must be defined before try so except/finally can always cancel it
         try:
             if download_manager.paused:
-                print(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
+                log.info(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
                 await asyncio.sleep(15)
                 try:
                     prefetch_queue.put_nowait(movie_id)
                 except asyncio.QueueFull:
-                    print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on pause requeue")
+                    log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on pause requeue")
                 continue
             movies = await _get_movies()
             m = movies.get(movie_id)
@@ -1160,9 +1169,9 @@ async def _prefetch_worker(worker_id: int = 0):
             file_size = m.get("file_size") or 0
             message_id = m.get("message_id")
             if not file_size or not message_id:
-                print(f"[prefetch:{worker_id}] skipping {movie_id}: missing file_size or message_id in index")
+                log.warning(f"[prefetch:{worker_id}] skipping {movie_id}: missing file_size or message_id in index")
                 continue
-            print(f"[prefetch:{worker_id}] starting {movie_id} ({fn})")
+            log.info(f"[prefetch:{worker_id}] starting {movie_id} ({fn})")
 
             # Start download task first so it starts instantly
             task = await download_manager.get_or_create(
@@ -1202,14 +1211,14 @@ async def _prefetch_worker(worker_id: int = 0):
                     # Replace 👨💻 with ⚡ on the channel post to signal download complete
                     _schedule(_send_channel_reaction(message_id, "⚡"))
                 elif stopped == b"1":
-                    print(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
+                    log.info(f"[prefetch:{worker_id}] {movie_id} explicitly stopped, not requeueing")
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
                 else:
-                    print(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
+                    log.info(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
                     try:
                         prefetch_queue.put_nowait(movie_id)
                     except asyncio.QueueFull:
-                        print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on preempt requeue")
+                        log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on preempt requeue")
             else:
                 done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
@@ -1223,7 +1232,7 @@ async def _prefetch_worker(worker_id: int = 0):
                 else:
                     # another download (priority or another prefetch) is
                     # active right now — wait a bit, then retry
-                    print(f"[prefetch:{worker_id}] {movie_id} deferred, another download active")
+                    log.info(f"[prefetch:{worker_id}] {movie_id} deferred, another download active")
                     if msg_id:
                         await _notify_edit(msg_id, f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
                     else:
@@ -1234,10 +1243,10 @@ async def _prefetch_worker(worker_id: int = 0):
                     try:
                         prefetch_queue.put_nowait(movie_id)
                     except asyncio.QueueFull:
-                        print(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on deferred requeue")
-            print(f"[prefetch:{worker_id}] finished {movie_id}")
+                        log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on deferred requeue")
+            log.info(f"[prefetch:{worker_id}] finished {movie_id}")
         except Exception as e:
-            print(f"[prefetch:{worker_id}] {movie_id} failed: {e}")
+            log.error(f"[prefetch:{worker_id}] {movie_id} failed: {e}")
             if reporter is not None and not reporter.done():
                 reporter.cancel()
         finally:
@@ -1282,7 +1291,7 @@ async def _sync_channel(force: bool = False) -> int:
             max_id_seen = min_id
             active_tg = get_tg()
             if active_tg is None or client_pool.is_bot(active_tg) or not active_tg.is_connected:
-                print("[sync] no healthy user client available (all suspended/broken) — skipping sync pass")
+                log.error("[sync] no healthy user client available (all suspended/broken) — skipping sync pass")
                 return 0
             try:
                 # Pyrogram 2.x get_chat_history has no min_id filter — it
@@ -1312,7 +1321,7 @@ async def _sync_channel(force: bool = False) -> int:
                         max_id_seen = max(max_id_seen, msg.id)
                     except Exception: continue
             except AuthKeyDuplicated as ae:
-                print(f"[sync] AuthKeyDuplicated on client. Suspending client: {ae}")
+                log.error(f"[sync] AuthKeyDuplicated on client. Suspending client: {ae}")
                 client_pool.suspend_auth(active_tg)
                 raise ae
 
@@ -1322,7 +1331,7 @@ async def _sync_channel(force: bool = False) -> int:
 
             new_ids = found_ids - existing_ids
             for mid in new_ids:
-                print(f"Sync: new movie detected, enqueueing for prefetch: {mid}")
+                log.info(f"Sync: new movie detected, enqueueing for prefetch: {mid}")
                 stopped = await redis_client.get(R_DL_STOPPED.format(mid))
                 if stopped != b"1":
                     try:
@@ -1331,7 +1340,7 @@ async def _sync_channel(force: bool = False) -> int:
                         if mid in found_msg_ids:
                             _schedule(_send_channel_reaction(found_msg_ids[mid], "👨‍💻"))
                     except asyncio.QueueFull:
-                        print(f"Sync: prefetch_queue full, skipping {mid}")
+                        log.warning(f"Sync: prefetch_queue full, skipping {mid}")
 
             # Clean up deleted movies — only meaningful on a full walk;
             # an incremental (min_id) pass never sees old messages so it
@@ -1340,7 +1349,7 @@ async def _sync_channel(force: bool = False) -> int:
             if do_full:
                 removed_ids = existing_ids - found_ids
                 for mid in removed_ids:
-                    print(f"Sync: removing deleted movie {mid} from index")
+                    log.info(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(redis_client, mid)
                     await download_manager.evict(mid, redis_client,
                                                  file_name=existing_movies.get(mid, {}).get("file_name"))
@@ -1359,7 +1368,7 @@ async def _sync_channel(force: bool = False) -> int:
             if max_id_seen > min_id:
                 await redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
             await redis_client.set(st.R_SYNC_TS, str(time.time()))
-            print(f"Sync: {count} new/updated movies ({'full' if do_full else 'incremental'})")
+            log.info(f"Sync: {count} new/updated movies ({'full' if do_full else 'incremental'})")
             return await redis_client.hlen(st.R_MOVIES)
         finally:
             await redis_client.delete(st.R_SYNC_LCK)
@@ -1398,7 +1407,7 @@ async def manual_sync(request: Request):
     try:
         return {"synced": await _sync_channel(force=True)}
     except AuthKeyDuplicated:
-        print("[sync] Retrying manual sync after marking previous client broken")
+        log.error("[sync] Retrying manual sync after marking previous client broken")
         return {"synced": await _sync_channel(force=True)}
 
 
@@ -1466,36 +1475,34 @@ async def debug_downloads(request: Request):
 async def catalog(type: str, id: str):
     movies = await _get_movies()
     def is_series(m): return bool(st.IS_SERIES_RE.search(m.get("file_name","")))
-    
+
+    # Semaphore limits concurrent Redis/HTTP calls — all items fly in parallel
+    # within the concurrency cap instead of serialising batch-by-batch.
+    _catalog_sem = asyncio.Semaphore(5)
+
     if type == "movie":
         filtered = {mid: m for mid, m in movies.items() if not is_series(m)}
         async def build(mid, m):
-            fn = m.get("file_name","Unknown")
-            try:
-                poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
-            except Exception as e:
-                print(f"[catalog] Poster fetch failed for {fn}: {e}")
-                poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
-            title, year = st.parse_title_year(fn)
-            meta = {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
-                    "poster": poster, "posterShape": "poster", "year": year}
-            if imdb_id:
-                meta["imdb_id"] = imdb_id
-            return meta
-        # Process movies in batches to avoid overwhelming Redis
-        metas = []
-        batch_size = 5
-        items = list(filtered.items())
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i+batch_size]
-            batch_metas = await asyncio.gather(*[build(mid, m) for mid, m in batch], return_exceptions=True)
-            for result in batch_metas:
-                if isinstance(result, Exception):
-                    print(f"[catalog] Build failed: {result}")
-                else:
-                    metas.append(result)
-        return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
-    
+            async with _catalog_sem:
+                fn = m.get("file_name","Unknown")
+                try:
+                    poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
+                except Exception as e:
+                    log.error(f"[catalog] Poster fetch failed for {fn}: {e}")
+                    poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
+                title, year = st.parse_title_year(fn)
+                meta = {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
+                        "poster": poster, "posterShape": "poster", "year": year}
+                if imdb_id:
+                    meta["imdb_id"] = imdb_id
+                return meta
+        results = await asyncio.gather(*[build(mid, m) for mid, m in filtered.items()], return_exceptions=True)
+        metas = [r for r in results if not isinstance(r, Exception)]
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"[catalog] Build failed: {r}")
+        return JSONResponse({"metas": metas}, headers={"Cache-Control": "no-store"})
+
     else:  # type == "series"
         series_groups = {}
         for mid, m in movies.items():
@@ -1506,38 +1513,32 @@ async def catalog(type: str, id: str):
             if sid not in series_groups:
                 series_groups[sid] = {"title": show_title, "files": []}
             series_groups[sid]["files"].append((mid, m))
-            
+
         async def build_series(sid, group):
-            fn = group["files"][0][1].get("file_name","Unknown")
-            try:
-                poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
-            except Exception as e:
-                print(f"[catalog] Poster fetch failed for {fn}: {e}")
-                poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
-            year = ""
-            for _, m in group["files"]:
-                _, y = st.parse_title_year(m.get("file_name",""))
-                if y:
-                    year = y
-                    break
-            meta = {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
-                    "poster": poster, "posterShape": "poster", "year": year}
-            if imdb_id:
-                meta["imdb_id"] = imdb_id
-            return meta
-        # Process series in batches to avoid overwhelming Redis
-        metas = []
-        batch_size = 5
-        items = list(series_groups.items())
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i+batch_size]
-            batch_metas = await asyncio.gather(*[build_series(sid, group) for sid, group in batch], return_exceptions=True)
-            for result in batch_metas:
-                if isinstance(result, Exception):
-                    print(f"[catalog] Build failed: {result}")
-                else:
-                    metas.append(result)
-        return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
+            async with _catalog_sem:
+                fn = group["files"][0][1].get("file_name","Unknown")
+                try:
+                    poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
+                except Exception as e:
+                    log.error(f"[catalog] Poster fetch failed for {fn}: {e}")
+                    poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
+                year = ""
+                for _, m in group["files"]:
+                    _, y = st.parse_title_year(m.get("file_name",""))
+                    if y:
+                        year = y
+                        break
+                meta = {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
+                        "poster": poster, "posterShape": "poster", "year": year}
+                if imdb_id:
+                    meta["imdb_id"] = imdb_id
+                return meta
+        results = await asyncio.gather(*[build_series(sid, group) for sid, group in series_groups.items()], return_exceptions=True)
+        metas = [r for r in results if not isinstance(r, Exception)]
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"[catalog] Build failed: {r}")
+        return JSONResponse({"metas": metas}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/meta/{type}/{id}.json")
@@ -1592,7 +1593,7 @@ async def meta(type: str, id: str):
         try:
             poster = await st.get_poster(redis_client, fn)
         except Exception as e:
-            print(f"[meta] Poster fetch failed for {fn}: {e}")
+            log.error(f"[meta] Poster fetch failed for {fn}: {e}")
             poster = "https://via.placeholder.com/300x450?text=No+Poster"
         return JSONResponse({"meta": {"id": id, "type": type, "name": title or fn, "year": year,
             "poster": poster, "description": fn, "posterShape": "poster"}})
@@ -1607,7 +1608,7 @@ async def meta(type: str, id: str):
         try:
             poster = await st.get_poster(redis_client, fn)
         except Exception as e:
-            print(f"[meta] Poster fetch failed for {fn}: {e}")
+            log.error(f"[meta] Poster fetch failed for {fn}: {e}")
             poster = "https://via.placeholder.com/300x450?text=No+Poster"
         year = ""
         for m in matching_files:
@@ -1672,7 +1673,7 @@ async def stream(type: str, id: str):
                 if fs:
                     _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
             except Exception as e:
-                print(f"[stream] warn: {e}")
+                log.warning(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid, m.get("file_name"))
             label = "TGStream ⚡" if cached else "TGStream"
@@ -1703,7 +1704,7 @@ async def stream(type: str, id: str):
                     if fs:
                         _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
                 except Exception as e:
-                    print(f"[stream] warn: {e}")
+                    log.warning(f"[stream] warn: {e}")
                 
                 q   = m.get("quality","Unknown")
                 sz  = m.get("file_size_text","Unknown")
@@ -1730,7 +1731,7 @@ async def stream(type: str, id: str):
         fs = movie.get("file_size") or media.file_size
         _schedule(_ensure_download(clean, fs, movie["message_id"], movie.get("file_name")))
     except Exception as e:
-        print(f"[stream] warn: {e}")
+        log.warning(f"[stream] warn: {e}")
     fn  = movie.get("file_name","Unknown")
     q   = movie.get("quality","Unknown")
     sz  = movie.get("file_size_text","Unknown")
@@ -1797,7 +1798,7 @@ async def subtitles(type: str, id: str):
             if r.status_code == 200:
                 return JSONResponse(r.json())
     except Exception as e:
-        print(f"[subtitles] failed to fetch from OpenSubtitles: {e}")
+        log.error(f"[subtitles] failed to fetch from OpenSubtitles: {e}")
         
     return JSONResponse({"subtitles": []})
 
@@ -2112,11 +2113,11 @@ async def delete_media(movie_id: str, delete_tg: bool = False, x_api_key: str | 
         try:
             await active_tg.delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
         except AuthKeyDuplicated as ae:
-            print(f"[delete_media] AuthKeyDuplicated on client. Suspending client: {ae}")
+            log.error(f"[delete_media] AuthKeyDuplicated on client. Suspending client: {ae}")
             client_pool.suspend_auth(active_tg)
             await get_tg().delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
         except Exception as e:
-            print(f"[delete_media] failed to delete from Telegram: {e}")
+            log.error(f"[delete_media] failed to delete from Telegram: {e}")
             raise HTTPException(status_code=502, detail=f"Failed to delete from Telegram: {e}")
             
     # 3. Delete from index

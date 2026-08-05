@@ -9,6 +9,7 @@ Rate limit strategies:
   4. Adaptive chunking (smaller chunks when rate limited)
 """
 from __future__ import annotations
+import logging
 import asyncio
 import os
 import random
@@ -27,6 +28,8 @@ MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))  # Throttle between G
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
 MAX_MSG_CACHE_SIZE = 500   # Auto-prune message cache above this threshold
+
+log = logging.getLogger("tgstream.streamer")
 
 
 class ByteStreamer:
@@ -84,12 +87,12 @@ class ByteStreamer:
         wait_s = min(flood_wait_s * jitter, MAX_BACKOFF_S)
         until = time.time() + wait_s
         self._backoff_until[(c_idx, dc_id)] = until
-        print(f"[streamer] Client {c_idx} DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
+        log.warning(f"[streamer] Client {c_idx} DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
         try:
             from metrics import metrics
             await metrics.record_rate_limit(dc_id, wait_s)
         except Exception as e:
-            print(f"[streamer] metrics error: {e}")
+            log.error(f"[streamer] metrics error: {e}")
         await asyncio.sleep(wait_s)
 
     async def _get_fresh_msg(self, chat_id: int, message_id: int, client: Client, client_idx: int | None):
@@ -183,7 +186,7 @@ class ByteStreamer:
             until = self._backoff_until[backoff_key]
             if time.time() < until:
                 remaining = until - time.time()
-                print(f"[streamer] Waiting for Client {cur_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
+                log.info(f"[streamer] Waiting for Client {cur_c_idx} DC {dc_id} backoff: {remaining:.1f}s")
                 await asyncio.sleep(remaining)
             del self._backoff_until[backoff_key]
 

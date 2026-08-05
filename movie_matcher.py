@@ -3,23 +3,14 @@ import re
 import httpx
 from rapidfuzz import fuzz
 
-from state import parse_title_year as _state_parse_title_year
+from state import parse_title_year as _state_parse_title_year, _get_http_client
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 TMDB_URL = "https://api.themoviedb.org/3"
 CINEMETA_URL = "https://v3-cinemeta.strem.io"
 
-# Shared connection-pooled client — avoids a TLS handshake per resolve call.
-# Mirrors the pattern in state.py (_get_http_client).
-_http_client: httpx.AsyncClient | None = None
-
-
-def _get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=10, follow_redirects=True)
-    return _http_client
+# HTTP client is shared with state.py — single connection pool, no duplicate TLS handshakes.
 
 
 # --------------------------------------------------
