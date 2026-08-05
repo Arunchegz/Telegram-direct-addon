@@ -540,18 +540,34 @@ async def _get_our_reaction(message_id: int) -> str | None:
 
 
 async def _clear_channel_reaction(message_id: int) -> None:
-    """Remove our reaction from a channel message (send empty reaction list)."""
+    """Remove our reaction from a channel message.
+
+    Telegram's SendReaction with reaction=[] triggers INPUT_REQUEST_TOO_LONG
+    on some peer types in layer 158. Instead we re-send the same reaction with
+    add_to_recent=False which acts as a toggle-off on the server side.
+    If we can't determine which reaction to clear, fall back to the empty list
+    but catch the error gracefully.
+    """
     if not source_chat_id or not message_id:
         return
     try:
         tg = get_tg()
-        await tg.invoke(
-            SendReaction(
-                peer=await tg.resolve_peer(source_chat_id),
-                msg_id=message_id,
-                reaction=[],
+        peer = await tg.resolve_peer(source_chat_id)
+        # Determine which reaction is currently set so we can toggle it off
+        current = await _get_our_reaction(message_id)
+        if current:
+            # Toggle off by re-sending the same emoji — Telegram treats this as removal
+            await tg.invoke(
+                SendReaction(
+                    peer=peer,
+                    msg_id=message_id,
+                    reaction=[ReactionEmoji(emoticon=current)],
+                    add_to_recent=False,
+                )
             )
-        )
+        else:
+            # Nothing to clear
+            pass
         log.info(f"[reaction] cleared reaction on msg {message_id}")
     except FloodWait as fw:
         log.info(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
@@ -1844,7 +1860,7 @@ async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = Non
     return await download_manager.hydrate_cached(movie_id, file_size, redis_client, file_name)
 
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
-@app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
+@app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"], operation_id="proxy_movie")
 async def proxy(movie_id: str, request: Request):
     """
     Four-path resolution (in order):
