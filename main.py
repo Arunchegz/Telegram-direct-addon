@@ -502,7 +502,7 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
                     reaction=[ReactionEmoji(emoticon=candidate)],
                 )
             )
-            log.info(f"[reaction] set {candidate} on msg {message_id}")
+            log.debug(f"[reaction] set {candidate} on msg {message_id}")
             return
         except FloodWait as fw:
             log.warning(f"[reaction] flood-wait {fw.value}s, skipping reaction for msg {message_id}")

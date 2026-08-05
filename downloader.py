@@ -419,7 +419,7 @@ class DownloadTask:
                             start_mb = current_pos / 1024 / 1024
                             end_mb = (current_pos + request_chunk) / 1024 / 1024
                             c_num = c_idx if c_idx is not None else 0
-                            log.info(f"[dl:{self.movie_id}] client {c_num} downloading {start_mb:.1f}-{end_mb:.1f} MB")
+                            log.debug(f"[dl:{self.movie_id}] client {c_num} downloading {start_mb:.1f}-{end_mb:.1f} MB")
 
                             async for piece in self.streamer.yield_file(
                                 msg,
