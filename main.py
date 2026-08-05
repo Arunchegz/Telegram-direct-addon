@@ -291,6 +291,7 @@ async def lifespan(app: FastAPI):
 
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
+    download_manager.streamer = byte_streamer
     download_manager.on_alert = _notify_send
     download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)
 
@@ -327,15 +328,25 @@ async def lifespan(app: FastAPI):
         await bot_client.stop()
     await redis_client.aclose()
     await st.close_http_client()
-    # Close movie_matcher's shared http client
-    import movie_matcher as _mm
-    if _mm._http_client is not None and not _mm._http_client.is_closed:
-        await _mm._http_client.aclose()
 
 
 app = FastAPI(title="TGStream", version="2.0.0", lifespan=lifespan, docs_url="/api/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["GET", "HEAD", "OPTIONS"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def _count_http_request(request: Request, call_next):
+    """Feeds the /api/metrics 'http' block — record_http_request was defined
+    but never called, leaving total_requests/errors permanently zero."""
+    try:
+        response = await call_next(request)
+        await metrics.record_http_request(response.status_code < 500)
+        return response
+    except Exception:
+        await metrics.record_http_request(False)
+        raise
+
 
 app.mount("/dashboard", StaticFiles(directory="static", html=True), name="dashboard")
 
@@ -394,7 +405,7 @@ async def _sweep_loop():
             if n1 or n2:
                 log.info(f"[sweep] pruned {n1} msg-cache entries, {n2} finished task entries")
         except Exception as e:
-            log.info(f"[sweep] {e}")
+            log.error(f"[sweep] {e}")
 
 
 SYNC_POLL_S = int(os.getenv("SYNC_POLL_S", "120"))  # auto-detect new/removed movies
@@ -411,7 +422,7 @@ async def _sync_loop():
             except Exception as e:
                 log.error(f"[sync_loop] retry failed: {e}")
         except Exception as e:
-            log.info(f"[sync_loop] {e}")
+            log.error(f"[sync_loop] sync failed: {e}")
         await asyncio.sleep(SYNC_POLL_S)
 
 
@@ -991,10 +1002,11 @@ async def _handle_admin_callback(cq: dict):
 async def _handle_admin_command(chat_id, text: str):
     """Minimal remote control over DM. Only responds to ADMIN_USER_ID."""
     parts = text.strip().split(maxsplit=1)
-    cmd = parts[0].lower()
+    # Strip the @botname suffix so "/status@MyBot" matches "/status"
+    cmd = parts[0].lower().split("@")[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd in ("/status", "/status@" ):
+    if cmd == "/status":
         uptime_s = time.time() - _START_TIME
         uptime = f"{uptime_s/3600:.1f}h" if uptime_s > 3600 else f"{uptime_s/60:.0f}m"
         healthy = client_pool.healthy_count()
@@ -1028,6 +1040,10 @@ async def _handle_admin_command(chat_id, text: str):
         if arg not in movies:
             await _bot_reply(chat_id, f"Not found: {arg}")
             return
+        # Mark explicitly stopped so the prefetch worker doesn't instantly
+        # requeue the movie after the task is cancelled (matches the API
+        # /api/media/{id}/evict semantics).
+        await redis_client.set(R_DL_STOPPED.format(arg), "1", ex=86400)
         await download_manager.evict(arg, redis_client, file_name=movies[arg].get("file_name"))
         await _bot_reply(chat_id, f"🗑 Evicted: {arg}")
 
@@ -1820,6 +1836,8 @@ async def subtitles(type: str, id: str):
 
 
 async def _ensure_download(movie_id: str, file_size: int, message_id: int, file_name: str = None):
+    # A play request overrides a previous explicit pause/evict.
+    await redis_client.delete(R_DL_STOPPED.format(movie_id))
     await download_manager.get_or_create(
         movie_id=movie_id, file_size=file_size, message_id=message_id,
         redis=redis_client, byte_streamer=byte_streamer, fetch_msg_fn=_fetch_msg,
@@ -1842,7 +1860,12 @@ async def _yield_local_file(dl_file, start: int, length: int, request: Request):
         if await request.is_disconnected():
             break
         size = min(LOCAL_READ_CHUNK, length - sent)
-        data = await dl_file.pread(start + sent, size)
+        try:
+            data = await dl_file.pread(start + sent, size)
+        except OSError:
+            # File evicted/unlinked mid-stream (LRU eviction, delete) —
+            # end the stream cleanly instead of aborting the connection.
+            break
         if not data:
             break
         sent += len(data)
@@ -1937,21 +1960,28 @@ async def proxy(movie_id: str, request: Request):
 
     # Path selection and capping
     use_path = None
+    waited = False  # set when Path B's short wait converted to local
     if covered > 0 and (req_start + covered - 1) >= req_end:
         # Path A: Range fully in local SparseFile
         use_path = "local"
         end = req_end
     elif covered > 0 and (req_start + covered - 1) >= req_end - SHORT_WAIT_GRACE_BYTES:
-        # Path B: almost there, wait briefly then re-check
-        if task:
+        # Path B: almost there, wait briefly then re-check. A done task will
+        # never fire its progress event again — skip the wasted timeout wait.
+        if task and not task.is_done():
             try:
                 await asyncio.wait_for(task.progress_event().wait(), timeout=WAIT_TIMEOUT_S)
             except asyncio.TimeoutError:
                 pass
-            covered = dl_map.covered_prefix(req_start)
+            # Task/map/file may have been replaced (preempted, evicted, restarted)
+            # while we waited — refresh before re-checking coverage.
+            dl_map  = download_manager.get_map(movie_id)
+            dl_file = download_manager.get_file(movie_id)
+            covered = dl_map.covered_prefix(req_start) if (dl_map and dl_file and dl_file.exists()) else 0
             if covered > 0 and (req_start + covered - 1) >= req_end:
                 use_path = "local"
                 end = req_end
+                waited = True
     if use_path is None and covered >= LOCAL_READY_BYTES:
         # Path C: Mixed local prefix + live Telegram tail
         use_path = "mixed"
@@ -1984,7 +2014,7 @@ async def proxy(movie_id: str, request: Request):
 
     # ── Path A: fully local ───────────────────────────────────────────────────
     if use_path == "local":
-        await metrics.record_stream_path("local")
+        await metrics.record_stream_path("local-waited" if waited else "local")
         await metrics.record_cache_hit(total)
         return StreamingResponse(
             _yield_local_file(dl_file, start, total, request),

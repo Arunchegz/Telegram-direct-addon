@@ -38,6 +38,7 @@ class ByteStreamer:
         self.client = client
         self._last_invoke_time: dict = {}      # key: c_idx (None for single-client mode)
         self._throttle_locks: dict = {}        # per-client lock, created lazily
+        self._getfile_locks: dict = {}         # per-client lock serializing GetFile (throttle sleep + invoke)
         self._session_locks: dict = {}         # Lock to serialize session creation per client
         self._backoff_until = {}  # Per-client and DC backoff state: {(c_idx, dc_id): until_timestamp}
         self._msg_cache: dict = {}  # (chat_id, msg_id, c_idx) -> (msg, fetched_at)
@@ -46,7 +47,13 @@ class ByteStreamer:
         # serializing every stream in the process through a single global lock.
         pool_size = len(client) if hasattr(client, "__len__") else 1
         concurrency = max(MAX_CONCURRENT_GETFILE, pool_size)
-        self._concurrent_semaphore = asyncio.Semaphore(concurrency)  # Global concurrency limit
+        # Background (prefetch/download) GetFile concurrency — capped so a
+        # background task can never exhaust MTProto headroom.
+        self._download_semaphore = asyncio.Semaphore(concurrency)
+        # Live (proxy playback) GetFile concurrency — a SEPARATE pool so live
+        # chunks never queue behind a background batch (which holds its slot
+        # for two 600ms-throttled 1MB calls).
+        self._live_semaphore = asyncio.Semaphore(concurrency)
 
         # Live-playback priority: counts requests currently pulling bytes
         # for active/foreground streaming (Path C tail + Path D). Background
@@ -94,6 +101,19 @@ class ByteStreamer:
             if elapsed < min_ms:
                 await asyncio.sleep((min_ms - elapsed) / 1000)
             self._last_invoke_time[c_idx] = time.time()
+
+    def _getfile_slot(self, c_idx, is_background: bool):
+        """Per-client GetFile lock + concurrency semaphore for one request.
+
+        The per-client lock is held across the throttle sleep AND the invoke,
+        so two coroutines can never hit the same session simultaneously —
+        the throttle alone only serialized the sleep, letting GetFile calls
+        from concurrent downloads/live streams pile up on one client.
+        """
+        return (
+            self._getfile_locks.setdefault(c_idx, asyncio.Lock()),
+            self._download_semaphore if is_background else self._live_semaphore,
+        )
 
     async def _wait_backoff(self, dc_id: int, flood_wait_s: int, c_idx: int | None = None) -> None:
         """Exponential backoff with jitter on FloodWait."""
@@ -213,11 +233,13 @@ class ByteStreamer:
         # ── First chunk ───────────────────────────────────────────────────────
         while True:
             try:
-                async with self._concurrent_semaphore:
+                getfile_lock, getfile_sem = self._getfile_slot(cur_c_idx, is_background)
+                async with getfile_lock:
                     await throttle(cur_c_idx)
-                    r = await session.invoke(
-                        raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
-                    )
+                    async with getfile_sem:
+                        r = await session.invoke(
+                            raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
+                        )
                 break  # success
             except (FloodWait, Timeout, RpcConnectFailed) as e:
                 if not _retry or retries >= self.MAX_YIELD_RETRIES:
@@ -286,14 +308,16 @@ class ByteStreamer:
             fid = _extract_fid(msg)
             loc = _location(fid)
 
-            await throttle(cur_c_idx)
             while True:
                 try:
                     current_session = await self._session(cur_c, fid)
-                    async with self._concurrent_semaphore:
-                        r = await current_session.invoke(
-                            raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
-                        )
+                    getfile_lock, getfile_sem = self._getfile_slot(cur_c_idx, is_background)
+                    async with getfile_lock:
+                        await throttle(cur_c_idx)
+                        async with getfile_sem:
+                            r = await current_session.invoke(
+                                raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
+                            )
                     break  # success
                 except (FloodWait, Timeout, RpcConnectFailed) as e:
                     if not _retry or retries >= self.MAX_YIELD_RETRIES:

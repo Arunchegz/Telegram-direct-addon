@@ -8,7 +8,7 @@ import unittest
 import json
 from state import (
     parse_title_year,
-    parse_series,
+    parse_season_episode,
     fmt_size,
     movie_id,
     quality,
@@ -33,10 +33,10 @@ class TestStateHelpers(unittest.TestCase):
             with self.subTest(fn=fn):
                 self.assertEqual(parse_title_year(fn), expected)
 
-    def test_parse_series(self):
-        self.assertEqual(parse_series("Breaking.Bad.S05E14.Ozymandias.1080p.mkv"), {"season": 5, "episode": 14})
-        self.assertEqual(parse_series("Friends Season 2 Episode 10.mp4"), {"season": 2, "episode": 10})
-        self.assertIsNone(parse_series("The Matrix 1999.mkv"))
+    def test_parse_season_episode(self):
+        self.assertEqual(parse_season_episode("Breaking.Bad.S05E14.Ozymandias.1080p.mkv"), (5, 14))
+        self.assertEqual(parse_season_episode("Friends Season 2 Episode 10.mp4"), (2, 10))
+        self.assertEqual(parse_season_episode("The Matrix 1999.mkv"), (None, None))
 
     def test_parse_show_title(self):
         self.assertEqual(parse_show_title("Game.of.Thrones.S01E01.1080p.mkv"), "Game Of Thrones")

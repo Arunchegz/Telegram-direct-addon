@@ -26,6 +26,11 @@ from pyrogram.errors import AuthKeyDuplicated, FloodWait
 log = logging.getLogger("tgstream.clients")
 
 
+class ClientUnavailableError(RuntimeError):
+    """Raised by ClientPool.pick() when every client is unavailable and none
+    is scheduled to recover — lets callers return 503 instead of hanging."""
+
+
 class ClientPool:
     def __init__(self):
         self.clients: List[Client] = []
@@ -227,8 +232,12 @@ class ClientPool:
 
         If all are cooling down, releases the lock, sleeps until the soonest
         one is free, then re-acquires — so other coroutines are not blocked
-        during the wait.
-        """
+        during the wait. If every client is permanently broken (none cooling
+        down, none recovering), bail out after a bounded number of cycles
+        instead of sleeping forever — the proxy can then return a 503."""
+        no_recovery_cycles = 0
+        started = time.time()
+        MAX_PICK_WAIT_S = 60.0
         while True:
             async with self._lock:
                 avail = self._available()
@@ -240,14 +249,29 @@ class ClientPool:
                 if self._cooldown_until:
                     soonest = min(self._cooldown_until.values())
                     wait = max(0.0, soonest - time.time())
+                    no_recovery_cycles = 0
                 else:
+                    # Zero clients cooling down but none available = every
+                    # session permanently broken (no recovery scheduled).
+                    no_recovery_cycles += 1
+                    if no_recovery_cycles > 6:
+                        raise ClientUnavailableError(
+                            "All Telegram client(s) broke down and none is scheduled for recovery"
+                        )
                     wait = 5.0
+                # Hard safety bound: never hang a request forever, even on stale
+                # "cooling down" markers that never resolve (e.g. a permanently
+                # broken client whose cooldown expired in the past).
+                if (time.time() - started) >= MAX_PICK_WAIT_S:
+                    raise ClientUnavailableError(
+                        f"All Telegram client(s) unavailable for >{MAX_PICK_WAIT_S:.0f}s"
+                    )
                 n = len(self.clients)
                 log.warning(f"[clients] all {n} client(s) unavailable, waiting {wait:.1f}s")
                 if wait > 30:
                     self._fire_alert("all_cooldown", f"🟡 All {n} Telegram client(s) cooling down, waiting {wait:.0f}s")
             # Lock released — sleep without blocking other callers
-            await asyncio.sleep(wait)
+            await asyncio.sleep(max(wait, 0.1))
 
     def is_bot(self, client: Client) -> bool:
         for i, c in enumerate(self.clients):
@@ -272,12 +296,6 @@ class ClientPool:
         self._broken[idx] = True
         log.error(f"[clients] client {idx} marked as broken (auth key duplicated / invalidated)")
         self._fire_alert(f"broken:{idx}", f"🔴 Telegram client {idx} marked broken (auth key duplicated/invalidated)")
-
-    def mark_broken_by_client(self, client: Client):
-        for i, c in enumerate(self.clients):
-            if c == client:
-                self.mark_broken(i)
-                break
 
     def suspend_auth(self, client: Client, cooldown_s: int = 90):
         """AuthKeyDuplicated mid-operation = another holder (usually the
@@ -320,7 +338,7 @@ class ClientPool:
                 c.media_sessions.clear()
             self._broken[idx] = False
             self._cooldown_until.pop(idx, None)
-            log.error(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
+            log.info(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
         except AuthKeyDuplicated:
             next_cooldown = min(cooldown_s * 2, 600)  # cap at 10min
             log.warning(f"[clients] client {idx} still suspended — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")

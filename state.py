@@ -57,7 +57,7 @@ async def load_movies(redis: aioredis.Redis) -> dict:
     for k, v in raw.items():
         try:
             movies[k.decode()] = json.loads(v)
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             log.warning(f"[load_movies] skipping corrupted Redis key {k.decode()!r}: {e}")
     return movies
 

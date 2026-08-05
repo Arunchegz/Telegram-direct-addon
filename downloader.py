@@ -43,13 +43,14 @@ STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", str(Path.home() / "tgstream_stora
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
 SEEK_GRACE_DELAY_S = float(os.getenv("SEEK_GRACE_DELAY_S", "5"))  # Pause downloader after seek, let live proxy claim MTProto first
-DL_THROTTLE_S  = float(os.getenv("DL_THROTTLE_S", "0.15"))  # Sleep between successful chunks (reduced for larger prefetch chunks)
+# Permanently-failing files (media removed/edited, session revoked) should
+# stop retrying after this many consecutive errors instead of looping forever.
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("DL_MAX_CONSECUTIVE_FAILURES", "20"))
 LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
 R_DL_MAP     = "tgstream:dl:map:{}"     # JSON [[start,end],...]
 R_DL_DONE    = "tgstream:dl:done:{}"    # "1" when fully downloaded
-R_DL_PATH    = "tgstream:dl:path:{}"    # local file path string
 R_DL_TS      = "tgstream:dl:ts:{}"      # last access timestamp (for LRU eviction)
 R_DL_STOPPED = "tgstream:dl:stopped:{}" # "1" when user explicitly paused/evicted
 
@@ -178,6 +179,7 @@ class SparseFile:
         self.path = path
         self._fd: Optional[int] = None
         self._lock = asyncio.Lock()
+        self._deleted = False  # set by delete() — _get_fd must NOT reopen after unlink
 
     @classmethod
     async def create(cls, path: Path, size: int) -> "SparseFile":
@@ -194,6 +196,8 @@ class SparseFile:
 
     async def _get_fd(self) -> int:
         async with self._lock:
+            if self._deleted:
+                raise OSError(f"SparseFile {self.path} has been deleted (evicted)")
             if self._fd is None or self._fd < 0:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
@@ -212,6 +216,7 @@ class SparseFile:
 
     async def delete(self) -> None:
         async with self._lock:
+            self._deleted = True
             if self._fd is not None:
                 try:
                     os.close(self._fd)
@@ -355,13 +360,21 @@ class DownloadTask:
         await metrics.record_download_start()
 
         try:
-            current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
+            # Start ahead of the play-head (hint) by LOCAL_READY_BYTES so the
+            # background fetch never duplicates the bytes the live proxy is
+            # currently streaming (first-2MB startup double-fetch). If that
+            # pushes past EOF (small file), fall back to the beginning.
+            start_offset = ((self._hint + LOCAL_READY_BYTES) // PREFETCH_CHUNK) * PREFETCH_CHUNK
+            current_offset = 0 if start_offset >= self.file_size else start_offset
 
             while current_offset < self.file_size:
-                # Re-anchor if seek jumped ahead
+                # Re-anchor if seek jumped ahead — also keep ahead of the
+                # new play-head so the live proxy wins the race for the
+                # bytes it is about to serve.
                 if self._seek_event.is_set():
                     self._seek_event.clear()
-                    current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
+                    reanchor = ((self._hint + LOCAL_READY_BYTES) // PREFETCH_CHUNK) * PREFETCH_CHUNK
+                    current_offset = 0 if reanchor >= self.file_size else reanchor
                     log.info(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
                     # Grace delay: let the live proxy stream claim the MTProto session
                     # first after a seek, instead of both proxy and downloader hitting
@@ -450,8 +463,6 @@ class DownloadTask:
 
                     await metrics.record_download_chunk(len(data))
 
-                    await asyncio.sleep(DL_THROTTLE_S)
-
                 except asyncio.CancelledError:
                     log.info(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
                     return
@@ -475,6 +486,13 @@ class DownloadTask:
                             f"{self._consecutive_errors} consecutive failures at "
                             f"{current_offset/1024/1024:.1f}MB — last error: {e}"
                         )
+                    if self._consecutive_errors >= MAX_CONSECUTIVE_FAILURES:
+                        # Media likely gone/edited permanently — stop retrying,
+                        # persist partial progress, free the download slot so
+                        # other movies aren't starved forever.
+                        log.error(f"[dl:{self.movie_id}] giving up after {self._consecutive_errors} consecutive failures — last error: {e}")
+                        await self._persist_map()
+                        return
                     await asyncio.sleep(backoff_s)
                     self._msg = None
                     continue
@@ -581,6 +599,7 @@ class DownloadManager:
         self.on_alert = None   # optional async fn(text) for health/failure notifications set by main.py
         self.on_evict = None   # optional fn(movie_id) called on every eviction (sync, for cleanup hooks)
         self.on_complete = None  # optional async fn(movie_id, message_id) — fired when a download fully completes
+        self.streamer = None   # ByteStreamer instance set by main.py — used to protect live movies from LRU eviction
 
     def init_pool_size(self):
         """Call once after client_pool.start() so the semaphore reflects
@@ -641,24 +660,24 @@ class DownloadManager:
             # at once. Priority requests (user pressed play) preempt a
             # lower-priority (prefetch) download when at capacity — the
             # preempted task's partial progress is already persisted to
-            # Redis, so it simply resumes later. Two priority requests
-            # never fight over this since actual playback also has the
-            # live-MTProto proxy fallback path and doesn't strictly need
-            # the bg task.
+            # Redis, so it simply resumes later. Never preempt a priority
+            # task with another priority task: that would cancel the very
+            # download the user is waiting on (the episode they pressed
+            # play on) and it is never requeued by the priority path.
+            # At all-priority capacity, live-MTProto proxy fallback serves
+            # playback, so skipping the background download is safe.
             live_active = {
                 mid for mid in self._active_task_mids
                 if (t := self._tasks.get(mid)) and t._task and not t._task.done()
             }
             if movie_id not in live_active and len(live_active) >= self._max_concurrent_downloads:
                 if priority:
-                    # Preempt a non-priority slot first; only fall back to
-                    # preempting another priority download if every active
-                    # slot happens to be priority (rare).
                     victim = next((m for m in live_active if m not in self._priority_mids), None)
-                    victim = victim or next(iter(live_active), None)
                     if victim:
                         log.info(f"[dm] preempting {victim} for priority download {movie_id}")
                         self._tasks[victim].cancel()
+                    else:
+                        return None  # all slots already priority — don't churn, serve live
                 else:
                     return None  # low-priority (prefetch) — wait your turn
 
@@ -698,8 +717,12 @@ class DownloadManager:
                 self._priority_mids.add(movie_id)
 
             def _on_done(_t, mid=movie_id):
-                self._active_task_mids.discard(mid)
-                self._priority_mids.discard(mid)
+                # Only clear the active marker if THIS task is still the
+                # registered one — a stale callback from a cancelled task
+                # must not discard a newer task's slot for the same movie.
+                if self._tasks.get(mid) is _t:
+                    self._active_task_mids.discard(mid)
+                    self._priority_mids.discard(mid)
             dt._task.add_done_callback(_on_done)
 
             # Update access timestamp for LRU eviction
@@ -733,7 +756,6 @@ class DownloadManager:
         await redis.delete(
             R_DL_MAP.format(movie_id),
             R_DL_DONE.format(movie_id),
-            R_DL_PATH.format(movie_id),
             R_DL_TS.format(movie_id),
         )
         log.info(f"[dm] evicted {movie_id}")
@@ -756,6 +778,17 @@ class DownloadManager:
 
     async def evict_lru_if_needed(self, redis: aioredis.Redis):
         """Evict oldest accessed movies if total local storage > MAX_LOCAL_GB."""
+        # Never evict a movie currently being streamed (live proxy) or with a
+        # running priority (play-triggered) download — eviction closes the fd
+        # and unlinks the file mid-stream, corrupting playback.
+        protected: set[str] = set()
+        if self.streamer is not None:
+            protected |= set(getattr(self.streamer, "live_movie_ids", set()))
+        protected |= {
+            m for m in self._priority_mids
+            if (t := self._tasks.get(m)) and t._task and not t._task.done()
+        }
+
         # Snapshot to avoid RuntimeError if _files mutates during iteration
         files_snapshot = list(self._files.values())
         total = sum(
@@ -782,6 +815,8 @@ class DownloadManager:
         for _, mid in order:
             if total <= limit:
                 break
+            if mid in protected:
+                continue  # streaming/priority movie — never evict mid-stream
             f = self._files.get(mid)
             size = self._disk_usage(f.path) if f else 0
             await self.evict(mid, redis)
