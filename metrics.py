@@ -37,6 +37,7 @@ class Metrics:
             "local-waited": 0,
             "mixed": 0,
             "telegram-live": 0,
+            "bucket": 0,
         }
         self.stream_total: int = 0
 

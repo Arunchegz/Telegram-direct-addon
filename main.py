@@ -45,8 +45,9 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
 import state as st
+import hfbucket
 from clients import pool as client_pool
-from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path, R_DL_STOPPED
+from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path, cache_path, R_DL_STOPPED
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
 
@@ -97,6 +98,12 @@ LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))  # Mat
 SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 1024)))  # 2MB grace window for Path B
 DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
 # LOCAL_READY_BYTES imported from downloader (default 15MB)
+
+# ── HuggingFace bucket (permanent private storage) ───────────────────────────
+# When a file is fully cached and the bucket is configured, player requests are
+# 302-redirected to a signed bucket URL — served from HF's CDN, zero Telegram
+# cost, survives restarts/evictions. See hfbucket.py for the env surface.
+HF_REDIRECT_DONE = os.getenv("HF_REDIRECT_DONE", "true").strip().lower() != "false"
 
 # Bot / notification config (defined here so lifespan and all helpers can reference without forward refs)
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()        # from @BotFather
@@ -305,6 +312,13 @@ async def lifespan(app: FastAPI):
             msg_id = (m or {}).get("message_id") or message_id
             if msg_id:
                 _schedule(_send_channel_reaction(msg_id, "⚡"))
+            # Mirror the finished file into the HF bucket (permanent storage)
+            # when the bucket is not mounted at STORAGE_DIR. On mounted
+            # deployments the file already IS the bucket object.
+            if m and hfbucket.configured() and not hfbucket.HF_BUCKET_MOUNTED:
+                rel = _bucket_rel_path(movie_id, m.get("file_name"))
+                if rel:
+                    _schedule(_mirror_to_bucket(movie_id, rel))
         except Exception as e:
             log.error(f"[reaction] on_complete hook failed for {movie_id}: {type(e).__name__}: {e!r}")
 
@@ -1882,6 +1896,34 @@ async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = Non
     """
     return await download_manager.hydrate_cached(movie_id, file_size, redis_client, file_name)
 
+
+def _bucket_rel_path(movie_id: str, file_name: str | None = None) -> str | None:
+    """Object path (relative to STORAGE_DIR) used as the bucket key."""
+    try:
+        return cache_path(movie_id, file_name).relative_to(STORAGE_DIR).as_posix()
+    except ValueError:
+        return None
+
+
+async def _mirror_to_bucket(movie_id: str, rel: str) -> None:
+    """Mirror a fully cached file into the HF bucket (permanent storage).
+    No-op when the bucket is mounted at STORAGE_DIR or unconfigured."""
+    try:
+        local = STORAGE_DIR / rel
+        if local.is_file():
+            await hfbucket.upload_file(str(local), rel)
+    except Exception as e:
+        log.error(f"[hfbucket] mirror hook failed for {movie_id}: {e}")
+
+
+async def _delete_bucket_object(movie_id: str, file_name: str | None) -> None:
+    """Best-effort removal of a movie's bucket object (user-triggered evictions
+    and deletes). LRU evictions skip this on purpose — the bucket is the
+    permanent copy."""
+    rel = _bucket_rel_path(movie_id, file_name)
+    if rel:
+        await hfbucket.delete_object(rel)
+
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"], operation_id="proxy_movie")
 async def proxy(movie_id: str, request: Request):
@@ -1920,6 +1962,18 @@ async def proxy(movie_id: str, request: Request):
 
     # ── Skip Telegram entirely if file already fully cached ─────────────────
     _cached = await _hydrate_if_cached(movie_id, file_size, filename)
+
+    # ── HuggingFace bucket: serve completed files from permanent storage ─────
+    # 302 the player straight to the (signed) bucket URL so bytes come from
+    # HF's CDN — zero Telegram cost, survives restarts and local evictions.
+    # When the object isn't available yet, fall through to the local proxy.
+    if HF_REDIRECT_DONE and hfbucket.configured():
+        rel = _bucket_rel_path(movie_id, filename)
+        if rel:
+            bucket_url = await hfbucket.try_redirect(rel)
+            if bucket_url:
+                await metrics.record_stream_path("bucket")
+                return RedirectResponse(bucket_url, status_code=302)
 
     if not _cached:
         _schedule(_ensure_download(movie_id, file_size, movie["message_id"], filename))
@@ -2137,6 +2191,7 @@ async def evict_cache_media(movie_id: str, x_api_key: str | None = Header(defaul
     await download_manager.evict(movie_id, redis_client,
                                  file_name=movies.get(movie_id, {}).get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on API eviction
+    _schedule(_delete_bucket_object(movie_id, movies.get(movie_id, {}).get("file_name")))
     return {"status": "ok"}
 
 
@@ -2152,6 +2207,7 @@ async def delete_media(movie_id: str, delete_tg: bool = False, x_api_key: str | 
     await download_manager.evict(movie_id, redis_client,
                                  file_name=movie.get("file_name"))
     deferred_notifications.pop(movie_id, None)  # #2: prevent leak on delete
+    _schedule(_delete_bucket_object(movie_id, movie.get("file_name")))
     
     # 2. Optionally delete from Telegram
     if delete_tg:
@@ -2180,7 +2236,14 @@ async def api_config():
     return {
         "channel": str(CHANNEL_USERNAME),
         "manifest_url": manifest_url,
-        "stremio_url": stremio_url
+        "stremio_url": stremio_url,
+        "hf_bucket": {
+            "configured": hfbucket.configured(),
+            "id": hfbucket.HF_BUCKET_ID or None,
+            "mounted": hfbucket.HF_BUCKET_MOUNTED,
+            "redirect_done": HF_REDIRECT_DONE,
+            "signed": bool(hfbucket.HF_S3_ACCESS_KEY and hfbucket.HF_S3_SECRET_KEY),
+        },
     }
 
 

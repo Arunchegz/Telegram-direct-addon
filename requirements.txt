@@ -8,3 +8,4 @@ python-dotenv==1.0.1
 redis==5.0.4
 parse-torrent-title==2.8.2
 rapidfuzz
+huggingface-hub

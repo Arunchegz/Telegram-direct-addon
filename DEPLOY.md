@@ -12,8 +12,13 @@
 
 ## 2 — Create + mount the bucket (persistent storage)
 
-1. Create a **public bucket**: https://huggingface.co/new-bucket → e.g. `Telegram_stremio-storage`
+1. Create a bucket (public or private): https://huggingface.co/new-bucket → e.g. `Telegram_stremio-storage`
 2. Space → **Settings → Storage** → attach the bucket, mount path **`/data`** (read-write)
+3. Set `HF_TOKEN` (your HF access token with Read+Write on the bucket) —
+   the addon resolves private objects and redirects players to the signed
+   public CDN URL, so no extra credentials are needed.
+   (Optional: S3 credentials via https://huggingface.co/settings/tokens →
+   *Generate S3 credentials* → `HF_S3_ACCESS_KEY`/`HF_S3_SECRET_KEY`.)
 
 The bucket is your persistent disk: prefetched files written to `/data` sync to it
 automatically, and completed files stream straight from the bucket CDN.
@@ -40,9 +45,12 @@ SYNC_INTERVAL       = 300
 FULL_RECONCILE_S    = 300
 STREAM_CONCURRENCY  = 5
 STORAGE_DIR         = /data/tgstream
-HF_BUCKET_ID        = <your-username>/Telegram_stremio-storage
+HF_BUCKET_ID        = arunchegz1/Telegram_stremio-storage
 HF_BUCKET_PREFIX    = tgstream
+HF_BUCKET_MOUNTED   = true
 HF_REDIRECT_DONE    = true
+HF_TOKEN            = hf_...     # needed for private buckets
+# optional S3 presigning: HF_S3_ACCESS_KEY / HF_S3_SECRET_KEY / HF_S3_EXPIRES
 ```
 
 > [!IMPORTANT]
