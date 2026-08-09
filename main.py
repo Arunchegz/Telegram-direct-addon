@@ -325,6 +325,11 @@ async def lifespan(app: FastAPI):
     download_manager.on_complete = _on_download_complete
     client_pool.on_health_event = _notify_send
     log.info(f"Pyrogram pool started ({len(client_pool)} client(s))")
+    if hfbucket.configured():
+        log.info(f"[hfbucket] bucket={hfbucket.HF_BUCKET_ID} mounted={hfbucket.HF_BUCKET_MOUNTED} "
+                 f"redirects={HF_REDIRECT_DONE} presign={'yes' if hfbucket.HF_S3_ACCESS_KEY and hfbucket.HF_S3_SECRET_KEY else 'no'}")
+    else:
+        log.info("[hfbucket] not configured (HF_BUCKET_ID unset) — bucket streaming disabled")
 
     _schedule(_sync_loop())
     for i in range(download_manager._max_concurrent_downloads):
