@@ -194,7 +194,8 @@ async def _probe_url(url: str) -> bool:
     """Range-probe a signed URL — GET 1 byte, follow redirects. Accepts the
     2xx headers from the gateway (302→CDN) and the CDN 200/206 itself."""
     try:
-        r = await _client().get(url, headers={"Range": "bytes=0-0"})
+        r = await _client().get(url, headers={"Range": "bytes=0-0"},
+                                follow_redirects=True)
         return 200 <= r.status_code < 300
     except Exception:
         return False
