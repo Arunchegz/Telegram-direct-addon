@@ -397,13 +397,35 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
         if int(movie.get("message_id", 0) or 0) in message_ids:
             removed.append((mid, movie.get("file_name", mid)))
 
+    removed_ids = {mid for mid, _ in removed}
     for mid, file_name in removed:
         log.info(f"[delete-listener] removing {mid} ({file_name}) from index/cache: {reason}")
+        # Mark explicitly stopped BEFORE evict so an in-flight prefetch worker
+        # sees "stopped" (not "preempted") after its download task is cancelled
+        # and does not requeue the deleted movie.
+        await redis_client.set(R_DL_STOPPED.format(mid), "1")
         await st.del_movie(redis_client, mid)
+        # Invalidate the index cache before releasing the download task, so a
+        # concurrent worker cannot re-read a stale index still containing it.
+        _invalidate_movies_cache()
         await download_manager.evict(mid, redis_client, file_name=file_name)
         deferred_notifications.pop(mid, None)
-    if removed:
-        _invalidate_movies_cache()
+    # Drop the deleted movies from the prefetch queue (can't remove arbitrary
+    # items from asyncio.Queue — drain and skip matching ids).
+    drained = []
+    while not prefetch_queue.empty():
+        try:
+            drained.append(prefetch_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    for qmid in drained:
+        if qmid in removed_ids:
+            log.info(f"[delete-listener] dropped {qmid} from prefetch queue")
+        else:
+            try:
+                prefetch_queue.put_nowait(qmid)
+            except asyncio.QueueFull:
+                pass
 
     if removed:
         await _notify_send(f"🗑 Removed {len(removed)} deleted movie{'s' if len(removed) != 1 else ''}")

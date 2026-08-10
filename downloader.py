@@ -475,6 +475,12 @@ class DownloadTask:
                     await asyncio.sleep(wait_s)
                     continue
                 except Exception as e:
+                    if isinstance(e, ValueError) and "No streamable media" in str(e):
+                        # Message/media permanently gone (channel post deleted) —
+                        # retrying for minutes would only hammer Telegram. Give up.
+                        log.error(f"[dl:{self.movie_id}] permanent failure (media gone): {e}")
+                        await self._persist_map()
+                        return
                     backoff_s = DL_MIN_BACKOFF * self._error_backoff
                     self._error_backoff = min(self._error_backoff * 2, 8)
                     self._consecutive_errors += 1
