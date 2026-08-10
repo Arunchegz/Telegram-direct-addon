@@ -330,6 +330,14 @@ class ClientPool:
                 await c.stop()
         except Exception:
             pass
+        # stop() can leave the client marked connected when its session is
+        # wedged (e.g. after a 406 kick) — force a full disconnect so start()
+        # below doesn't fail with "Client is already connected".
+        try:
+            if c.is_connected:
+                await c.disconnect()
+        except Exception:
+            pass
         try:
             await c.start()
             # Clear stale media sessions from before the reconnect — using them
@@ -350,7 +358,15 @@ class ClientPool:
             except RuntimeError:
                 pass
         except Exception as e:
-            log.error(f"[clients] client {idx} reconnect failed: {e}")
+            next_cooldown = min(cooldown_s * 2, 600)
+            log.error(f"[clients] client {idx} reconnect failed ({e}) — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self._recover_auth(idx, next_cooldown, attempt + 1))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            except RuntimeError:
+                pass
 
     async def acquire_download_slot(self) -> Tuple[int, Client]:
         """Pick the client with the fewest active background DownloadTasks
