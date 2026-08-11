@@ -1,0 +1,7 @@
+.git
+*.session
+.env
+tgstream_storage/
+__pycache__
+*.pyc
+.DS_Store

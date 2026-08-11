@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import httpx
@@ -11,6 +12,23 @@ TMDB_URL = "https://api.themoviedb.org/3"
 CINEMETA_URL = "https://v3-cinemeta.strem.io"
 
 # HTTP client is shared with state.py — single connection pool, no duplicate TLS handshakes.
+
+
+async def _http_get_json(url: str, params: dict | None = None, attempts: int = 2):
+    """GET with one retry — Cinemeta is flaky (429s/timeouts) and TMDB is
+    third-party; a single failure would otherwise abort matching outright.
+    Returns parsed JSON on success, None on final failure (callers degrade
+    gracefully)."""
+    for attempt in range(attempts):
+        try:
+            r = await _get_http_client().get(url, params=params)
+            if r.status_code == 200:
+                return r.json()
+        except (httpx.HTTPError, ValueError):
+            pass
+        if attempt < attempts - 1:
+            await asyncio.sleep(1.0 * (attempt + 1))
+    return None
 
 
 # --------------------------------------------------
@@ -38,16 +56,11 @@ async def tmdb_search(title, year):
     if year:
         params["year"] = year
 
-    client = _get_http_client()
-    r = await client.get(
-        f"{TMDB_URL}/search/movie",
-        params=params,
-    )
-
-    if r.status_code != 200:
+    data = await _http_get_json(f"{TMDB_URL}/search/movie", params=params)
+    if not data:
         return None
 
-    results = r.json().get("results", [])
+    results = data.get("results", [])
 
     if not results:
         return None
@@ -60,16 +73,14 @@ async def tmdb_search(title, year):
 # --------------------------------------------------
 
 async def tmdb_to_imdb(tmdb_id):
-    client = _get_http_client()
-    r = await client.get(
+    data = await _http_get_json(
         f"{TMDB_URL}/movie/{tmdb_id}/external_ids",
         params={"api_key": TMDB_API_KEY},
     )
-
-    if r.status_code != 200:
+    if not data:
         return None
 
-    return r.json().get("imdb_id")
+    return data.get("imdb_id")
 
 
 # --------------------------------------------------
@@ -77,15 +88,11 @@ async def tmdb_to_imdb(tmdb_id):
 # --------------------------------------------------
 
 async def cinemeta_from_imdb(imdb_id):
-    client = _get_http_client()
-    r = await client.get(
-        f"{CINEMETA_URL}/meta/movie/{imdb_id}.json"
-    )
-
-    if r.status_code != 200:
+    data = await _http_get_json(f"{CINEMETA_URL}/meta/movie/{imdb_id}.json")
+    if not data:
         return None
 
-    return r.json().get("meta")
+    return data.get("meta")
 
 
 # --------------------------------------------------
@@ -93,15 +100,11 @@ async def cinemeta_from_imdb(imdb_id):
 # --------------------------------------------------
 
 async def cinemeta_search(title):
-    client = _get_http_client()
-    r = await client.get(
-        f"{CINEMETA_URL}/catalog/movie/top/search={title}.json"
-    )
-
-    if r.status_code != 200:
+    data = await _http_get_json(f"{CINEMETA_URL}/catalog/movie/top/search={title}.json")
+    if not data:
         return []
 
-    return r.json().get("metas", [])
+    return data.get("metas", [])
 
 
 # --------------------------------------------------

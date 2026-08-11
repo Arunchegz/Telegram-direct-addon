@@ -37,14 +37,15 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, AuthKeyDuplicated, ReactionInvalid
 from pyrogram.handlers import MessageHandler, RawUpdateHandler, CallbackQueryHandler
-from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji
-from pyrogram.raw.functions.messages import SendReaction, SetChatAvailableReactions
+from pyrogram.raw.types import UpdateDeleteChannelMessages, ReactionEmoji, UpdateMessageReactions
+from pyrogram.raw.functions.messages import SendReaction, SetChatAvailableReactions, GetMessagesReactions
 from pyrogram.raw.types import ChatReactionsAll
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
 import state as st
+from appstate import appstate
 import hfbucket
 from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES, MAX_LOCAL_GB, find_cache_path, cache_path, R_DL_STOPPED
@@ -114,7 +115,7 @@ DISABLE_BOT_LISTENER = os.getenv("DISABLE_BOT_LISTENER", "false").strip().lower(
 ADMIN_USER_ID  = os.getenv("ADMIN_USER_ID", "").strip()  # Telegram user id allowed to issue /commands via DM
 _START_TIME    = time.time()
 
-source_chat_id: int | None = None
+appstate.source_chat_id: int | None = None
 
 # ── In-process movie catalog cache ───────────────────────────────────────────
 # load_movies() does HGETALL on every call. Proxy, stream, catalog, and meta
@@ -136,7 +137,7 @@ async def _get_movies() -> dict:
         # Re-check inside lock — another coroutine may have refreshed while we waited
         if time.time() - _movies_cache_ts < _MOVIES_CACHE_TTL:
             return _movies_cache
-        _movies_cache = await st.load_movies(redis_client)
+        _movies_cache = await st.load_movies(appstate.redis_client)
         _movies_cache_ts = time.time()
     return _movies_cache
 
@@ -149,11 +150,12 @@ def _invalidate_movies_cache():
 
 def get_tg() -> Client:
     return client_pool.primary()
-redis_client: aioredis.Redis = None
-byte_streamer: ByteStreamer = None
-stream_sem: asyncio.Semaphore = None
+
+
+# Lifespan-owned state (appstate.redis_client, appstate.byte_streamer, appstate.stream_sem, appstate.bot_client,
+# appstate.source_chat_id) lives in appstate — see appstate.py.
+
 _sync_lock = asyncio.Lock()
-bot_client: Client = None  # dedicated Pyrogram client logged in as the bot (MTProto, not HTTPS)
 
 
 def _schedule(coro):
@@ -173,10 +175,9 @@ def _log_task_exception(task: asyncio.Task):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global source_chat_id, redis_client, byte_streamer, stream_sem, bot_client
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     # Configure Redis with retry and connection pool settings for resilience
-    redis_client = aioredis.from_url(
+    appstate.redis_client = aioredis.from_url(
         REDIS_URL,
         decode_responses=False,
         max_connections=10,
@@ -185,18 +186,18 @@ async def lifespan(app: FastAPI):
         retry_on_timeout=True,
         health_check_interval=30,
     )
-    stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
+    appstate.stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
 
     if BOT_TOKEN:
         try:
-            bot_client = Client(
+            appstate.bot_client = Client(
                 "notify_bot", api_id=API_ID, api_hash=API_HASH,
                 bot_token=BOT_TOKEN, in_memory=True, no_updates=False,
                 parse_mode=ParseMode.DISABLED,
             )
-            await bot_client.start()
+            await appstate.bot_client.start()
             log.info("[notify] bot_client started (MTProto, used for reliable notify send/edit)")
 
             if ADMIN_USER_ID:
@@ -226,18 +227,18 @@ async def lifespan(app: FastAPI):
                     except Exception as e:
                         log.error(f"[bot] callback failed: {type(e).__name__}: {e!r}")
 
-                bot_client.add_handler(MessageHandler(_pyro_admin_command, filters.private & filters.text))
-                bot_client.add_handler(CallbackQueryHandler(_pyro_admin_callback))
+                appstate.bot_client.add_handler(MessageHandler(_pyro_admin_command, filters.private & filters.text))
+                appstate.bot_client.add_handler(CallbackQueryHandler(_pyro_admin_callback))
                 log.info(f"[bot] MTProto admin command/callback handlers registered for user {ADMIN_USER_ID}")
         except Exception as e:
             log.error(f"[notify] bot_client failed to start, will fall back to HTTP API only: {type(e).__name__}: {e!r}")
-            bot_client = None
+            appstate.bot_client = None
         await _register_bot_commands()
     if CHANNEL_USERNAME:
         try:
             source_chat = await get_tg().get_chat(CHANNEL_USERNAME)
-            source_chat_id = source_chat.id
-            log.info(f"[listener] Resolved source channel id: {source_chat_id}")
+            appstate.source_chat_id = source_chat.id
+            log.info(f"[listener] Resolved source channel id: {appstate.source_chat_id}")
         except Exception as e:
             log.error(f"[listener] failed to resolve source channel id for delete listener: {e}")
 
@@ -250,10 +251,9 @@ async def lifespan(app: FastAPI):
                 fn = getattr(media, "file_name", None)
                 if fn:
                     mid = st.movie_id(fn)
-                    existing_movies = await st.load_movies(redis_client)
-                    if mid not in existing_movies:
+                    if not await appstate.redis_client.hexists(st.R_MOVIES, mid):
                         log.info(f"[listener] instantly adding new movie to catalog: {mid}")
-                        await st.save_movie(redis_client, mid, {
+                        await st.save_movie(appstate.redis_client, mid, {
                             "message_id": message.id, "file_name": fn,
                             "file_size": media.file_size,
                             "file_size_text": st.fmt_size(media.file_size),
@@ -264,11 +264,9 @@ async def lifespan(app: FastAPI):
                         # React 👨‍💻 on the channel post to signal prefetch queued/pending
                         _schedule(_send_channel_reaction(message.id, "👨‍💻"))
                         # Auto-prefetch new posts immediately (matches sync handler policy)
-                        stopped = await redis_client.get(R_DL_STOPPED.format(mid))
+                        stopped = await appstate.redis_client.get(R_DL_STOPPED.format(mid))
                         if stopped != b"1":
-                            try:
-                                prefetch_queue.put_nowait(mid)
-                            except asyncio.QueueFull:
+                            if not _queue_put(mid):
                                 log.warning(f"[listener] prefetch_queue full, skipping {mid}")
             # Sync in background to reconcile index and clean up deletions
             _schedule(_sync_channel(force=False))
@@ -278,14 +276,14 @@ async def lifespan(app: FastAPI):
     async def _instant_delete_handler(client, update, users, chats):
         if not isinstance(update, UpdateDeleteChannelMessages):
             return
-        if source_chat_id is None:
+        if appstate.source_chat_id is None:
             return
-        if _channel_update_chat_id(update) != source_chat_id:
+        if _channel_update_chat_id(update) != appstate.source_chat_id:
             return
         try:
             removed = await _remove_deleted_messages(set(update.messages), "telegram channel delete update")
             if removed:
-                await redis_client.set(st.R_SYNC_TS, str(time.time()))
+                await appstate.redis_client.set(st.R_SYNC_TS, str(time.time()))
         except Exception as se:
             log.error(f"[listener] instant delete cleanup failed: {se}")
 
@@ -296,11 +294,11 @@ async def lifespan(app: FastAPI):
         get_tg().add_handler(RawUpdateHandler(_instant_delete_handler))
         log.info(f"[listener] Registered Pyrogram instant post/delete handlers for {CHANNEL_USERNAME}")
 
-    byte_streamer = ByteStreamer(client_pool)
+    appstate.byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
-    download_manager.streamer = byte_streamer
+    download_manager.streamer = appstate.byte_streamer
     download_manager.on_alert = _notify_send
-    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)
+    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)  # sync callback; single atomic dict op is GIL-safe
 
     async def _on_download_complete(movie_id: str, message_id: int) -> None:
         """Fired by the downloader whenever a movie finishes caching —
@@ -343,9 +341,9 @@ async def lifespan(app: FastAPI):
     yield
     await download_manager.shutdown()
     await client_pool.stop()
-    if bot_client:
-        await bot_client.stop()
-    await redis_client.aclose()
+    if appstate.bot_client:
+        await appstate.bot_client.stop()
+    await appstate.redis_client.aclose()
     await st.close_http_client()
 
 
@@ -403,13 +401,13 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
         # Mark explicitly stopped BEFORE evict so an in-flight prefetch worker
         # sees "stopped" (not "preempted") after its download task is cancelled
         # and does not requeue the deleted movie.
-        await redis_client.set(R_DL_STOPPED.format(mid), "1")
-        await st.del_movie(redis_client, mid)
+        await appstate.redis_client.set(R_DL_STOPPED.format(mid), "1")
+        await st.del_movie(appstate.redis_client, mid)
         # Invalidate the index cache before releasing the download task, so a
         # concurrent worker cannot re-read a stale index still containing it.
         _invalidate_movies_cache()
-        await download_manager.evict(mid, redis_client, file_name=file_name)
-        deferred_notifications.pop(mid, None)
+        await download_manager.evict(mid, appstate.redis_client, file_name=file_name)
+        await _deferred_pop(mid)
     # Drop the deleted movies from the prefetch queue (can't remove arbitrary
     # items from asyncio.Queue — drain and skip matching ids).
     drained = []
@@ -420,12 +418,10 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
             break
     for qmid in drained:
         if qmid in removed_ids:
+            _prefetch_queued.discard(qmid)
             log.info(f"[delete-listener] dropped {qmid} from prefetch queue")
         else:
-            try:
-                prefetch_queue.put_nowait(qmid)
-            except asyncio.QueueFull:
-                pass
+            _queue_put(qmid)
 
     if removed:
         await _notify_send(f"🗑 Removed {len(removed)} deleted movie{'s' if len(removed) != 1 else ''}")
@@ -441,7 +437,7 @@ async def _sweep_loop():
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_S)
         try:
-            n1 = byte_streamer.prune_msg_cache()
+            n1 = appstate.byte_streamer.prune_msg_cache()
             n2 = await download_manager.prune_finished_tasks()
             if n1 or n2:
                 log.info(f"[sweep] pruned {n1} msg-cache entries, {n2} finished task entries")
@@ -480,9 +476,9 @@ async def _register_bot_commands():
         ("find", "Search catalog: /find <name>"),
         ("help", "Show available commands"),
     ]
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            await bot_client.set_bot_commands([BotCommand(c, d) for c, d in commands])
+            await appstate.bot_client.set_bot_commands([BotCommand(c, d) for c, d in commands])
             log.info("[bot] command menu registered (via bot_client)")
             return
         except Exception as e:
@@ -490,14 +486,14 @@ async def _register_bot_commands():
     if not BOT_TOKEN:
         return
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{_TG_API}/setMyCommands",
-                              json={"commands": [{"command": c, "description": d} for c, d in commands]})
-            data = r.json()
-            if data.get("ok"):
-                log.info("[bot] command menu registered")
-            else:
-                log.info(f"[bot] setMyCommands rejected: {data.get('description')}")
+        c = st._get_http_client()
+        r = await c.post(f"{_TG_API}/setMyCommands",
+                          json={"commands": [{"command": c, "description": d} for c, d in commands]})
+        data = r.json()
+        if data.get("ok"):
+            log.info("[bot] command menu registered")
+        else:
+            log.info(f"[bot] setMyCommands rejected: {data.get('description')}")
     except Exception as e:
         log.error(f"[bot] setMyCommands failed: {type(e).__name__}: {e!r}")
 
@@ -521,11 +517,11 @@ REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the prim
 async def _ensure_channel_reactions_enabled() -> None:
     """Enable all reactions on the source channel so 👨‍💻 and ⚡ always work.
     Requires the user client to be a channel admin. Fails silently if not."""
-    if not source_chat_id:
+    if not appstate.source_chat_id:
         return
     try:
         tg = get_tg()
-        peer = await tg.resolve_peer(source_chat_id)
+        peer = await tg.resolve_peer(appstate.source_chat_id)
         await tg.invoke(SetChatAvailableReactions(
             peer=peer,
             available_reactions=ChatReactionsAll(),
@@ -542,14 +538,14 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
     cannot send reactions on channel posts they don't own.
     Falls back silently on any error so reactions never break the main flow.
     """
-    if not source_chat_id or not message_id:
+    if not appstate.source_chat_id or not message_id:
         return
     for attempt, candidate in enumerate((emoji, REACTION_FALLBACK)):
         try:
             tg = get_tg()
             await tg.invoke(
                 SendReaction(
-                    peer=await tg.resolve_peer(source_chat_id),
+                    peer=await tg.resolve_peer(appstate.source_chat_id),
                     msg_id=message_id,
                     reaction=[ReactionEmoji(emoticon=candidate)],
                 )
@@ -573,13 +569,12 @@ async def _send_channel_reaction(message_id: int, emoji: str) -> None:
 
 async def _get_our_reaction(message_id: int) -> str | None:
     """Return the emoji we have reacted with on a channel message, or None."""
-    if not source_chat_id or not message_id:
+    if not appstate.source_chat_id or not message_id:
         return None
     try:
-        from pyrogram.raw.functions.messages import GetMessagesReactions
-        from pyrogram.raw.types import ReactionEmoji as _RE, UpdateMessageReactions
+        _RE = ReactionEmoji
         tg = get_tg()
-        peer = await tg.resolve_peer(source_chat_id)
+        peer = await tg.resolve_peer(appstate.source_chat_id)
         updates = await tg.invoke(GetMessagesReactions(peer=peer, id=[message_id]))
         for upd in getattr(updates, "updates", []):
             if isinstance(upd, UpdateMessageReactions) and upd.msg_id == message_id:
@@ -600,11 +595,11 @@ async def _clear_channel_reaction(message_id: int) -> None:
     If we can't determine which reaction to clear, fall back to the empty list
     but catch the error gracefully.
     """
-    if not source_chat_id or not message_id:
+    if not appstate.source_chat_id or not message_id:
         return
     try:
         tg = get_tg()
-        peer = await tg.resolve_peer(source_chat_id)
+        peer = await tg.resolve_peer(appstate.source_chat_id)
         # Determine which reaction is currently set so we can toggle it off
         current = await _get_our_reaction(message_id)
         if current:
@@ -622,7 +617,7 @@ async def _clear_channel_reaction(message_id: int) -> None:
             pass
         log.info(f"[reaction] cleared reaction on msg {message_id}")
     except FloodWait as fw:
-        log.info(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
+        log.warning(f"[reaction] flood-wait {fw.value}s clearing reaction for msg {message_id}")
     except Exception as e:
         log.error(f"[reaction] clear failed for msg {message_id}: {type(e).__name__}: {e!r}")
 
@@ -632,41 +627,42 @@ async def _rescan_missing_files(movies: dict) -> int:
     Find movies Redis still marks as fully downloaded whose local sparse
     file is gone, reset their download state and re-enqueue a prefetch so
     they get re-cached automatically (self-heal)."""
-    requeued = 0
-    for mid, m in movies.items():
-        try:
-            done = await redis_client.get(f"tgstream:dl:done:{mid}")
-            if done != b"1":
-                continue
-            if find_cache_path(mid, m.get("file_name")).exists():
-                continue
-            stopped = await redis_client.get(R_DL_STOPPED.format(mid))
-            await redis_client.delete(
-                f"tgstream:dl:map:{mid}",
-                f"tgstream:dl:done:{mid}",
-                f"tgstream:dl:path:{mid}",
-                f"tgstream:dl:ts:{mid}",
-            )
-            if stopped == b"1":
-                log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
-                      f"state reset, user-stopped, not requeueing")
-                continue
+    # Serialized: _reconcile_reactions (startup) and _sync_channel (do_full)
+    # can fire this concurrently; a lock prevents duplicate requeues.
+    async with _rescan_lock:
+        requeued = 0
+        for mid, m in movies.items():
             try:
-                prefetch_queue.put_nowait(mid)
-            except asyncio.QueueFull:
-                log.info(f"[rescan] prefetch_queue full, dropping {mid}")
-            log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
-                  f"reset, requeued prefetch")
-            requeued += 1
-        except Exception as e:
-            log.error(f"[rescan] error for {mid}: {type(e).__name__}: {e!r}")
-            continue
-    if requeued:
-        log.info(f"[rescan] done: {requeued} file(s) missing, re-enqueued for prefetch")
-        _schedule(_notify_send(f"♻️ Local cache was wiped by a restart — "
-                               f"re-prefetching {requeued} movie(s)"))
-    else:
-        log.info("[rescan] done: no missing files")
+                done = await appstate.redis_client.get(f"tgstream:dl:done:{mid}")
+                if done != b"1":
+                    continue
+                if find_cache_path(mid, m.get("file_name")).exists():
+                    continue
+                stopped = await appstate.redis_client.get(R_DL_STOPPED.format(mid))
+                await appstate.redis_client.delete(
+                    f"tgstream:dl:map:{mid}",
+                    f"tgstream:dl:done:{mid}",
+                    f"tgstream:dl:path:{mid}",
+                    f"tgstream:dl:ts:{mid}",
+                )
+                if stopped == b"1":
+                    log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                          f"state reset, user-stopped, not requeueing")
+                    continue
+                if not _queue_put(mid):
+                    log.info(f"[rescan] prefetch_queue full, dropping {mid}")
+                log.info(f"[rescan] {mid}: Redis done but file missing (disk wiped) — "
+                      f"reset, requeued prefetch")
+                requeued += 1
+            except Exception as e:
+                log.error(f"[rescan] error for {mid}: {type(e).__name__}: {e!r}")
+                continue
+        if requeued:
+            log.info(f"[rescan] done: {requeued} file(s) missing, re-enqueued for prefetch")
+            _schedule(_notify_send(f"♻️ Local cache was wiped by a restart — "
+                                   f"re-prefetching {requeued} movie(s)"))
+        else:
+            log.info("[rescan] done: no missing files")
     return requeued
 
 
@@ -680,9 +676,9 @@ async def _reconcile_reactions() -> None:
     await asyncio.sleep(15)  # wait for pool + first sync to settle
     log.info("[reaction] starting startup reconciliation scan...")
     try:
-        movies = await st.load_movies(redis_client)
+        movies = await st.load_movies(appstate.redis_client)
     except Exception as e:
-        log.info(f"[reaction] reconcile aborted, could not load movies: {e}")
+        log.warning(f"[reaction] reconcile aborted, could not load movies: {e}")
         return
 
     await _rescan_missing_files(movies)
@@ -707,8 +703,7 @@ async def _reconcile_reactions() -> None:
                     # File gone (evicted/deleted/disk-wiped) but reaction still
                     # shows ⚡ -- wrong. If queued or actively downloading,
                     # downgrade to 👨‍💻 instead of clearing entirely.
-                    q = prefetch_queue
-                    queued = mid in list(q._queue)  # snapshot to avoid mutation during iteration
+                    queued = mid in _prefetch_queued
                     dl_task = download_manager.get(mid)
                     downloading = bool(dl_task and dl_task._task and not dl_task._task.done())
                     if queued or downloading:
@@ -733,9 +728,9 @@ async def _notify_send(text: str) -> int | None:
 
     # Prefer MTProto via dedicated bot_client — bypasses the api.telegram.org
     # HTTPS ConnectTimeout issues seen on some hosts, still posts as the bot.
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            msg = await bot_client.send_message(chat_id, text)
+            msg = await appstate.bot_client.send_message(chat_id, text)
             return msg.id
         except Exception as pe:
             log.error(f"[notify] bot_client send failed, falling back to HTTP: {type(pe).__name__}: {pe!r}")
@@ -744,10 +739,10 @@ async def _notify_send(text: str) -> int | None:
     if not BOT_TOKEN:
         return None
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{_TG_API}/sendMessage",
-                              json={"chat_id": NOTIFY_CHAT_ID, "text": text})
-            return r.json().get("result", {}).get("message_id")
+        c = st._get_http_client()
+        r = await c.post(f"{_TG_API}/sendMessage",
+                          json={"chat_id": NOTIFY_CHAT_ID, "text": text})
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"[notify] HTTP send failed: {type(e).__name__}: {e!r}")
         return None
@@ -761,9 +756,9 @@ async def _notify_edit(msg_id: int, text: str) -> float:
     chat_id = _resolve_chat_id(NOTIFY_CHAT_ID)
 
     # Prefer MTProto via dedicated bot_client, same reasoning as _notify_send
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            await bot_client.edit_message_text(chat_id, msg_id, text)
+            await appstate.bot_client.edit_message_text(chat_id, msg_id, text)
             return 0
         except FloodWait as fw:
             log.info(f"[notify] bot_client edit rate-limited, backing off {fw.value}s")
@@ -778,19 +773,19 @@ async def _notify_edit(msg_id: int, text: str) -> float:
     if not BOT_TOKEN:
         return 0
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{_TG_API}/editMessageText",
-                             json={"chat_id": NOTIFY_CHAT_ID, "message_id": msg_id, "text": text})
-            data = r.json()
-            if not data.get("ok"):
-                desc = data.get("description", "")
-                if data.get("error_code") == 429:
-                    wait = data.get("parameters", {}).get("retry_after", 3)
-                    log.info(f"[notify] HTTP rate-limited, backing off {wait}s")
-                    return float(wait)
-                if "not modified" not in desc:
-                    log.info(f"[notify] HTTP edit rejected: {desc}")
-            return 0
+        c = st._get_http_client()
+        r = await c.post(f"{_TG_API}/editMessageText",
+                         json={"chat_id": NOTIFY_CHAT_ID, "message_id": msg_id, "text": text})
+        data = r.json()
+        if not data.get("ok"):
+            desc = data.get("description", "")
+            if data.get("error_code") == 429:
+                wait = data.get("parameters", {}).get("retry_after", 3)
+                log.info(f"[notify] HTTP rate-limited, backing off {wait}s")
+                return float(wait)
+            if "not modified" not in desc:
+                log.info(f"[notify] HTTP edit rejected: {desc}")
+        return 0
     except Exception as e:
         log.error(f"[notify] HTTP edit failed: {type(e).__name__}: {e!r}")
         return 0
@@ -868,21 +863,39 @@ async def _progress_reporter(movie_id: str, file_name: str, file_size: int, msg_
 
 prefetch_queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=200)
 
+# Mirror of what's currently in prefetch_queue. asyncio.Queue has no way to
+# check membership without touching the private `._queue` deque, so we keep a
+# parallel set, updated at every put/get. Single event loop: the operations
+# below are not awaited, so the set stays consistent with the queue.
+_prefetch_queued: set[str] = set()
+
+_rescan_lock = asyncio.Lock()
+
+
+def _queue_put(mid: str) -> bool:
+    """put_nowait + track in _prefetch_queued. True if queued."""
+    try:
+        prefetch_queue.put_nowait(mid)
+        _prefetch_queued.add(mid)
+        return True
+    except asyncio.QueueFull:
+        return False
+
 
 async def _bot_reply(chat_id, text: str):
     """Admin command replies — prefers MTProto bot_client (reliable on hosts
     where HTTPS to api.telegram.org is flaky/blocked), HTTP as fallback."""
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            await bot_client.send_message(chat_id, text)
+            await appstate.bot_client.send_message(chat_id, text)
             return
         except Exception as e:
             log.error(f"[bot] reply via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(f"{_TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+        c = st._get_http_client()
+        await c.post(f"{_TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
     except Exception as e:
         log.error(f"[bot] reply failed: {type(e).__name__}: {e!r}")
 
@@ -910,7 +923,7 @@ async def _render_list_page(page: int = 0):
     keyboard = []
     # Batch all done-flag lookups in one mget round-trip instead of N GETs
     done_keys = [f"tgstream:dl:done:{mid}" for mid, _ in chunk]
-    done_vals = await redis_client.mget(*done_keys) if done_keys else []
+    done_vals = await appstate.redis_client.mget(*done_keys) if done_keys else []
     for (mid, m), done_val in zip(chunk, done_vals):
         symbol = "✅" if done_val == b"1" else "⬜"
         fn = m.get("file_name", mid)
@@ -943,28 +956,28 @@ def _to_pyro_markup(keyboard: dict) -> InlineKeyboardMarkup:
 
 
 async def _bot_send_keyboard(chat_id, text: str, keyboard: dict):
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            msg = await bot_client.send_message(chat_id, text, reply_markup=_to_pyro_markup(keyboard))
+            msg = await appstate.bot_client.send_message(chat_id, text, reply_markup=_to_pyro_markup(keyboard))
             return msg.id
         except Exception as e:
             log.error(f"[bot] list send via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return None
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(f"{_TG_API}/sendMessage",
-                              json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
-            return r.json().get("result", {}).get("message_id")
+        c = st._get_http_client()
+        r = await c.post(f"{_TG_API}/sendMessage",
+                          json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"[bot] list send failed: {type(e).__name__}: {e!r}")
         return None
 
 
 async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            await bot_client.edit_message_text(chat_id, message_id, text, reply_markup=_to_pyro_markup(keyboard))
+            await appstate.bot_client.edit_message_text(chat_id, message_id, text, reply_markup=_to_pyro_markup(keyboard))
             return
         except Exception as e:
             desc = str(e)
@@ -974,29 +987,29 @@ async def _bot_edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
     if not BOT_TOKEN:
         return
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(f"{_TG_API}/editMessageText",
-                          json={"chat_id": chat_id, "message_id": message_id,
-                                "text": text, "reply_markup": keyboard})
+        c = st._get_http_client()
+        await c.post(f"{_TG_API}/editMessageText",
+                      json={"chat_id": chat_id, "message_id": message_id,
+                            "text": text, "reply_markup": keyboard})
     except Exception as e:
         log.error(f"[bot] list edit failed: {type(e).__name__}: {e!r}")
 
 
 async def _bot_answer_callback(callback_id: str, text: str | None = None):
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         try:
-            await bot_client.answer_callback_query(callback_id, text=text or "")
+            await appstate.bot_client.answer_callback_query(callback_id, text=text or "")
             return
         except Exception as e:
             log.error(f"[bot] answerCallbackQuery via bot_client failed, falling back to HTTP: {type(e).__name__}: {e!r}")
     if not BOT_TOKEN:
         return
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            payload = {"callback_query_id": callback_id}
-            if text:
-                payload["text"] = text
-            await c.post(f"{_TG_API}/answerCallbackQuery", json=payload)
+        c = st._get_http_client()
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        await c.post(f"{_TG_API}/answerCallbackQuery", json=payload)
     except Exception as e:
         log.error(f"[bot] answerCallbackQuery failed: {type(e).__name__}: {e!r}")
 
@@ -1029,8 +1042,8 @@ async def _handle_admin_callback(cq: dict):
             await _bot_edit_keyboard(chat_id, message_id, text, kb)
             return
         fn = movies[target].get("file_name", target)
-        await download_manager.evict(target, redis_client, file_name=fn)
-        await st.del_movie(redis_client, target)
+        await download_manager.evict(target, appstate.redis_client, file_name=fn)
+        await st.del_movie(appstate.redis_client, target)
         _invalidate_movies_cache()
         await _bot_answer_callback(cq_id, f"Deleted: {fn[:50]}")
         text, kb = await _render_list_page(page)
@@ -1084,8 +1097,8 @@ async def _handle_admin_command(chat_id, text: str):
         # Mark explicitly stopped so the prefetch worker doesn't instantly
         # requeue the movie after the task is cancelled (matches the API
         # /api/media/{id}/evict semantics).
-        await redis_client.set(R_DL_STOPPED.format(arg), "1", ex=86400)
-        await download_manager.evict(arg, redis_client, file_name=movies[arg].get("file_name"))
+        await appstate.redis_client.set(R_DL_STOPPED.format(arg), "1", ex=86400)
+        await download_manager.evict(arg, appstate.redis_client, file_name=movies[arg].get("file_name"))
         await _bot_reply(chat_id, f"🗑 Evicted: {arg}")
 
     elif cmd == "/find":
@@ -1102,7 +1115,7 @@ async def _handle_admin_command(chat_id, text: str):
             return
         lines = []
         for mid, m in matches:
-            cached = await redis_client.get(f"tgstream:dl:done:{mid}")
+            cached = await appstate.redis_client.get(f"tgstream:dl:done:{mid}")
             state_tag = "✅ cached" if cached == b"1" else "—"
             lines.append(f"{m.get('file_name', mid)} ({state_tag})\nid: {mid}")
         await _bot_reply(chat_id, "🔎 Matches:\n\n" + "\n\n".join(lines))
@@ -1135,7 +1148,7 @@ async def _bot_channel_listener():
     if not BOT_TOKEN:
         log.warning("[listener] BOT_TOKEN not set, skipping instant-post listener")
         return
-    if bot_client and bot_client.is_connected:
+    if appstate.bot_client and appstate.bot_client.is_connected:
         log.warning("[listener] MTProto bot_client is active, skipping HTTP long-poll updates listener")
         return
     if ADMIN_USER_ID:
@@ -1176,9 +1189,9 @@ async def _bot_channel_listener():
                         log.info("[listener] new channel post detected — instant sync")
                         try:
                             # force=False: respect SYNC_INTERVAL cooldown.
-                            # This path only active when bot_client is absent
+                            # This path only active when appstate.bot_client is absent
                             # (MTProto _instant_sync_handler handles the real-time
-                            # catalog update when bot_client is present).
+                            # catalog update when appstate.bot_client is present).
                             await _sync_channel(force=False)
                         except Exception as e:
                             log.error(f"[listener] sync failed: {e}")
@@ -1211,6 +1224,19 @@ async def _bot_channel_listener():
 
 
 deferred_notifications = {}
+_deferred_lock = asyncio.Lock()
+
+
+async def _deferred_pop(movie_id: str, default=None):
+    """Pop a deferred notification id under the lock — mutating this dict
+    across awaits (workers, evict, delete) must not interleave."""
+    async with _deferred_lock:
+        return deferred_notifications.pop(movie_id, default)
+
+
+async def _deferred_set(movie_id: str, msg_id: int) -> None:
+    async with _deferred_lock:
+        deferred_notifications[movie_id] = msg_id
 
 
 async def _prefetch_worker(worker_id: int = 0):
@@ -1224,14 +1250,13 @@ async def _prefetch_worker(worker_id: int = 0):
     one movie at a time regardless of pool size."""
     while True:
         movie_id = await prefetch_queue.get()
+        _prefetch_queued.discard(movie_id)
         reporter = None  # must be defined before try so except/finally can always cancel it
         try:
             if download_manager.paused:
                 log.info(f"[prefetch:{worker_id}] paused, requeueing {movie_id}")
                 await asyncio.sleep(15)
-                try:
-                    prefetch_queue.put_nowait(movie_id)
-                except asyncio.QueueFull:
+                if not _queue_put(movie_id):
                     log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on pause requeue")
                 continue
             movies = await _get_movies()
@@ -1251,15 +1276,15 @@ async def _prefetch_worker(worker_id: int = 0):
                 movie_id=movie_id,
                 file_size=file_size,
                 message_id=message_id,
-                redis=redis_client,
-                byte_streamer=byte_streamer,
+                redis=appstate.redis_client,
+                byte_streamer=appstate.byte_streamer,
                 fetch_msg_fn=_fetch_msg,
                 priority=False,
                 file_name=fn,
             )
 
             # Send notification afterwards (if task successfully started)
-            msg_id = deferred_notifications.pop(movie_id, None)
+            msg_id = await _deferred_pop(movie_id)
             if task and task._task:
                 if msg_id:
                     await _notify_edit(msg_id, f"⬇️ Prefetching: {fn}\n0/100")
@@ -1277,8 +1302,8 @@ async def _prefetch_worker(worker_id: int = 0):
                 # done, put back at the end of the queue to finish later.
                 # But if the user explicitly paused/evicted it from the
                 # dashboard, respect that instead of instantly restarting.
-                done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
-                stopped = await redis_client.get(R_DL_STOPPED.format(movie_id))
+                done_val = await appstate.redis_client.get(f"tgstream:dl:done:{movie_id}")
+                stopped = await appstate.redis_client.get(R_DL_STOPPED.format(movie_id))
                 if done_val == b"1":
                     await _notify_edit(msg_id, f"✅ Prefetched: {fn}\n100/100\n{BASE_URL}/proxy/{movie_id}")
                     # Replace 👨💻 with ⚡ on the channel post to signal download complete
@@ -1288,12 +1313,10 @@ async def _prefetch_worker(worker_id: int = 0):
                     await _notify_edit(msg_id, f"⏸ Paused: {fn}")
                 else:
                     log.info(f"[prefetch:{worker_id}] {movie_id} preempted, requeueing")
-                    try:
-                        prefetch_queue.put_nowait(movie_id)
-                    except asyncio.QueueFull:
+                    if not _queue_put(movie_id):
                         log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on preempt requeue")
             else:
-                done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+                done_val = await appstate.redis_client.get(f"tgstream:dl:done:{movie_id}")
                 if done_val == b"1":
                     ready_text = f"✅ Already cached: {fn}\n{BASE_URL}/proxy/{movie_id}"
                     if msg_id:
@@ -1311,11 +1334,9 @@ async def _prefetch_worker(worker_id: int = 0):
                     else:
                         msg_id = await _notify_send(f"⏳ Waiting to prefetch: {fn}\n(Another download is currently active)")
                     if msg_id:
-                        deferred_notifications[movie_id] = msg_id
+                        await _deferred_set(movie_id, msg_id)
                     await asyncio.sleep(15)
-                    try:
-                        prefetch_queue.put_nowait(movie_id)
-                    except asyncio.QueueFull:
+                    if not _queue_put(movie_id):
                         log.info(f"[prefetch:{worker_id}] prefetch_queue full, dropping {movie_id} on deferred requeue")
             log.info(f"[prefetch:{worker_id}] finished {movie_id}")
         except Exception as e:
@@ -1329,17 +1350,17 @@ async def _prefetch_worker(worker_id: int = 0):
 async def _sync_channel(force: bool = False) -> int:
     async with _sync_lock:
         if not force:
-            last = await redis_client.get(st.R_SYNC_TS)
+            last = await appstate.redis_client.get(st.R_SYNC_TS)
             if last:
                 try:
                     interval = SYNC_POLL_S if DISABLE_BOT_LISTENER else SYNC_INTERVAL
                     if (time.time() - float(last)) < interval:
                         # Return the current movies count
-                        return await redis_client.hlen(st.R_MOVIES)
+                        return await appstate.redis_client.hlen(st.R_MOVIES)
                 except ValueError:
                     pass
 
-        acquired = await redis_client.set(st.R_SYNC_LCK, "1", ex=600, nx=True)
+        acquired = await appstate.redis_client.set(st.R_SYNC_LCK, "1", ex=600, nx=True)
         if not acquired:
             return 0
         try:
@@ -1350,12 +1371,12 @@ async def _sync_channel(force: bool = False) -> int:
             # post handler) and roughly every FULL_RECONCILE_S otherwise —
             # routine polling uses min_id so it only pulls NEW messages
             # instead of re-scanning the whole channel every cycle.
-            last_full = await redis_client.get(st.R_SYNC_FULL_TS)
+            last_full = await appstate.redis_client.get(st.R_SYNC_FULL_TS)
             do_full = force or not last_full or (time.time() - float(last_full)) > FULL_RECONCILE_S
 
             min_id = 0
             if not do_full:
-                raw_max = await redis_client.get(st.R_SYNC_MAX_ID)
+                raw_max = await appstate.redis_client.get(st.R_SYNC_MAX_ID)
                 min_id = int(raw_max) if raw_max else 0
 
             count = 0
@@ -1381,7 +1402,7 @@ async def _sync_channel(force: bool = False) -> int:
                         fn = getattr(media, "file_name", None)
                         if not fn: continue
                         mid = st.movie_id(fn)
-                        await st.save_movie(redis_client, mid, {
+                        await st.save_movie(appstate.redis_client, mid, {
                             "message_id": msg.id, "file_name": fn,
                             "file_size": media.file_size,
                             "file_size_text": st.fmt_size(media.file_size),
@@ -1405,15 +1426,13 @@ async def _sync_channel(force: bool = False) -> int:
             new_ids = found_ids - existing_ids
             for mid in new_ids:
                 log.info(f"Sync: new movie detected, enqueueing for prefetch: {mid}")
-                stopped = await redis_client.get(R_DL_STOPPED.format(mid))
+                stopped = await appstate.redis_client.get(R_DL_STOPPED.format(mid))
                 if stopped != b"1":
-                    try:
-                        prefetch_queue.put_nowait(mid)
+                    if not _queue_put(mid):
+                        log.info(f"[sync] prefetch_queue full, dropping {mid}")
+                    elif mid in found_msg_ids:
                         # React 👨‍💻 on the channel post to signal prefetch queued
-                        if mid in found_msg_ids:
-                            _schedule(_send_channel_reaction(found_msg_ids[mid], "👨‍💻"))
-                    except asyncio.QueueFull:
-                        log.warning(f"Sync: prefetch_queue full, skipping {mid}")
+                        _schedule(_send_channel_reaction(found_msg_ids[mid], "👨‍💻"))
 
             # Clean up deleted movies — only meaningful on a full walk;
             # an incremental (min_id) pass never sees old messages so it
@@ -1423,12 +1442,12 @@ async def _sync_channel(force: bool = False) -> int:
                 removed_ids = existing_ids - found_ids
                 for mid in removed_ids:
                     log.info(f"Sync: removing deleted movie {mid} from index")
-                    await st.del_movie(redis_client, mid)
-                    await download_manager.evict(mid, redis_client,
+                    await st.del_movie(appstate.redis_client, mid)
+                    await download_manager.evict(mid, appstate.redis_client,
                                                  file_name=existing_movies.get(mid, {}).get("file_name"))
                 if removed_ids:
                     _invalidate_movies_cache()
-                await redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
+                await appstate.redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
 
             if new_ids or removed_ids:
                 await _notify_send(f"🔄 Synced: {len(new_ids)} new, {len(removed_ids)} removed")
@@ -1439,12 +1458,12 @@ async def _sync_channel(force: bool = False) -> int:
                 await _rescan_missing_files(existing_movies)
 
             if max_id_seen > min_id:
-                await redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
-            await redis_client.set(st.R_SYNC_TS, str(time.time()))
+                await appstate.redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
+            await appstate.redis_client.set(st.R_SYNC_TS, str(time.time()))
             log.info(f"Sync: {count} new/updated movies ({'full' if do_full else 'incremental'})")
-            return await redis_client.hlen(st.R_MOVIES)
+            return await appstate.redis_client.hlen(st.R_MOVIES)
         finally:
-            await redis_client.delete(st.R_SYNC_LCK)
+            await appstate.redis_client.delete(st.R_SYNC_LCK)
 
 
 MANIFEST = {
@@ -1462,8 +1481,8 @@ MANIFEST = {
 
 @app.get("/")
 async def health():
-    movies = await redis_client.hlen(st.R_MOVIES)
-    last   = await redis_client.get(st.R_SYNC_TS)
+    movies = await appstate.redis_client.hlen(st.R_MOVIES)
+    last   = await appstate.redis_client.get(st.R_SYNC_TS)
     age    = round((time.time() - float(last)) / 60, 1) if last else None
     dl     = download_manager.stats()
     return {"status": "ok", "movies": movies, "channel": CHANNEL_USERNAME,
@@ -1507,7 +1526,7 @@ async def debug_movies(request: Request):
         task = download_manager.get(mid)
         dl_map = download_manager.get_map(mid)
         if not dl_map:
-            dl_map = await download_manager._load_map(mid, redis_client)
+            dl_map = await download_manager._load_map(mid, appstate.redis_client)
 
         file_path = find_cache_path(mid, entry.get("file_name"))
         exists = file_path.exists()
@@ -1521,7 +1540,7 @@ async def debug_movies(request: Request):
 
         is_done = False
         if exists:
-            done_val = await redis_client.get(f"tgstream:dl:done:{mid}")
+            done_val = await appstate.redis_client.get(f"tgstream:dl:done:{mid}")
             is_done = done_val == b"1" or cached_bytes >= fs
 
         entry["is_done"] = is_done
@@ -1559,10 +1578,10 @@ async def catalog(type: str, id: str):
             async with _catalog_sem:
                 fn = m.get("file_name","Unknown")
                 try:
-                    poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
+                    poster, imdb_id = await st.get_poster_and_imdb(appstate.redis_client, fn)
                 except Exception as e:
                     log.error(f"[catalog] Poster fetch failed for {fn}: {e}")
-                    poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
+                    poster, imdb_id = st._local_placeholder_poster(fn), ""
                 title, year = st.parse_title_year(fn)
                 meta = {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
                         "poster": poster, "posterShape": "poster", "year": year}
@@ -1591,10 +1610,10 @@ async def catalog(type: str, id: str):
             async with _catalog_sem:
                 fn = group["files"][0][1].get("file_name","Unknown")
                 try:
-                    poster, imdb_id = await st.get_poster_and_imdb(redis_client, fn)
+                    poster, imdb_id = await st.get_poster_and_imdb(appstate.redis_client, fn)
                 except Exception as e:
                     log.error(f"[catalog] Poster fetch failed for {fn}: {e}")
-                    poster, imdb_id = "https://via.placeholder.com/300x450?text=No+Poster", ""
+                    poster, imdb_id = st._local_placeholder_poster(fn), ""
                 year = ""
                 for _, m in group["files"]:
                     _, y = st.parse_title_year(m.get("file_name",""))
@@ -1664,10 +1683,10 @@ async def meta(type: str, id: str):
         fn = movie.get("file_name","Unknown")
         title, year = st.parse_title_year(fn)
         try:
-            poster = await st.get_poster(redis_client, fn)
+            poster = await st.get_poster(appstate.redis_client, fn)
         except Exception as e:
             log.error(f"[meta] Poster fetch failed for {fn}: {e}")
-            poster = "https://via.placeholder.com/300x450?text=No+Poster"
+            poster = st._local_placeholder_poster(fn)
         return JSONResponse({"meta": {"id": id, "type": type, "name": title or fn, "year": year,
             "poster": poster, "description": fn, "posterShape": "poster"}})
     else:  # type == "series"
@@ -1679,10 +1698,10 @@ async def meta(type: str, id: str):
         fn = first_file.get("file_name", "Unknown")
         show_title = st.parse_show_title(fn)
         try:
-            poster = await st.get_poster(redis_client, fn)
+            poster = await st.get_poster(appstate.redis_client, fn)
         except Exception as e:
             log.error(f"[meta] Poster fetch failed for {fn}: {e}")
-            poster = "https://via.placeholder.com/300x450?text=No+Poster"
+            poster = st._local_placeholder_poster(fn)
         year = ""
         for m in matching_files:
             _, y = st.parse_title_year(m.get("file_name", ""))
@@ -1798,7 +1817,7 @@ async def stream(type: str, id: str):
         msg   = await _fetch_msg(movie["message_id"])
         media = msg.video or msg.document
         if not media:
-            await st.del_movie(redis_client, clean)
+            await st.del_movie(appstate.redis_client, clean)
             _invalidate_movies_cache()
             return JSONResponse({"streams": []})
         fs = movie.get("file_size") or media.file_size
@@ -1854,7 +1873,7 @@ async def subtitles(type: str, id: str):
         return JSONResponse({"subtitles": []})
         
     # Get IMDB ID
-    _, imdb_id = await st.get_poster_and_imdb(redis_client, filename)
+    _, imdb_id = await st.get_poster_and_imdb(appstate.redis_client, filename)
     if not imdb_id:
         return JSONResponse({"subtitles": []})
         
@@ -1866,10 +1885,10 @@ async def subtitles(type: str, id: str):
         
     # Query OpenSubtitles v3 addon
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
-            if r.status_code == 200:
-                return JSONResponse(r.json())
+        client = st._get_http_client()
+        r = await client.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
+        if r.status_code == 200:
+            return JSONResponse(r.json())
     except Exception as e:
         log.error(f"[subtitles] failed to fetch from OpenSubtitles: {e}")
         
@@ -1878,17 +1897,17 @@ async def subtitles(type: str, id: str):
 
 async def _ensure_download(movie_id: str, file_size: int, message_id: int, file_name: str = None):
     # A play request overrides a previous explicit pause/evict.
-    await redis_client.delete(R_DL_STOPPED.format(movie_id))
+    await appstate.redis_client.delete(R_DL_STOPPED.format(movie_id))
     await download_manager.get_or_create(
         movie_id=movie_id, file_size=file_size, message_id=message_id,
-        redis=redis_client, byte_streamer=byte_streamer, fetch_msg_fn=_fetch_msg,
+        redis=appstate.redis_client, byte_streamer=appstate.byte_streamer, fetch_msg_fn=_fetch_msg,
         priority=True, file_name=file_name,
     )
-    await download_manager.evict_lru_if_needed(redis_client)
+    await download_manager.evict_lru_if_needed(appstate.redis_client)
 
 
 async def _is_cached(movie_id: str, file_name: str = None) -> bool:
-    done = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+    done = await appstate.redis_client.get(f"tgstream:dl:done:{movie_id}")
     if done != b"1":
         return False
     sparse_path = find_cache_path(movie_id, file_name)
@@ -1921,7 +1940,7 @@ async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = Non
     so proxy Path A can pread immediately.
     Never touches Telegram.
     """
-    return await download_manager.hydrate_cached(movie_id, file_size, redis_client, file_name)
+    return await download_manager.hydrate_cached(movie_id, file_size, appstate.redis_client, file_name)
 
 
 def _bucket_rel_path(movie_id: str, file_name: str | None = None) -> str | None:
@@ -2115,20 +2134,20 @@ async def proxy(movie_id: str, request: Request):
         async def _mixed():
             async for chunk in _yield_local_file(dl_file, start, covered, request):
                 yield chunk
-            async with stream_sem:
+            async with appstate.stream_sem:
                 try: msg = await _fetch_msg(movie["message_id"])
                 except Exception: return
                 aligned   = (rest_start // TG_CHUNK) * TG_CHUNK
                 first_cut = rest_start - aligned
                 last_cut  = (end % TG_CHUNK) + 1
                 parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
-                byte_streamer.mark_live_start(movie_id)
+                appstate.byte_streamer.mark_live_start(movie_id)
                 try:
-                    async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
+                    async for chunk in appstate.byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
                         if await request.is_disconnected(): break
                         yield chunk
                 finally:
-                    byte_streamer.mark_live_end(movie_id)
+                    appstate.byte_streamer.mark_live_end(movie_id)
 
         return StreamingResponse(_mixed(), status_code=206,
                                  headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
@@ -2145,7 +2164,7 @@ async def proxy(movie_id: str, request: Request):
         raise HTTPException(502, "Telegram unavailable")
 
     if not (msg.video or msg.document):
-        await st.del_movie(redis_client, movie_id)
+        await st.del_movie(appstate.redis_client, movie_id)
         _invalidate_movies_cache()
         raise HTTPException(404, "Deleted from Telegram")
 
@@ -2157,13 +2176,13 @@ async def proxy(movie_id: str, request: Request):
     async def _live():
         # No semaphore here — live proxy requests must never queue behind each other.
         # Pyrogram handles MTProto-level concurrency internally.
-        byte_streamer.mark_live_start(movie_id)
+        appstate.byte_streamer.mark_live_start(movie_id)
         try:
-            async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
+            async for chunk in appstate.byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
                 if await request.is_disconnected(): break
                 yield chunk
         finally:
-            byte_streamer.mark_live_end(movie_id)
+            appstate.byte_streamer.mark_live_end(movie_id)
 
     return StreamingResponse(_live(), status_code=206,
                              headers={**headers, "X-Source": "telegram-live"}, media_type=ctype_val)
@@ -2194,7 +2213,7 @@ async def start_download_media(movie_id: str, x_api_key: str | None = Header(def
         except Exception:
             raise HTTPException(status_code=502, detail="Telegram unavailable")
 
-    await redis_client.delete(R_DL_STOPPED.format(movie_id))
+    await appstate.redis_client.delete(R_DL_STOPPED.format(movie_id))
     _schedule(_ensure_download(movie_id, file_size, movie["message_id"], movie.get("file_name")))
     return {"status": "ok"}
 
@@ -2204,7 +2223,7 @@ async def pause_download_media(movie_id: str, x_api_key: str | None = Header(def
     _check_api_auth(x_api_key)
     task = download_manager.get(movie_id)
     if task:
-        await redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
+        await appstate.redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
         task.cancel()
         return {"status": "ok"}
     return {"status": "ignored"}
@@ -2213,11 +2232,11 @@ async def pause_download_media(movie_id: str, x_api_key: str | None = Header(def
 @app.post("/api/media/{movie_id}/evict")
 async def evict_cache_media(movie_id: str, x_api_key: str | None = Header(default=None)):
     _check_api_auth(x_api_key)
-    await redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
+    await appstate.redis_client.set(R_DL_STOPPED.format(movie_id), "1", ex=86400)
     movies = await _get_movies()
-    await download_manager.evict(movie_id, redis_client,
+    await download_manager.evict(movie_id, appstate.redis_client,
                                  file_name=movies.get(movie_id, {}).get("file_name"))
-    deferred_notifications.pop(movie_id, None)  # #2: prevent leak on API eviction
+    await _deferred_pop(movie_id)  # #2: prevent leak on API eviction
     _schedule(_delete_bucket_object(movie_id, movies.get(movie_id, {}).get("file_name")))
     return {"status": "ok"}
 
@@ -2231,9 +2250,9 @@ async def delete_media(movie_id: str, delete_tg: bool = False, x_api_key: str | 
         raise HTTPException(status_code=404, detail="Movie not found in index")
     
     # 1. Evict cache from downloader
-    await download_manager.evict(movie_id, redis_client,
+    await download_manager.evict(movie_id, appstate.redis_client,
                                  file_name=movie.get("file_name"))
-    deferred_notifications.pop(movie_id, None)  # #2: prevent leak on delete
+    await _deferred_pop(movie_id)  # #2: prevent leak on delete
     _schedule(_delete_bucket_object(movie_id, movie.get("file_name")))
     
     # 2. Optionally delete from Telegram
@@ -2250,7 +2269,7 @@ async def delete_media(movie_id: str, delete_tg: bool = False, x_api_key: str | 
             raise HTTPException(status_code=502, detail=f"Failed to delete from Telegram: {e}")
             
     # 3. Delete from index
-    await st.del_movie(redis_client, movie_id)
+    await st.del_movie(appstate.redis_client, movie_id)
     _invalidate_movies_cache()
     return {"status": "ok"}
 

@@ -47,6 +47,7 @@ import logging
 import os
 import time
 import urllib.parse
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -70,7 +71,7 @@ HF_BUCKET_VERIFY  = os.getenv("HF_BUCKET_VERIFY", "true").strip().lower() != "fa
 _S3_HOST = urllib.parse.urlparse(HF_S3_ENDPOINT).netloc
 
 # rel_path -> (expires_at, url) cache: the last verified player-facing URL.
-_VERIFY: dict[str, tuple[float, str]] = {}
+_VERIFY: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
 # internal-only hosts the CDN may redirect to when resolved from inside HG's network
 _INTERNAL_HOST_SUBSTRINGS = ("cas-bridge", "hf-internal", ".internal", "internal.")
 
@@ -127,11 +128,42 @@ def _sigv4_sign(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _sigv4_signing_key(secret_key: str, date_stamp: str) -> bytes:
+def _sigv4_signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:
     k_date = _sigv4_sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
-    k_region = _sigv4_sign(k_date, HF_S3_REGION)
+    k_region = _sigv4_sign(k_date, region)
     k_service = _sigv4_sign(k_region, "s3")
     return _sigv4_sign(k_service, "aws4_request")
+
+
+def _sigv4_query_string(access_key: str, amz_date: str, date_stamp: str, region: str) -> str:
+    """Sorted canonical query string of the presign parameters."""
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    params = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", f"{access_key}/{scope}"),
+        ("X-Amz-Date", amz_date),
+        ("X-Amz-Expires", str(HF_S3_EXPIRES)),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    return "&".join(
+        f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+        for k, v in sorted(params)
+    )
+
+
+def _sigv4_canonical_request(method: str, canonical_uri: str, query_string: str, host: str) -> str:
+    return "\n".join([
+        method.upper(), canonical_uri, query_string,
+        f"host:{host}\n", "host", "UNSIGNED-PAYLOAD",
+    ])
+
+
+def _sigv4_string_to_sign(amz_date: str, date_stamp: str, region: str, canonical_request: str) -> str:
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    return "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
 
 
 def presigned_uri(method: str, canonical_key: str, now=None) -> str:
@@ -140,38 +172,17 @@ def presigned_uri(method: str, canonical_key: str, now=None) -> str:
     if not (HF_S3_ACCESS_KEY and HF_S3_SECRET_KEY):
         return ""
 
-    signed_headers = "host"
     canonical_uri = "/" + _owner() + "/" + urllib.parse.quote(canonical_key, safe="/~")
 
     t = now or datetime.now(timezone.utc)
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = t.strftime("%Y%m%d")
-    scope = f"{date_stamp}/{HF_S3_REGION}/s3/aws4_request"
 
-    params = [
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
-        ("X-Amz-Credential", f"{HF_S3_ACCESS_KEY}/{scope}"),
-        ("X-Amz-Date", amz_date),
-        ("X-Amz-Expires", str(HF_S3_EXPIRES)),
-        ("X-Amz-SignedHeaders", signed_headers),
-    ]
-    params.sort()
-    qs = "&".join(
-        f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
-        for k, v in params
-    )
-
-    canonical_headers = f"host:{_S3_HOST}\n"
-    canonical_request = "\n".join([
-        method.upper(), canonical_uri, qs, canonical_headers,
-        signed_headers, "UNSIGNED-PAYLOAD",
-    ])
-    string_to_sign = "\n".join([
-        "AWS4-HMAC-SHA256", amz_date, scope,
-        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-    ])
+    qs = _sigv4_query_string(HF_S3_ACCESS_KEY, amz_date, date_stamp, HF_S3_REGION)
+    canonical_request = _sigv4_canonical_request(method, canonical_uri, qs, _S3_HOST)
+    string_to_sign = _sigv4_string_to_sign(amz_date, date_stamp, HF_S3_REGION, canonical_request)
     signature = hmac.new(
-        _sigv4_signing_key(HF_S3_SECRET_KEY, date_stamp),
+        _sigv4_signing_key(HF_S3_SECRET_KEY, date_stamp, HF_S3_REGION),
         string_to_sign.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -270,8 +281,12 @@ async def try_redirect(rel_path: str) -> str:
 
     if url:
         _VERIFY[rel_path] = (now + ttl, url)
+        _VERIFY.move_to_end(rel_path)
         if len(_VERIFY) > 1000:
-            _VERIFY.clear()
+            # LRU-style eviction: drop the oldest ~10% instead of clearing
+            # everything, so a cache miss doesn't thundering-herd the bucket.
+            for _ in range(len(_VERIFY) - 900):
+                _VERIFY.popitem(last=False)
     else:
         _VERIFY.pop(rel_path, None)
     return url
