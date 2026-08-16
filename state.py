@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import PTN
 import httpx
-from store import LocalStore
+from store import HybridStore
 
 log = logging.getLogger("tgstream.state")
 
@@ -51,7 +51,7 @@ R_SYNC_FULL_TS = "tgstream:sync:last_full"
 
 
 # ── Movie index ───────────────────────────────────────────────────────────────
-async def load_movies(redis: LocalStore) -> dict:
+async def load_movies(redis: HybridStore) -> dict:
     raw = await redis.hgetall(R_MOVIES)
     movies = {}
     for k, v in raw.items():
@@ -62,11 +62,11 @@ async def load_movies(redis: LocalStore) -> dict:
     return movies
 
 
-async def save_movie(redis: LocalStore, mid: str, data: dict):
+async def save_movie(redis: HybridStore, mid: str, data: dict):
     await redis.hset(R_MOVIES, mid, json.dumps(data))
 
 
-async def del_movie(redis: LocalStore, mid: str):
+async def del_movie(redis: HybridStore, mid: str):
     await redis.hdel(R_MOVIES, mid)
 
 
@@ -129,13 +129,13 @@ async def _fetch_poster(filename: str) -> tuple[str, str]:
     return _local_placeholder_poster(title), ""
 
 
-async def get_poster(redis: LocalStore, filename: str) -> str:
+async def get_poster(redis: HybridStore, filename: str) -> str:
     """Legacy compat: returns only poster URL."""
     poster, _ = await get_poster_and_imdb(redis, filename)
     return poster
 
 
-async def get_poster_and_imdb(redis: LocalStore, filename: str) -> tuple[str, str]:
+async def get_poster_and_imdb(redis: HybridStore, filename: str) -> tuple[str, str]:
     """Returns (poster_url, imdb_id). Both cached in Redis for 24h."""
     # Use movie_id (slug + MD5 suffix) as cache key — avoids collisions between
     # filenames that share the same first N characters.

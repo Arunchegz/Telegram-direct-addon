@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from store import LocalStore
+from store import HybridStore
 from pyrogram.errors import FloodWait
 
 from clients import pool as client_pool
@@ -254,7 +254,7 @@ class DownloadTask:
         file_size: int,
         sparse: SparseFile,
         dl_map: DownloadMap,
-        redis: LocalStore,
+        redis: HybridStore,
         byte_streamer,          # streamer.ByteStreamer
         fetch_msg_fn,           # async fn(msg_id) -> msg
         message_id: int,
@@ -629,7 +629,7 @@ class DownloadManager:
         movie_id: str,
         file_size: int,
         message_id: int,
-        redis: LocalStore,
+        redis: HybridStore,
         byte_streamer,
         fetch_msg_fn,
         priority: bool = False,
@@ -745,7 +745,7 @@ class DownloadManager:
     def get_file(self, movie_id: str) -> Optional[SparseFile]:
         return self._files.get(movie_id)
 
-    async def evict(self, movie_id: str, redis: LocalStore,
+    async def evict(self, movie_id: str, redis: HybridStore,
                     file_name: str = None):
         """Cancel task, delete local file, clear Redis download state."""
         # Pop state inside lock, then do I/O (cancel + file delete) outside
@@ -782,7 +782,7 @@ class DownloadManager:
         except OSError:
             return 0
 
-    async def evict_lru_if_needed(self, redis: LocalStore):
+    async def evict_lru_if_needed(self, redis: HybridStore):
         """Evict oldest accessed movies if total local storage > MAX_LOCAL_GB."""
         # Never evict a movie currently being streamed (live proxy) or with a
         # running priority (play-triggered) download — eviction closes the fd
@@ -862,7 +862,7 @@ class DownloadManager:
             return_exceptions=True,
         )
 
-    async def _load_map(self, movie_id: str, redis: LocalStore) -> DownloadMap:
+    async def _load_map(self, movie_id: str, redis: HybridStore) -> DownloadMap:
         raw = await redis.get(R_DL_MAP.format(movie_id))
         if raw:
             try:
@@ -885,7 +885,7 @@ class DownloadManager:
             }
         return result
 
-    async def hydrate_cached(self, movie_id: str, file_size: int, redis: LocalStore,
+    async def hydrate_cached(self, movie_id: str, file_size: int, redis: HybridStore,
                              file_name: str | None = None) -> bool:
         """
         Returns True if the file is fully downloaded locally and ready to serve.

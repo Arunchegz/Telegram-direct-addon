@@ -27,7 +27,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-from store import store as _local_store  # replaces Redis
+import redis.asyncio as aioredis
+from store import HybridStore as _HybridStore
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,7 +96,7 @@ if CHANNEL_USERNAME:
     except ValueError:
         pass
 
-# REDIS_URL removed — using local in-process store (store.py)
+REDIS_URL          = os.getenv("REDIS_URL", "")
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 2MB initial fetch
@@ -179,9 +180,18 @@ def _log_task_exception(task: asyncio.Task):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    # Initialise local in-process store (replaces Upstash Redis)
-    await _local_store.load()
-    appstate.redis_client = _local_store
+    # Hybrid store: Redis for persistent state, local JSON for dl maps, in-memory for poster cache
+    _redis = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=False,
+        max_connections=10,
+        socket_connect_timeout=10,
+        socket_keepalive=True,
+        retry_on_timeout=True,
+        health_check_interval=30,
+    )
+    appstate.redis_client = _HybridStore(_redis)
+    await appstate.redis_client.load()
     appstate.stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)

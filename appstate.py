@@ -14,7 +14,7 @@ from __future__ import annotations
 class AppState:
     """Holds runtime objects created during lifespan startup."""
 
-    # LocalStore instance (replaces Redis — no external dependency)
+    # HybridStore instance (Redis + local JSON + in-memory poster cache)
     redis_client = None
     # ByteStreamer — chunk streaming with per-client throttle/backoff
     byte_streamer = None
