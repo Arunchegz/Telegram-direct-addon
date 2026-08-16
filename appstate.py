@@ -14,7 +14,7 @@ from __future__ import annotations
 class AppState:
     """Holds runtime objects created during lifespan startup."""
 
-    # aioredis.Redis client (connection pool)
+    # LocalStore instance (replaces Redis — no external dependency)
     redis_client = None
     # ByteStreamer — chunk streaming with per-client throttle/backoff
     byte_streamer = None
