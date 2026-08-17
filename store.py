@@ -41,6 +41,8 @@ _PERSIST_DEBOUNCE_S = 10.0
 _LOCAL_PREFIXES = (
     "tgstream:dl:map:",
     "tgstream:dl:ts:",
+    "tgstream:dl:done:",     # set once per completed download, read frequently
+    "tgstream:dl:stopped:",  # set on pause/evict, read on requeue decisions
 )
 # Key prefixes kept in-memory only (poster/imdb cache)
 _MEM_PREFIXES = (

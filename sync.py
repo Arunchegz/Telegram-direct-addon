@@ -67,6 +67,11 @@ async def _sync_loop():
                     await _sync_channel(force=False)
             except Exception as e:
                 log.error(f"[sync_loop] retry failed: {e}")
+        # Sleep between iterations — without this the loop spins tight, calling
+        # Redis (get R_SYNC_TS + hlen R_MOVIES) thousands of times per minute
+        # even when _sync_channel returns early. Use half the minimum interval
+        # so we never miss a scheduled sync window by more than one tick.
+        await asyncio.sleep(min(SYNC_POLL_S, SYNC_INTERVAL) // 2)
 
 REACTION_FALLBACK = os.getenv("REACTION_FALLBACK", "🤔")  # used when the primary emoji is not in the channel's allowed reactions
 
@@ -283,8 +288,10 @@ async def _sync_channel(force: bool = False) -> int:
                 try:
                     interval = SYNC_POLL_S if DISABLE_BOT_LISTENER else SYNC_INTERVAL
                     if (time.time() - float(last)) < interval:
-                        # Return the current movies count
-                        return await appstate.redis_client.hlen(st.R_MOVIES)
+                        # Return the current movies count from the in-memory cache
+                        # (avoids a Redis hlen round-trip on every early-return tick).
+                        movies = await _get_movies()
+                        return len(movies)
                 except ValueError:
                     pass
 
