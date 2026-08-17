@@ -414,6 +414,8 @@ async def _remove_deleted_messages(message_ids: set[int], reason: str = "delete 
         _invalidate_movies_cache()
         await download_manager.evict(mid, appstate.redis_client, file_name=file_name)
         await _deferred_pop(mid)
+        # Remove the file from the HF bucket (permanent storage).
+        _schedule(_delete_bucket_object(mid, file_name))
     # Drop the deleted movies from the prefetch queue (can't remove arbitrary
     # items from asyncio.Queue — drain and skip matching ids).
     drained = []
@@ -2080,6 +2082,7 @@ _sync_configure(
     _notify_send=_notify_send,
     _queue_put=_queue_put,
     _prefetch_queued=_prefetch_queued,
+    _delete_bucket_object=_delete_bucket_object,
     get_tg=get_tg,
     CHANNEL_USERNAME=CHANNEL_USERNAME,
     DISABLE_BOT_LISTENER=DISABLE_BOT_LISTENER,

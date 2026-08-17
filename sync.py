@@ -43,6 +43,7 @@ _schedule = None
 _notify_send = None
 _queue_put = None
 _prefetch_queued = None        # live set object from main (queue membership)
+_delete_bucket_object = None   # -> main._delete_bucket_object
 get_tg = None
 CHANNEL_USERNAME = None
 DISABLE_BOT_LISTENER = None
@@ -368,10 +369,13 @@ async def _sync_channel(force: bool = False) -> int:
             if do_full:
                 removed_ids = existing_ids - found_ids
                 for mid in removed_ids:
+                    file_name = existing_movies.get(mid, {}).get("file_name")
                     log.info(f"Sync: removing deleted movie {mid} from index")
                     await st.del_movie(appstate.redis_client, mid)
-                    await download_manager.evict(mid, appstate.redis_client,
-                                                 file_name=existing_movies.get(mid, {}).get("file_name"))
+                    await download_manager.evict(mid, appstate.redis_client, file_name=file_name)
+                    # Remove the file from the HF bucket (permanent storage).
+                    if _delete_bucket_object is not None:
+                        _schedule(_delete_bucket_object(mid, file_name))
                 if removed_ids:
                     _invalidate_movies_cache()
                 await appstate.redis_client.set(st.R_SYNC_FULL_TS, str(time.time()))
