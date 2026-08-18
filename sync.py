@@ -399,6 +399,7 @@ async def _sync_channel(force: bool = False) -> int:
                 await appstate.redis_client.set(st.R_SYNC_MAX_ID, str(max_id_seen))
             await appstate.redis_client.set(st.R_SYNC_TS, str(time.time()))
             log.info(f"Sync: {count} new/updated movies ({'full' if do_full else 'incremental'})")
-            return await appstate.redis_client.hlen(st.R_MOVIES)
+            movies = await _get_movies()
+            return len(movies)
         finally:
             await appstate.redis_client.delete(st.R_SYNC_LCK)

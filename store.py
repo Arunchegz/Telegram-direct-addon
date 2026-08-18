@@ -43,6 +43,8 @@ _LOCAL_PREFIXES = (
     "tgstream:dl:ts:",
     "tgstream:dl:done:",     # set once per completed download, read frequently
     "tgstream:dl:stopped:",  # set on pause/evict, read on requeue decisions
+    "tgstream:last_sync",    # sync timestamp — single instance, no cross-process need
+    "tgstream:sync:",        # sync:max_msg_id, sync:last_full — same
 )
 # Key prefixes kept in-memory only (poster/imdb cache)
 _MEM_PREFIXES = (

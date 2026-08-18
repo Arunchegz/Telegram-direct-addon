@@ -257,7 +257,8 @@ async def lifespan(app: FastAPI):
                 fn = getattr(media, "file_name", None)
                 if fn:
                     mid = st.movie_id(fn)
-                    if not await appstate.redis_client.hexists(st.R_MOVIES, mid):
+                    movies = await _get_movies()
+                    if mid not in movies:
                         log.info(f"[listener] instantly adding new movie to catalog: {mid}")
                         await st.save_movie(appstate.redis_client, mid, {
                             "message_id": message.id, "file_name": fn,
@@ -1153,11 +1154,11 @@ MANIFEST = {
 
 @app.get("/")
 async def health():
-    movies = await appstate.redis_client.hlen(st.R_MOVIES)
+    movies = await _get_movies()
     last   = await appstate.redis_client.get(st.R_SYNC_TS)
     age    = round((time.time() - float(last)) / 60, 1) if last else None
     dl     = download_manager.stats()
-    return {"status": "ok", "movies": movies, "channel": CHANNEL_USERNAME,
+    return {"status": "ok", "movies": len(movies), "channel": CHANNEL_USERNAME,
             "sync_age_min": age, "active_downloads": len(dl), "download_stats": dl}
 
 
