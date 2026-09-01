@@ -35,7 +35,7 @@ Env:
   HF_S3_ACCESS_KEY  S3 credentials generated from a HF token — recommended
   HF_S3_SECRET_KEY  (Settings → Access Tokens → Generate S3 credentials)
   HF_S3_ENDPOINT    default https://s3.hf.co
-  HF_S3_EXPIRES     presigned URL lifetime in seconds (default 3600)
+  HF_S3_EXPIRES     presigned URL lifetime in seconds (default 21600)
   HF_BUCKET_VERIFY  probe availability before 302 (default "true")
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ HF_S3_ACCESS_KEY  = os.getenv("HF_S3_ACCESS_KEY", "").strip()
 HF_S3_SECRET_KEY  = os.getenv("HF_S3_SECRET_KEY", "").strip()
 HF_S3_ENDPOINT    = os.getenv("HF_S3_ENDPOINT", "https://s3.hf.co").rstrip("/")
 HF_S3_REGION      = os.getenv("HF_S3_REGION", "us-east-1").strip() or "us-east-1"
-HF_S3_EXPIRES     = int(os.getenv("HF_S3_EXPIRES", "3600"))
+HF_S3_EXPIRES     = int(os.getenv("HF_S3_EXPIRES", "21600"))
 HF_BUCKET_VERIFY  = os.getenv("HF_BUCKET_VERIFY", "true").strip().lower() != "false"
 
 _S3_HOST = urllib.parse.urlparse(HF_S3_ENDPOINT).netloc
