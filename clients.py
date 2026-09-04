@@ -34,7 +34,7 @@ class ClientUnavailableError(RuntimeError):
 class ClientPool:
     def __init__(self):
         self.clients: List[Client] = []
-        self._rr_counter = 0
+        self._rr_counter = -1  # start at -1 so first pick lands on index 0, not 1
         self._cooldown_until: Dict[int, float] = {}
         self._download_load: Dict[int, int] = {}   # idx -> # active DownloadTasks pinned to it
         self._broken: Dict[int, bool] = {}         # idx -> True if client connection is broken

@@ -265,7 +265,9 @@ async def try_redirect(rel_path: str) -> str:
         url = presigned_uri("GET", s3_canonical_key(rel_path))
         if HF_BUCKET_VERIFY and not await _probe_url(url):
             url = ""
-        ttl = HF_S3_EXPIRES
+        # Expire the cache entry 60s before the URL itself expires so we
+        # never serve a stale/expired presigned URL to the player.
+        ttl = max(HF_S3_EXPIRES - 60, 60)
     elif HF_TOKEN:
         url = await _resolve_with_token(rel_path)
         if url and HF_BUCKET_VERIFY and not await _probe_url(url):

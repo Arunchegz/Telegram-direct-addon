@@ -137,7 +137,7 @@ class ByteStreamer:
         # by session identity, so mixing object refs and ints as dict keys causes misses.
         key = (chat_id, message_id, client_idx if client_idx is not None else id(client))
         cached_msg, fetched_at = self._msg_cache.get(key, (None, 0.0))
-        if cached_msg is None or (now - fetched_at) > 3000:
+        if cached_msg is None or (now - fetched_at) > 1800:  # 30min TTL; file_reference expires ~1h
             try:
                 msg = await client.get_messages(chat_id, message_id)
             except Exception:
@@ -162,7 +162,7 @@ class ByteStreamer:
         if key in self._msg_cache:
             del self._msg_cache[key]
 
-    def prune_msg_cache(self, max_age_s: float = 3000):
+    def prune_msg_cache(self, max_age_s: float = 1800):
         """Drop entries older than max_age_s. Cache has no natural eviction
         otherwise and grows forever on a long-lived process."""
         now = time.time()
