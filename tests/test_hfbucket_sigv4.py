@@ -15,6 +15,7 @@ os.environ["HF_S3_SECRET_KEY"] = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 os.environ["HF_S3_ENDPOINT"] = "https://s3.hf.co"
 os.environ["HF_BUCKET_ID"] = "arunchegz1/Telegram_stremio-storage"
 os.environ["HF_S3_REGION"] = "us-east-1"
+os.environ["HF_S3_EXPIRES"] = "3600"
 
 from hfbucket import (  # noqa: E402  (env must be set before import)
     presigned_uri,

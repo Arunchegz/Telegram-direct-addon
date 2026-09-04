@@ -106,12 +106,10 @@
         </div>
         
         <div class="info-box">
-          <b style="color:var(--accent);">Hybrid Streaming Architecture (4 paths):</b><br>
+          <b style="color:var(--accent);">Streaming Architecture (2 tiers):</b><br>
           <ul style="margin-left: 20px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px;">
-            <li><b style="color:var(--success);">Path A (local)</b> — Byte-range exists on disk. Served instantly from local SparseFile cache.</li>
-            <li><b style="color:var(--primary-hover);">Path B (local-waited)</b> — Byte-range is currently downloading. Thread waits up to 2s for download to land.</li>
-            <li><b style="color:var(--warning-text);">Path C (mixed)</b> — Serves already-cached prefix locally, and transparently shifts back to Telegram live download for remainder.</li>
-            <li><b style="color:var(--danger-text);">Path D (telegram-live)</b> — Direct streaming fallback via Telegram MTProto.</li>
+            <li><b style="color:var(--success);">Permanent Storage (HF Bucket)</b> — Completed files redirect straight to Hugging Face CDN / S3 with zero Telegram cost.</li>
+            <li><b style="color:var(--danger-text);">Telegram Live</b> — Direct live streaming fallback via Telegram MTProto.</li>
           </ul>
         </div>
       </div>

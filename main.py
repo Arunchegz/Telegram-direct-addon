@@ -1433,12 +1433,6 @@ async def stream(type: str, id: str):
 
         for score, mid, m in scored_files:
             fn = m.get("file_name","")
-            try:
-                fs = m.get("file_size") or 0
-                if fs:
-                    _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
-            except Exception as e:
-                log.warning(f"[stream] warn: {e}")
             q,sz,src = m.get("quality","Unknown"),m.get("file_size_text","Unknown"),m.get("source","")
             cached = await _is_cached(mid, m.get("file_name"))
             label = "TGStream ⚡" if cached else "TGStream"
@@ -1464,13 +1458,6 @@ async def stream(type: str, id: str):
             s = s if s is not None else 1
             ep = ep if ep is not None else 1
             if s == season and ep == episode:
-                try:
-                    fs = m.get("file_size") or 0
-                    if fs:
-                        _schedule(_ensure_download(mid, fs, m["message_id"], m.get("file_name")))
-                except Exception as e:
-                    log.warning(f"[stream] warn: {e}")
-                
                 q   = m.get("quality","Unknown")
                 sz  = m.get("file_size_text","Unknown")
                 src = m.get("source","")
@@ -1493,8 +1480,6 @@ async def stream(type: str, id: str):
             await st.del_movie(appstate.redis_client, clean)
             _invalidate_movies_cache()
             return JSONResponse({"streams": []})
-        fs = movie.get("file_size") or media.file_size
-        _schedule(_ensure_download(clean, fs, movie["message_id"], movie.get("file_name")))
     except Exception as e:
         log.warning(f"[stream] warn: {e}")
     fn  = movie.get("file_name","Unknown")
@@ -1580,11 +1565,14 @@ async def _ensure_download(movie_id: str, file_size: int, message_id: int, file_
 
 
 async def _is_cached(movie_id: str, file_name: str = None) -> bool:
-    done = await appstate.redis_client.get(f"tgstream:dl:done:{movie_id}")
-    if done != b"1":
-        return False
-    sparse_path = find_cache_path(movie_id, file_name)
-    return sparse_path.exists()
+    """Returns True if the file is available in permanent storage (HF Bucket)."""
+    if HF_REDIRECT_DONE and hfbucket.configured():
+        rel = _bucket_rel_path(movie_id, file_name)
+        if rel:
+            bucket_url = await hfbucket.try_redirect(rel)
+            if bucket_url:
+                return True
+    return False
 
 
 async def _yield_local_file(dl_file, start: int, length: int, request: Request):
@@ -1643,16 +1631,13 @@ async def _delete_bucket_object(movie_id: str, file_name: str | None) -> None:
     if rel:
         await hfbucket.delete_object(rel)
 
-# ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
+# ─── PROXY (Permanent Storage & Telegram Live) ──────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"], operation_id="proxy_movie")
 async def proxy(movie_id: str, request: Request):
     """
-    Four-path resolution (in order):
-      A. Range fully in local SparseFile  -> pread, instant
-      B. Short wait for downloader catch-up -> pread if ready (aggressive with reduced timeout)
-      C. Partial local prefix + live Telegram for remainder -> mixed stream (triggers when LOCAL_READY_BYTES ahead cached)
-      D. Fully live Telegram MTProto       -> StreamingResponse fallback
-    X-Source header reveals which path was used (visible in dev tools).
+    Two-path resolution:
+      1. Permanent Storage (HuggingFace bucket) -> 302 Redirect to CDN
+      2. Telegram Live MTProto                  -> Direct live StreamingResponse
     """
     await metrics.record_proxy_request()
 
@@ -1679,13 +1664,7 @@ async def proxy(movie_id: str, request: Request):
             "Cache-Control": "public, max-age=3600", "ETag": etag,
         })
 
-    # ── Skip Telegram entirely if file already fully cached ─────────────────
-    _cached = await _hydrate_if_cached(movie_id, file_size, filename)
-
-    # ── HuggingFace bucket: serve completed files from permanent storage ─────
-    # 302 the player straight to the (signed) bucket URL so bytes come from
-    # HF's CDN — zero Telegram cost, survives restarts and local evictions.
-    # When the object isn't available yet, fall through to the local proxy.
+    # ── 1. Permanent Storage: serve completed files from HuggingFace bucket ───
     if HF_REDIRECT_DONE and hfbucket.configured():
         rel = _bucket_rel_path(movie_id, filename)
         if rel:
@@ -1694,10 +1673,7 @@ async def proxy(movie_id: str, request: Request):
                 await metrics.record_stream_path("bucket")
                 return RedirectResponse(bucket_url, status_code=302)
 
-    if not _cached:
-        _schedule(_ensure_download(movie_id, file_size, movie["message_id"], filename))
-
-    # Parse Range
+    # ── 2. Parse Range header ────────────────────────────────────────────────
     start, end = 0, file_size - 1
     rh = request.headers.get("range", "")
     if rh.startswith("bytes="):
@@ -1721,63 +1697,18 @@ async def proxy(movie_id: str, request: Request):
     req_start = start
     req_end = end
 
-    # Hint downloader — but ignore suffix-range probes (bytes=-N) and tiny
-    # metadata reads near EOF; these are container/moov-atom probes, not
-    # real playback position, and would wrongly drag the downloader to EOF.
-    task    = download_manager.get(movie_id)
-    dl_map  = download_manager.get_map(movie_id)
-    dl_file = download_manager.get_file(movie_id)
-
-    # Check cache status
-    covered = dl_map.covered_prefix(req_start) if (dl_map and dl_file and dl_file.exists()) else 0
-
-    # Path selection and capping
-    use_path = None
-    waited = False  # set when Path B's short wait converted to local
-    if covered > 0 and (req_start + covered - 1) >= req_end:
-        # Path A: Range fully in local SparseFile
-        use_path = "local"
-        end = req_end
-    elif covered > 0 and (req_start + covered - 1) >= req_end - SHORT_WAIT_GRACE_BYTES:
-        # Path B: almost there, wait briefly then re-check. A done task will
-        # never fire its progress event again — skip the wasted timeout wait.
-        if task and not task.is_done():
-            try:
-                await asyncio.wait_for(task.progress_event().wait(), timeout=WAIT_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                pass
-            # Task/map/file may have been replaced (preempted, evicted, restarted)
-            # while we waited — refresh before re-checking coverage.
-            dl_map  = download_manager.get_map(movie_id)
-            dl_file = download_manager.get_file(movie_id)
-            covered = dl_map.covered_prefix(req_start) if (dl_map and dl_file and dl_file.exists()) else 0
-            if covered > 0 and (req_start + covered - 1) >= req_end:
-                use_path = "local"
-                end = req_end
-                waited = True
-    if use_path is None and covered >= LOCAL_READY_BYTES:
-        # Path C: Mixed local prefix + live Telegram tail
-        use_path = "mixed"
-        end = req_end
-    if use_path is None:
-        # Path D: Telegram live fallback. Cap open-ended requests to avoid rate limits/over-streaming.
-        use_path = "telegram-live"
-        if not rh:
-            end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
-        elif rh.endswith("-"):
-            end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
-        else:
-            end = min(req_end, file_size - 1)
+    # Telegram live streaming: Cap open-ended requests to avoid rate limits/over-streaming
+    if not rh:
+        end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
+    elif rh.endswith("-"):
+        end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
+    else:
+        end = min(req_end, file_size - 1)
 
     if start < 0 or start >= file_size or end < start:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     total = end - start + 1
-
-    _is_suffix_probe = rh.startswith("bytes=-")
-    _is_tail_probe   = total <= 2 * 1024 * 1024 and start > file_size - (10 * 1024 * 1024)
-    if task and not _is_suffix_probe and not _is_tail_probe:
-        task.hint(start)
 
     headers = {
         "Accept-Ranges": "bytes", "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -1785,47 +1716,7 @@ async def proxy(movie_id: str, request: Request):
         "Cache-Control": "public, max-age=3600", "ETag": etag, "Vary": "Range",
     }
 
-    # ── Path A: fully local ───────────────────────────────────────────────────
-    if use_path == "local":
-        await metrics.record_stream_path("local-waited" if waited else "local")
-        await metrics.record_cache_hit(total)
-        return StreamingResponse(
-            _yield_local_file(dl_file, start, total, request),
-            status_code=206,
-            headers={**headers, "X-Source": "local"},
-            media_type=ctype_val,
-        )
-
-    # ── Path C: local prefix + live tail ────────────────────────────────────────
-    if use_path == "mixed":
-        await metrics.record_stream_path("mixed")
-        await metrics.record_cache_hit(covered)
-        await metrics.record_cache_miss(total - covered)
-
-        rest_start = start + covered
-
-        async def _mixed():
-            async for chunk in _yield_local_file(dl_file, start, covered, request):
-                yield chunk
-            async with appstate.stream_sem:
-                try: msg = await _fetch_msg(movie["message_id"])
-                except Exception: return
-                aligned   = (rest_start // TG_CHUNK) * TG_CHUNK
-                first_cut = rest_start - aligned
-                last_cut  = (end % TG_CHUNK) + 1
-                parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
-                appstate.byte_streamer.mark_live_start(movie_id)
-                try:
-                    async for chunk in appstate.byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
-                        if await request.is_disconnected(): break
-                        yield chunk
-                finally:
-                    appstate.byte_streamer.mark_live_end(movie_id)
-
-        return StreamingResponse(_mixed(), status_code=206,
-                                 headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
-
-    # ── Path D: fully live Telegram ───────────────────────────────────────────
+    # ── 5. Fully live Telegram streaming ─────────────────────────────────────
     await metrics.record_stream_path("telegram-live")
     await metrics.record_cache_miss(total)
 
@@ -1847,8 +1738,6 @@ async def proxy(movie_id: str, request: Request):
     parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
 
     async def _live():
-        # No semaphore here — live proxy requests must never queue behind each other.
-        # Pyrogram handles MTProto-level concurrency internally.
         appstate.byte_streamer.mark_live_start(movie_id)
         try:
             async for chunk in appstate.byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
