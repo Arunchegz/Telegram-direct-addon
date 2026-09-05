@@ -24,7 +24,7 @@ from pyrogram.session import Auth, Session
 TG_CHUNK = 1024 * 1024        # Live streaming chunk size (1MB) - balances startup speed and API calls
 PREFETCH_CHUNK = 2 * 1024 * 1024   # Background prefetch logical chunk size (2MB) - fewer GetFile requests, higher throughput
 TG_MAX_LIMIT = 1024 * 1024      # Telegram's maximum allowed limit per GetFile request (hard API limit)
-MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "100"))      # Live stream: inter-request delay per client (100ms → ~10 req/s cap)
+MIN_THROTTLE_MS = int(os.getenv("MIN_THROTTLE_MS", "50"))       # Live stream: inter-request delay per client (50ms → ~20 req/s cap; idle clients skip entirely)
 MIN_DL_THROTTLE_MS = int(os.getenv("MIN_DL_THROTTLE_MS", "600")) # Background dl: slower per client (600ms → ~1.6 req/s per client)
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
@@ -92,14 +92,22 @@ class ByteStreamer:
         await self._throttle_with_ms(c_idx, MIN_DL_THROTTLE_MS)
 
     async def _throttle_with_ms(self, c_idx, min_ms: int) -> None:
-        """Core throttle implementation, parameterized by minimum interval."""
+        """Core throttle implementation, parameterized by minimum interval.
+
+        FIX #5: Skip the sleep entirely when the client has been idle for
+        longer than min_ms — enforcing a throttle on a truly idle client
+        adds unnecessary startup latency for the first chunk of a new stream.
+        Only sleep when requests are actually bunched together.
+        """
         self._throttle_locks.setdefault(c_idx, asyncio.Lock())
         lock = self._throttle_locks[c_idx]
         async with lock:
             last = self._last_invoke_time.get(c_idx, 0.0)
-            elapsed = (time.time() - last) * 1000
-            if elapsed < min_ms:
-                await asyncio.sleep((min_ms - elapsed) / 1000)
+            elapsed_ms = (time.time() - last) * 1000
+            # Only throttle when requests are genuinely bunched; idle clients
+            # (elapsed > min_ms) get a free pass — no sleep needed.
+            if elapsed_ms < min_ms:
+                await asyncio.sleep((min_ms - elapsed_ms) / 1000)
             self._last_invoke_time[c_idx] = time.time()
 
     def _getfile_slot(self, c_idx, is_background: bool):

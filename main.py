@@ -168,6 +168,40 @@ def _schedule(coro):
     return task
 
 
+async def _prewarm_media_sessions():
+    """FIX #2: Pre-warm one Telegram media session per client in the pool.
+    Triggers the DC auth key exchange (2-4s per client) at startup rather than
+    on the first user play request, eliminating cold-start streaming delay.
+    Uses any available message_id from the catalog; silently skips if catalog
+    is empty at startup (sessions will warm on first real request instead)."""
+    await asyncio.sleep(3)  # Let pool fully settle first
+    try:
+        movies = await st.load_movies(appstate.redis_client)
+        if not movies:
+            log.info("[prewarm] catalog empty, skipping media session prewarm")
+            return
+        # Pick any message id — we just need to trigger _session() creation
+        sample_movie = next(iter(movies.values()))
+        msg_id = sample_movie.get("message_id")
+        if not msg_id:
+            return
+        clients = client_pool._clients if hasattr(client_pool, "_clients") else []
+        if not clients:
+            return
+        for idx, c in enumerate(clients):
+            try:
+                msg = await c.get_messages(CHANNEL_USERNAME, msg_id)
+                if msg and (msg.video or msg.document):
+                    from streamer import _extract_fid
+                    fid = _extract_fid(msg)
+                    await appstate.byte_streamer._session(c, fid)
+                    log.info(f"[prewarm] client {idx} media session warmed (DC{fid.dc_id})")
+            except Exception as e:
+                log.info(f"[prewarm] client {idx} prewarm skipped: {type(e).__name__}: {e}")
+    except Exception as e:
+        log.info(f"[prewarm] prewarm failed (non-fatal): {e}")
+
+
 def _log_task_exception(task: asyncio.Task):
     try:
         task.result()
@@ -304,8 +338,17 @@ async def lifespan(app: FastAPI):
     appstate.byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
     download_manager.streamer = appstate.byte_streamer
+
+    # FIX #2: Pre-warm Telegram media sessions for all clients so the first
+    # play request doesn't pay the 2-4s DC auth key exchange cost.
+    # We do this by fetching the most-recently-synced movie's message with each
+    # client, which triggers _session() → Auth → ImportAuthorization in background.
+    _schedule(_prewarm_media_sessions())
     download_manager.on_alert = _notify_send
-    download_manager.on_evict = lambda mid: deferred_notifications.pop(mid, None)  # sync callback; single atomic dict op is GIL-safe
+    def _on_evict(mid: str):
+        deferred_notifications.pop(mid, None)   # sync callback; GIL-safe
+        _done_set.discard(mid)                  # FIX #3: invalidate hot-cache on evict
+    download_manager.on_evict = _on_evict
 
     async def _on_download_complete(movie_id: str, message_id: int) -> None:
         """Fired by the downloader whenever a movie finishes caching —
@@ -1473,15 +1516,9 @@ async def stream(type: str, id: str):
 
     movie = movies.get(clean)
     if not movie: return JSONResponse({"streams": []})
-    try:
-        msg   = await _fetch_msg(movie["message_id"])
-        media = msg.video or msg.document
-        if not media:
-            await st.del_movie(appstate.redis_client, clean)
-            _invalidate_movies_cache()
-            return JSONResponse({"streams": []})
-    except Exception as e:
-        log.warning(f"[stream] warn: {e}")
+    # FIX #1: Do NOT call _fetch_msg here — that MTProto round-trip (~200-500ms)
+    # blocks Stremio before it even gets the URL. Validation happens lazily
+    # inside /proxy/ when the player makes its first byte-range request.
     fn  = movie.get("file_name","Unknown")
     q   = movie.get("quality","Unknown")
     sz  = movie.get("file_size_text","Unknown")
@@ -1594,6 +1631,14 @@ async def _yield_local_file(dl_file, start: int, length: int, request: Request):
 
 
 
+
+# FIX #3: In-memory set of fully-done movie_ids — eliminates Redis+disk I/O on
+# every proxy request for the common case (file already fully cached/in bucket).
+# R_DL_DONE is set-once and never cleared on a live run, so this is safe to cache
+# permanently in-process. Invalidated on evict (see download_manager.on_evict).
+_done_set: set[str] = set()
+
+
 async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = None) -> bool:
     """
     Returns True if the file is fully downloaded locally and ready to serve.
@@ -1601,7 +1646,13 @@ async def _hydrate_if_cached(movie_id: str, file_size: int, file_name: str = Non
     so proxy Path A can pread immediately.
     Never touches Telegram.
     """
-    return await download_manager.hydrate_cached(movie_id, file_size, appstate.redis_client, file_name)
+    # Fast path: pure in-memory lookup, zero I/O for already-confirmed files
+    if movie_id in _done_set:
+        return True
+    result = await download_manager.hydrate_cached(movie_id, file_size, appstate.redis_client, file_name)
+    if result:
+        _done_set.add(movie_id)
+    return result
 
 
 def _bucket_rel_path(movie_id: str, file_name: str | None = None) -> str | None:
