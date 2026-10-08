@@ -73,8 +73,33 @@ async def del_movie(redis: HybridStore, mid: str):
 # ── Poster cache ──────────────────────────────────────────────────────────────
 # Unified series-detection regex — used by is_series() checks everywhere.
 # Defined here so it is available before _fetch_poster which uses it.
+# Loose season/episode forms with no "E": "s2_01", "S02 01", "S2-01", "2x01".
+# Underscore counts as a separator (lookbehind only blocks letters/digits), so a
+# name like "_s2_01__attack_on_titan..." is recognised.
+_SE_LOOSE_S = r"(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(\d{1,3})(?![0-9A-Za-z])"
+_SE_LOOSE_X = r"(?<![A-Za-z0-9])(\d{1,2})[xX](\d{1,3})(?![0-9A-Za-z])"
+_SE_LOOSE_S_RE = re.compile(_SE_LOOSE_S)
+_SE_LOOSE_X_RE = re.compile(_SE_LOOSE_X)
+
+
+def _canon_se(filename: str) -> str:
+    """Rewrite loose season/episode tags ("s2_01", "2x01") as S02E01 so PTN and
+    the regex fallbacks all see a standard tag. Names with S01E01 are untouched."""
+    if re.search(r"[Ss]\d{1,2}[Ee]\d{1,3}", filename):
+        return filename
+    for rx in (_SE_LOOSE_S_RE, _SE_LOOSE_X_RE):
+        m = rx.search(filename)
+        if m:
+            tag = f" S{int(m.group(1)):02d}E{int(m.group(2)):02d} "
+            return filename[:m.start()] + tag + filename[m.end():]
+    return filename
+
+
 IS_SERIES_RE = re.compile(
     r"[Ss]\d{1,2}[Ee]\d{1,3}"          # S01E01 / S1E5
+    r"|" + _SE_LOOSE_S +                # s2_01 / S02 01 / S2-01
+    r"|" + _SE_LOOSE_X +                # 2x01
+    r""
     r"|[Ss]eason[\s._-]*\d+"            # Season.2 / Season 2
     r"|[Ee]pisode[\s._-]*\d+"           # Episode.3 / Episode 3
     r"|[Tt]emporada[\s._-]*\d+"         # Temporada.2 / Temporada 2 (Spanish/Portuguese)
@@ -260,14 +285,15 @@ def parse_title_year(filename: str) -> tuple[str, str]:
 
 
 def parse_show_title(filename: str) -> str:
-    name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", _canon_se(filename))
     name = re.sub(r"[._\-–—+]", " ", name)
     
     # Split by common season/episode patterns
     for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b"]:
-        parts = re.split(pattern, name, flags=re.IGNORECASE)
+        parts = re.split(pattern, name, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
-            name = parts[0]
+            # "S02E01 Attack On Titan 1080p": tag leads the name -> title follows it
+            name = parts[0] if parts[0].strip() else parts[-1]
             break
             
     # Split by year
@@ -299,6 +325,7 @@ def parse_season_episode(filename: str) -> tuple[Optional[int], Optional[int]]:
     Returns (season, episode) where season defaults to 1 for standalone episodes.
     Returns (None, None) if no SE found.
     """
+    filename = _canon_se(filename)
     r = PTN.parse(filename)
 
     season = r.get("season")
@@ -358,6 +385,7 @@ def normalize_title(title: str) -> str:
 def _clean_title_prefix(filename: str) -> str:
     """Extracts title from filename. Uses PTN as primary, regex strip as fallback."""
     # PTN extracts title directly — handles most patterns reliably
+    filename = _canon_se(filename)
     r = PTN.parse(filename)
     ptn_title = r.get("title", "")
     if ptn_title:
