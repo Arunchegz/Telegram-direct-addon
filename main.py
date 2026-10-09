@@ -328,7 +328,7 @@ async def lifespan(app: FastAPI):
         except Exception as se:
             log.error(f"[listener] instant delete cleanup failed: {se}")
 
-    if CHANNEL_USERNAME:
+    if CHANNEL_USERNAME and os.getenv("STREAMER_UPDATES", "true").strip().lower() != "false":
         chat_filter = filters.chat(CHANNEL_USERNAME)
         media_filter = filters.video | filters.document
         get_tg().add_handler(MessageHandler(_instant_sync_handler, chat_filter & media_filter))

@@ -25,6 +25,8 @@ from pyrogram.errors import AuthKeyDuplicated, FloodWait
 
 log = logging.getLogger("tgstream.clients")
 
+STREAMER_UPDATES = os.getenv("STREAMER_UPDATES", "true").strip().lower() != "false"
+
 
 class ClientUnavailableError(RuntimeError):
     """Raised by ClientPool.pick() when every client is unavailable and none
@@ -99,7 +101,11 @@ class ClientPool:
         for i, sess in enumerate(sessions):
             self._broken[i] = False
             self._is_bot[i] = ":" in sess
-            no_updates = False if i == 0 else True
+            # Only the primary client needs the live update stream, and only when
+            # instant post/delete handlers are wanted. Otherwise every client skips
+            # updates.GetChannelDifference, which is what floods the log with
+            # 500 PERSISTENT_TIMESTAMP_OUTDATED when Telegram has internal problems.
+            no_updates = not (i == 0 and STREAMER_UPDATES)
             try:
                 if ":" in sess:
                     c = Client(
