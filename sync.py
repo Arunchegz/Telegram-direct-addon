@@ -61,12 +61,13 @@ async def _sync_loop():
         try:
             await _sync_channel(force=False)
         except AuthKeyDuplicated:
-            log.error("[sync_loop] AuthKeyDuplicated, retrying instantly with healthy client")
-            try:
-                if get_tg() is not None and not client_pool.is_bot(get_tg()):
-                    await _sync_channel(force=False)
-            except Exception as e:
-                log.error(f"[sync_loop] retry failed: {e}")
+            # Do not immediately repeat the same MTProto request. The client pool
+            # marks the affected client unavailable and runs a single backoff
+            # recovery task; the normal poll delay below prevents a tight loop.
+            tg = get_tg()
+            log.error("[sync_loop] AuthKeyDuplicated during sync; skipping this cycle and backing off")
+            if tg is not None and not client_pool.is_bot(tg):
+                client_pool.suspend_auth(tg)
         # Sleep between iterations — without this the loop spins tight, calling
         # Redis (get R_SYNC_TS + hlen R_MOVIES) thousands of times per minute
         # even when _sync_channel returns early. Use half the minimum interval
