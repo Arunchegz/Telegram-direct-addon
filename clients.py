@@ -46,6 +46,7 @@ class ClientPool:
         self._last_alert_ts: Dict[str, float] = {}
         self._alert_min_interval_s = 300  # don't re-alert same condition more than once per 5min
         self._bg_tasks: set = set()  # strong refs to fire-and-forget tasks to prevent GC
+        self._auth_recovery_tasks: Dict[int, asyncio.Task] = {}  # one recovery loop per client
 
     def _fire_alert(self, key: str, text: str):
         """Fire-and-forget, rate-limited per `key` so a flapping client
@@ -147,13 +148,7 @@ class ClientPool:
                 self.clients.append(c)
                 self._broken[i] = True
                 self._cooldown_until[i] = time.time() + 60
-                try:
-                    loop = asyncio.get_running_loop()
-                    task = loop.create_task(self._recover_auth(i, 90))
-                    self._bg_tasks.add(task)
-                    task.add_done_callback(self._bg_tasks.discard)
-                except RuntimeError:
-                    pass
+                self._schedule_auth_recovery(i, 90)
             except Exception as e:
                 log.error(f"[clients] client {i} failed to start due to error: {e}")
                 c = Client(
@@ -181,16 +176,19 @@ class ClientPool:
         Retrying shortly after lets it win the key once the old container is
         gone, so deployments self-heal."""
         delay = (10, 30, 60)
-        for attempt in range(1, 4):
+        for attempt in range(1, len(delay) + 2):
             try:
                 await c.start()
                 break
-            except AuthKeyDuplicated as e:
-                if attempt >= 3:
+            except AuthKeyDuplicated:
+                if attempt > len(delay):
                     raise
                 wait = delay[attempt - 1]
-                log.error(f"[clients] client {i} AuthKeyDuplicated (attempt {attempt}/3)"
-                      f" — previous holder still using the session; retrying in {wait}s")
+                log.error(
+                    f"[clients] client {i} AuthKeyDuplicated "
+                    f"(attempt {attempt}/{len(delay) + 1}); retrying in {wait}s. "
+                    "Check for another live process using this session if it persists."
+                )
                 await asyncio.sleep(wait)
         if channel_username:
             try:
@@ -304,75 +302,106 @@ class ClientPool:
         self._fire_alert(f"broken:{idx}", f"🔴 Telegram client {idx} marked broken (auth key duplicated/invalidated)")
 
     def suspend_auth(self, client: Client, cooldown_s: int = 90):
-        """AuthKeyDuplicated mid-operation = another holder (usually the
-        previous container during a redeploy) still has the session — a
-        transient condition. Suspend the client briefly and reconnect later
-        instead of permanently breaking it; the duplicate disappears once the
-        other holder is gone, and this client is the only non-bot session."""
+        """Suspend a client after AUTH_KEY_DUPLICATED and schedule one recovery loop.
+
+        Backoff can handle short deployment overlap, but persistent conflicts
+        require stopping the other process or assigning a distinct session.
+        """
         idx = next((i for i, c in enumerate(self.clients) if c == client), None)
         if idx is None:
             return
         self._broken[idx] = True
         self._cooldown_until[idx] = time.time() + cooldown_s
-        log.error(f"[clients] client {idx} suspended {cooldown_s}s on AuthKeyDuplicated (transient) — will auto-recover")
+        log.error(
+            f"[clients] client {idx} suspended on AuthKeyDuplicated; "
+            f"waiting {cooldown_s}s before recovery. Check for duplicate live sessions."
+        )
+        self._schedule_auth_recovery(idx, cooldown_s)
+
+    def _schedule_auth_recovery(self, idx: int, cooldown_s: int) -> None:
+        """Ensure concurrent failures cannot launch overlapping reconnect attempts."""
+        current = self._auth_recovery_tasks.get(idx)
+        if current is not None and not current.done():
+            return
         try:
             loop = asyncio.get_running_loop()
-            task = loop.create_task(self._recover_auth(idx, cooldown_s))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
         except RuntimeError:
-            pass
-
-    async def _recover_auth(self, idx: int, cooldown_s: int, attempt: int = 0):
-        MAX_RECOVERY_ATTEMPTS = 10
-        if attempt >= MAX_RECOVERY_ATTEMPTS:
-            log.error(f"[clients] client {idx} giving up recovery after {MAX_RECOVERY_ATTEMPTS} attempts — session may be permanently invalidated")
-            self._fire_alert(f"broken:{idx}:perm", f"🔴 Client {idx} failed to recover after {MAX_RECOVERY_ATTEMPTS} attempts — session may need manual renewal")
             return
-        await asyncio.sleep(cooldown_s)
+        task = loop.create_task(self._recover_auth(idx, cooldown_s))
+        self._auth_recovery_tasks[idx] = task
+        self._bg_tasks.add(task)
+
+        def _finished(done_task: asyncio.Task) -> None:
+            self._bg_tasks.discard(done_task)
+            if self._auth_recovery_tasks.get(idx) is done_task:
+                self._auth_recovery_tasks.pop(idx, None)
+            if not done_task.cancelled():
+                try:
+                    error = done_task.exception()
+                except Exception:
+                    return
+                if error:
+                    log.error(
+                        f"[clients] recovery task for client {idx} ended unexpectedly: "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+        task.add_done_callback(_finished)
+
+    async def _recover_auth(self, idx: int, cooldown_s: int) -> None:
+        """Recover serially with exponential backoff; never overlap starts for one client."""
+        max_attempts = 10
         c = self.clients[idx]
-        try:
-            if c.is_connected:
-                await c.stop()
-        except Exception:
-            pass
-        # stop() can leave the client marked connected when its session is
-        # wedged (e.g. after a 406 kick) — force a full disconnect so start()
-        # below doesn't fail with "Client is already connected".
-        try:
-            if c.is_connected:
-                await c.disconnect()
-        except Exception:
-            pass
-        try:
-            await c.start()
-            # Clear stale media sessions from before the reconnect — using them
-            # after a stop/start would cause AUTH_KEY_UNREGISTERED errors on GetFile.
-            if hasattr(c, "media_sessions"):
-                c.media_sessions.clear()
-            self._broken[idx] = False
-            self._cooldown_until.pop(idx, None)
-            log.info(f"[clients] client {idx} recovered after AuthKeyDuplicated suspension (attempt {attempt + 1})")
-        except AuthKeyDuplicated:
-            next_cooldown = min(cooldown_s * 2, 600)  # cap at 10min
-            log.warning(f"[clients] client {idx} still suspended — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
+        wait_s = cooldown_s
+
+        for attempt in range(1, max_attempts + 1):
+            await asyncio.sleep(wait_s)
             try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(self._recover_auth(idx, next_cooldown, attempt + 1))
-                self._bg_tasks.add(task)
-                task.add_done_callback(self._bg_tasks.discard)
-            except RuntimeError:
-                pass
-        except Exception as e:
-            next_cooldown = min(cooldown_s * 2, 600)
-            log.error(f"[clients] client {idx} reconnect failed ({e}) — retrying in {next_cooldown}s (attempt {attempt + 1}/{MAX_RECOVERY_ATTEMPTS})")
-            try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(self._recover_auth(idx, next_cooldown, attempt + 1))
-                self._bg_tasks.add(task)
-                task.add_done_callback(self._bg_tasks.discard)
-            except RuntimeError:
-                pass
+                if c.is_connected:
+                    try:
+                        await c.stop()
+                    except Exception:
+                        pass
+                if c.is_connected:
+                    try:
+                        await c.disconnect()
+                    except Exception:
+                        pass
+
+                await c.start()
+                if hasattr(c, "media_sessions"):
+                    c.media_sessions.clear()
+                self._broken[idx] = False
+                self._cooldown_until.pop(idx, None)
+                log.info(
+                    f"[clients] client {idx} recovered after AuthKeyDuplicated "
+                    f"(attempt {attempt}/{max_attempts})"
+                )
+                return
+            except AuthKeyDuplicated:
+                log.warning(
+                    f"[clients] client {idx} still has AuthKeyDuplicated "
+                    f"(attempt {attempt}/{max_attempts}); another process may still "
+                    f"be using this session. Next retry in {min(wait_s * 2, 600)}s."
+                )
+            except Exception as e:
+                log.error(
+                    f"[clients] client {idx} reconnect failed "
+                    f"(attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}"
+                )
+
+            wait_s = min(wait_s * 2, 600)
+            self._cooldown_until[idx] = time.time() + wait_s
+
+        log.error(
+            f"[clients] client {idx} recovery stopped after {max_attempts} attempts. "
+            "Stop duplicate deployments/processes or configure a separately authorized session."
+        )
+        self._fire_alert(
+            f"broken:{idx}:perm",
+            f"🔴 Telegram client {idx} could not recover after {max_attempts} attempts. "
+            "Check duplicate deployments/session use or renew the session if necessary."
+        )
 
     async def acquire_download_slot(self) -> Tuple[int, Client]:
         """Pick the client with the fewest active background DownloadTasks
