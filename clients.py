@@ -25,7 +25,7 @@ from pyrogram.errors import AuthKeyDuplicated, FloodWait
 
 log = logging.getLogger("tgstream.clients")
 
-STREAMER_UPDATES = os.getenv("STREAMER_UPDATES", "true").strip().lower() != "false"
+STREAMER_UPDATES = os.getenv("STREAMER_UPDATES", "false").strip().lower() == "true"
 
 
 class ClientUnavailableError(RuntimeError):
